@@ -71,6 +71,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var sourceState: SourceState = .empty
     @Published private(set) var source: VideoSourceInfo?
     @Published private(set) var timeline: FrameTimeline?
+    @Published private(set) var scanResult: FrameScanResult?
     @Published private(set) var scanned: Int = 0
 
     // Settings
@@ -146,6 +147,7 @@ final class AppModel: ObservableObject {
         exportTask?.cancel()
         source = nil
         timeline = nil
+        scanResult = nil
         preview = nil
         selection = nil
         scanned = 0
@@ -164,6 +166,7 @@ final class AppModel: ObservableObject {
                 }
                 guard !Task.isCancelled else { return }
                 self.timeline = scan.timeline
+                self.scanResult = scan
                 self.scanned = scan.timeline.count
                 self.suppressChanges = true
                 self.rangeStart = .zero

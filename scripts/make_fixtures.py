@@ -127,9 +127,26 @@ def portrait():
            extra_output=["-crf", "8", "-g", "1", "-bf", "0"])
 
 
+def trimmed_edit_list():
+    """Stream-copy 1.5 s … 3.5 s of the count clip without re-encoding.
+
+    ffmpeg keeps the packets from the preceding keyframe (frame 30) and writes
+    an MP4 edit list (media_time = 0.5 s) so playback starts at frame 45.
+    The presented clip is frames 45 … 106 (62 frames); frames 30 … 44 are
+    stored but outside the edit. Exercises edit-list mapping in the scanner.
+    """
+    src = os.path.join(OUT, "count_5s_30fps.mp4")
+    dst = os.path.join(OUT, "trimmed_editlist.mp4")
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", "1.5", "-i", src, "-t", "2", "-c", "copy", "-an", dst],
+                   check=True)
+    print(f"wrote {dst} ({os.path.getsize(dst)} bytes)")
+
+
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
     count_clip()
+    trimmed_edit_list()
     moving_square()
     black_white()
     portrait()

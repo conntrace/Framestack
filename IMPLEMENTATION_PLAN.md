@@ -60,7 +60,7 @@ CI: `.github/workflows/ci.yml` runs build, tests, release app bundle; uploads te
 
 ## M1 — Core vertical slice (P0)
 - [~] Import: open panel + drag & drop; metadata (pixels, orientation, duration, nominal fps, codec, color tags, HDR/PAR warnings); decode probe with clear unsupported-codec error
-- [~] Timestamp scan; scanned count replaces labeled estimate
+- [~] Timestamp scan mapped through the edit list (decode fallback); scanned count replaces labeled estimate
 - [~] `[start, end)` numeric range (µs precision, exact rational), Full Clip reset
 - [~] Sampling All / Every Nth / Exact Count, clamping notice, live "N in range → K selected", timeline strip with range + sample ticks
 - [~] Decode selected frames by exact timestamp; missing frames reported
@@ -127,4 +127,5 @@ CI: `.github/workflows/ci.yml` runs build, tests, release app bundle; uploads te
 | Date | Where | Command | Result |
 |---|---|---|---|
 | 2026-11-06 | Linux container | `python3 scripts/make_fixtures.py` + ffmpeg decode check | 150/150 frame-index codes decode correctly; moving-square linear avg → 81.5/255 (gamma avg 21.2); black/white linear avg → 187.5/255; portrait display matrix (0,1,−1,0) |
-| 2026-11-06 | GitHub Actions macos-15 | `swift build`, `swift test`, `scripts/make_app_bundle.sh` | _pending — filled in after the first CI run_ |
+| 2026-11-06 | GitHub Actions macos-15, run 42247670128 (commit e26f890) | `swift build`, `swift test` | Build OK. 54 tests ran; 4 tests failed (166 assertion failures), all from one bug: sample-table timestamps were in media time, decoder timestamps in presentation time (edit list ignored) → timestamp k decoded frame k+2 on the B-frame clip. Fixed in the next commit (D-006). |
+| 2026-11-06 | GitHub Actions macos-15 | `swift build`, `swift test`, `scripts/make_app_bundle.sh` | _pending — second run_ |

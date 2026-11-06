@@ -48,6 +48,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 | `moving_square_24f.mp4` — white square moving over black, static gray bar | Average is computed in linear light (trail = 2/24 → 82/255, not 21/255); static content is reproduced; preview ≈ full-res export |
 | `black_white_30f.mp4` — alternating black/white frames | Linear 0.5 → 188/255; every-2nd = only black frames |
 | `portrait_rot90cw.mp4` — 90° display matrix | Portrait clips render upright with correct dimensions |
+| `trimmed_editlist.mp4` — stream-copied cut with an MP4 edit list | Only frames inside the edit are counted/used (45…106); fast scan = decoder timestamps |
 
 ## Manual verification (GUI — please run once on your Mac)
 

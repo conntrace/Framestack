@@ -75,6 +75,19 @@ private struct SourceSection: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
+            if let scan = model.scanResult {
+                if scan.samplesOutsideEdits > 0 {
+                    Label("\(scan.samplesOutsideEdits) stored frames lie outside the clip's edit list (trimmed) and are not used.",
+                          systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let reason = scan.fallbackReason {
+                    Label("Frames were counted by decoding: \(reason)", systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             if let timeline = model.timeline, timeline.duplicateTimestampsDropped > 0 {
                 Label("\(timeline.duplicateTimestampsDropped) samples shared a timestamp with another and were ignored.",
                       systemImage: "info.circle")
@@ -93,7 +106,8 @@ private struct SourceSection: View {
 
     private var framesDescription: String {
         if let timeline = model.timeline {
-            return "\(timeline.count) (scanned)"
+            let how = model.scanResult?.method == .decode ? "decoded" : "scanned"
+            return "\(timeline.count) (\(how))"
         }
         if let estimate = source.estimatedFrameCount {
             return "≈ \(estimate) (estimate)"

@@ -14,6 +14,9 @@ enum Fixture: String {
     case blackWhite = "black_white_30f"
     /// 10 frames encoded 320×180 with a 90° clockwise display matrix.
     case portrait = "portrait_rot90cw"
+    /// Stream-copied cut of `count`: stores frames 30…106, edit list
+    /// presents frames 45…106 (62 frames) starting at t = 0.
+    case trimmed = "trimmed_editlist"
 
     var url: URL {
         guard let url = Bundle.module.url(forResource: rawValue, withExtension: "mp4", subdirectory: "Fixtures") else {
