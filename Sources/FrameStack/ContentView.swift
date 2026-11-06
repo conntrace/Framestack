@@ -24,6 +24,14 @@ struct ContentView: View {
             return true
         }
         .toolbar {
+            ToolbarItemGroup(placement: .principal) {
+                Picker("View", selection: $model.viewMode) {
+                    ForEach(PreviewViewMode.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .disabled(model.timeline == nil)
+                .help("Composite, the original frame under the playhead, or both")
+            }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
                     model.presentOpenPanel()
@@ -61,6 +69,13 @@ private struct PreviewArea: View {
             Color(nsColor: .underPageBackgroundColor)
             content
         }
+        .background(
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { AppDelegate.previewViewport = geometry.size }
+                    .onChange(of: geometry.size) { _, size in AppDelegate.previewViewport = size }
+            }
+        )
     }
 
     @ViewBuilder
@@ -89,27 +104,68 @@ private struct PreviewArea: View {
             }
             .padding()
         case .ready:
-            if let preview = model.preview {
-                Image(decorative: preview.image, scale: 1)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .padding(16)
-                    .opacity(model.isPreviewCurrent ? 1 : 0.55)
-                    .overlay(alignment: .topLeading) {
-                        if !model.isPreviewCurrent {
-                            Label("Preview outdated", systemImage: "clock.arrow.circlepath")
-                                .font(.caption)
-                                .padding(6)
-                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
-                                .padding(24)
-                        }
-                    }
-            } else if case let .failed(message) = model.renderActivity {
-                Text(message).foregroundStyle(.secondary).padding()
-            } else {
-                ProgressView("Rendering preview…")
+            switch model.viewMode {
+            case .composite:
+                composite
+            case .original:
+                original
+            case .sideBySide:
+                HStack(spacing: 1) {
+                    original
+                    Divider()
+                    composite
+                }
             }
+        }
+    }
+
+    private var fullSize: PixelSize { model.source?.displaySize ?? PixelSize(width: 1, height: 1) }
+
+    @ViewBuilder
+    private var composite: some View {
+        if let preview = model.preview {
+            ZoomableImageView(
+                image: preview.image,
+                fullSize: fullSize,
+                zoom: model.zoom,
+                onZoomChange: { model.zoom = $0 },
+                caption: "Composite · \(preview.framesComposited) frames"
+            )
+            .opacity(model.isPreviewCurrent ? 1 : 0.55)
+            .overlay(alignment: .topLeading) {
+                if !model.isPreviewCurrent {
+                    Label("Preview outdated", systemImage: "clock.arrow.circlepath")
+                        .font(.caption)
+                        .padding(6)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                        .padding(12)
+                }
+            }
+        } else if case let .failed(message) = model.renderActivity {
+            Text(message).foregroundStyle(.secondary).padding().frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ProgressView("Rendering preview…").frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var original: some View {
+        if let frame = model.sourceFrame {
+            ZoomableImageView(
+                image: frame.image,
+                fullSize: fullSize,
+                zoom: model.zoom,
+                onZoomChange: { model.zoom = $0 },
+                caption: "Original · frame \(frame.index) · \(Format.seconds(frame.time.seconds))"
+            )
+            .opacity(frame.index == model.scrubIndex ? 1 : 0.55)
+        } else if let message = model.sourceFrameError {
+            Text(message).foregroundStyle(.secondary).padding().frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.scrubIndex == nil {
+            Text("Click the timeline or press ⌥→ to choose a frame.")
+                .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ProgressView("Decoding frame…").frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }

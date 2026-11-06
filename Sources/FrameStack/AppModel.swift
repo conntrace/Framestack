@@ -106,15 +106,26 @@ final class AppModel: ObservableObject {
     @Published var previewQuality: PreviewQuality = .draft { didSet { settingsChanged() } }
     @Published var exportBitDepth: ExportBitDepth = .sixteen
 
-    // Playhead (not a compositing setting; not undoable)
+    // Playhead and viewing (not compositing settings; not undoable)
     /// Index into `timeline.frames` of the frame under the playhead.
     @Published var scrubIndex: Int? {
         didSet {
             if let timeline, let i = scrubIndex, !(0..<timeline.count).contains(i) {
                 scrubIndex = min(max(i, 0), timeline.count - 1)
             }
+            scheduleSourceFrame()
         }
     }
+    @Published var viewMode: PreviewViewMode = .composite {
+        didSet {
+            if viewMode != .composite, scrubIndex == nil { scrubIndex = frameRange?.lowerBound ?? 0 }
+            scheduleSourceFrame()
+        }
+    }
+    @Published var zoom: ZoomMode = .fit
+    /// The source frame under the playhead (Original / Side-by-side views).
+    @Published private(set) var sourceFrame: SourceFrameSnapshot?
+    @Published private(set) var sourceFrameError: String?
 
     // Derived / results
     @Published private(set) var selection: Result<SamplingResult, SamplingError>?
@@ -132,6 +143,7 @@ final class AppModel: ObservableObject {
     private let renderer = CompositeRenderer()
     private var loadTask: Task<Void, Never>?
     private var thumbnailTask: Task<Void, Never>?
+    private var sourceFrameTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     private var exportTask: Task<Void, Never>?
     private var suppressChanges = false
@@ -203,6 +215,7 @@ final class AppModel: ObservableObject {
     func open(_ url: URL) {
         loadTask?.cancel()
         thumbnailTask?.cancel()
+        sourceFrameTask?.cancel()
         previewTask?.cancel()
         exportTask?.cancel()
         source = nil
@@ -210,9 +223,12 @@ final class AppModel: ObservableObject {
         scanResult = nil
         thumbnails = []
         preview = nil
+        sourceFrame = nil
+        sourceFrameError = nil
         selection = nil
         scanned = 0
         scrubIndex = nil
+        zoom = .fit
         renderActivity = .idle
         exportActivity = .idle
         undoManager?.removeAllActions(withTarget: self)
@@ -272,6 +288,43 @@ final class AppModel: ObservableObject {
             self.thumbnails = images
         }
     }
+
+    /// Decodes the exact frame under the playhead for the Original and
+    /// Side-by-side views (debounced; stale results are dropped).
+    private func scheduleSourceFrame() {
+        sourceFrameTask?.cancel()
+        guard viewMode != .composite, let source, let timeline, let index = scrubIndex, index < timeline.count else { return }
+        if sourceFrame?.index == index, sourceFrame != nil { return }
+        let time = timeline.frames[index]
+        let maxLongEdge = previewQuality.maxLongEdge
+        sourceFrameTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            guard !Task.isCancelled else { return }
+            do {
+                let image = try await SourceFrames.frame(for: source, at: time, maxLongEdge: maxLongEdge)
+                guard let self, !Task.isCancelled, self.scrubIndex == index, self.source == source else { return }
+                self.sourceFrame = SourceFrameSnapshot(image: image, index: index, time: time)
+                self.sourceFrameError = nil
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, !Task.isCancelled, self.scrubIndex == index else { return }
+                self.sourceFrameError = error.localizedDescription
+            }
+        }
+    }
+
+    // MARK: Zoom
+
+    /// Current numeric scale given the viewport (the view passes its size).
+    func zoomScale(in viewport: CGSize) -> Double {
+        zoom.scale(for: source?.displaySize ?? PixelSize(width: 1, height: 1), in: viewport)
+    }
+
+    func zoomIn(viewport: CGSize) { zoom = .scale(ZoomMode.stepIn(from: zoomScale(in: viewport))) }
+    func zoomOut(viewport: CGSize) { zoom = .scale(ZoomMode.stepOut(from: zoomScale(in: viewport))) }
+    func zoomToFit() { zoom = .fit }
+    func zoomActualSize() { zoom = .scale(1) }
 
     // MARK: Settings, undo, preview
 

@@ -30,6 +30,24 @@ struct FrameStackApp: App {
                     .keyboardShortcut("e")
                     .disabled(!model.canExport)
             }
+            CommandGroup(before: .toolbar) {
+                Picker("Show", selection: $model.viewMode) {
+                    Text("Composite").tag(PreviewViewMode.composite).keyboardShortcut("1", modifiers: [.command, .option])
+                    Text("Original Frame").tag(PreviewViewMode.original).keyboardShortcut("2", modifiers: [.command, .option])
+                    Text("Side by Side").tag(PreviewViewMode.sideBySide).keyboardShortcut("3", modifiers: [.command, .option])
+                }
+                .pickerStyle(.inline)
+                Divider()
+                Button("Zoom to Fit") { model.zoomToFit() }
+                    .keyboardShortcut("0")
+                Button("Actual Size") { model.zoomActualSize() }
+                    .keyboardShortcut("1")
+                Button("Zoom In") { model.zoomIn(viewport: AppDelegate.previewViewport) }
+                    .keyboardShortcut("=")
+                Button("Zoom Out") { model.zoomOut(viewport: AppDelegate.previewViewport) }
+                    .keyboardShortcut("-")
+                Divider()
+            }
             CommandMenu("Frame") {
                 Button("Previous Frame") { model.stepScrub(by: -1) }
                     .keyboardShortcut(.leftArrow, modifiers: .option)
@@ -72,6 +90,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     /// A file the system or the command line asked us to open; consumed by
     /// the main window.
     @Published var requestedURL: URL?
+
+    /// Size of the preview area, reported by the view so menu zoom steps can
+    /// start from the current "fit" scale.
+    nonisolated(unsafe) static var previewViewport = CGSize(width: 1000, height: 700)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)

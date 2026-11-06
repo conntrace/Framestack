@@ -354,6 +354,59 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.thumbnails.isEmpty, "cleared on open")
     }
 
+    // M3: original frame view and zoom.
+    func testOriginalViewLoadsTheFrameUnderThePlayhead() async throws {
+        let model = AppModel()
+        try await openAndWait(model, "count_5s_30fps")
+        XCTAssertNil(model.sourceFrame, "nothing decoded while showing the composite")
+
+        model.viewMode = .original
+        XCTAssertEqual(model.scrubIndex, 0, "playhead defaults to the range start")
+        try await waitUntil { model.sourceFrame != nil }
+        XCTAssertEqual(model.sourceFrame?.index, 0)
+        XCTAssertEqual(model.sourceFrame?.image.width, 320)
+
+        model.scrubIndex = 75
+        try await waitUntil { model.sourceFrame?.index == 75 }
+        XCTAssertEqual(model.sourceFrame?.time, model.timeline?.frames[75])
+
+        // Rapid stepping settles on the last frame requested.
+        for i in 76...90 { model.scrubIndex = i }
+        try await waitUntil { model.sourceFrame?.index == 90 }
+        XCTAssertEqual(model.sourceFrame?.index, 90)
+
+        model.viewMode = .sideBySide
+        XCTAssertEqual(model.sourceFrame?.index, 90, "kept across view modes")
+        try await openAndWait(model, "moving_square_24f")
+        XCTAssertNil(model.sourceFrame, "cleared on open")
+    }
+
+    func testZoomSteps() {
+        let size = PixelSize(width: 1000, height: 500)
+        let viewport = CGSize(width: 500, height: 500)
+        XCTAssertEqual(ZoomMode.fitScale(for: size, in: viewport), 0.5)
+        XCTAssertEqual(ZoomMode.fit.scale(for: size, in: viewport), 0.5)
+        XCTAssertEqual(ZoomMode.scale(2).scale(for: size, in: viewport), 2)
+        XCTAssertEqual(ZoomMode.stepIn(from: 0.5), 0.667)
+        XCTAssertEqual(ZoomMode.stepIn(from: 0.6), 0.667)
+        XCTAssertEqual(ZoomMode.stepOut(from: 0.5), 0.333)
+        XCTAssertEqual(ZoomMode.stepIn(from: 8), 8, "top of the range")
+        XCTAssertEqual(ZoomMode.stepOut(from: 0.1), 0.1)
+        XCTAssertEqual(ZoomMode.clamped(50), 8)
+
+        let model = AppModel()
+        XCTAssertEqual(model.zoom, .fit)
+        model.zoomActualSize()
+        XCTAssertEqual(model.zoom, .scale(1))
+        model.zoomIn(viewport: viewport)
+        XCTAssertEqual(model.zoom, .scale(1.5))
+        model.zoomOut(viewport: viewport)
+        model.zoomOut(viewport: viewport)
+        XCTAssertEqual(model.zoom, .scale(0.667))
+        model.zoomToFit()
+        XCTAssertEqual(model.zoom, .fit)
+    }
+
     // A damaged file still produces a composite and says what is missing.
     func testCorruptFileReportsMissingFramesInPreviewAndExport() async throws {
         let model = AppModel()
