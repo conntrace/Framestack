@@ -32,9 +32,12 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
     public var alignment: AlignmentSettings
     /// Post-composite straighten/crop/edge fill (M5c). Absent = identity.
     public var geometry: GeometrySettings
+    /// Temporal weighting (M6a). Absent = flat.
+    public var weighting: WeightCurve
 
     public init(rangeStart: FrameTime, rangeEnd: FrameTime, samplingKind: SamplingKind, nth: Int, exactCount: Int,
-                blendMode: BlendMode, opacity: Double, alignment: AlignmentSettings = .off, geometry: GeometrySettings = .identity) {
+                blendMode: BlendMode, opacity: Double, alignment: AlignmentSettings = .off, geometry: GeometrySettings = .identity,
+                weighting: WeightCurve = .flat) {
         self.rangeStart = rangeStart
         self.rangeEnd = rangeEnd
         self.samplingKind = samplingKind
@@ -44,10 +47,11 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         self.opacity = opacity
         self.alignment = alignment
         self.geometry = geometry
+        self.weighting = weighting
     }
 
     private enum CodingKeys: String, CodingKey {
-        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment, geometry
+        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment, geometry, weighting
     }
 
     public init(from decoder: Decoder) throws {
@@ -61,6 +65,7 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         opacity = try c.decode(Double.self, forKey: .opacity)
         alignment = try c.decodeIfPresent(AlignmentSettings.self, forKey: .alignment) ?? .off
         geometry = try c.decodeIfPresent(GeometrySettings.self, forKey: .geometry) ?? .identity
+        weighting = try c.decodeIfPresent(WeightCurve.self, forKey: .weighting) ?? .flat
     }
 
     public var samplingMode: SamplingMode {

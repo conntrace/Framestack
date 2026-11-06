@@ -712,3 +712,109 @@ final class GeometryAppTests: XCTestCase {
         XCTAssertEqual(reopened.imageSequence?.canvasPolicy, .fit)
     }
 }
+
+// MARK: - Temporal weighting (M6a)
+
+@MainActor
+final class WeightingAppTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("FrameStackWeightApp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var fixtures: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("FrameStackMediaTests/Fixtures")
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 20, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func waitReady(_ model: AppModel) async throws {
+        try await waitUntil { if case .ready = model.sourceState { return true } else { return false } }
+        try await waitUntil { model.isPreviewCurrent }
+    }
+
+    func testWeightingRerendersUndoesSavesAndExportsLikeThePreview() async throws {
+        let model = AppModel(defaults: UserDefaults(suiteName: "WeightingApp-\(UUID().uuidString)")!)
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        model.open(fixtures.appendingPathComponent("count_5s_30fps.mp4"))
+        try await waitReady(model)
+        XCTAssertNil(model.preview?.weighting)
+        XCTAssertEqual(model.currentWeights?.effectiveFrameCount ?? 0, 150, accuracy: 1e-9)
+        let flatPreview = try XCTUnwrap(model.preview)
+
+        model.weighting.preset = .late
+        XCTAssertFalse(model.isPreviewCurrent)
+        XCTAssertEqual(undo.undoActionName, "Change Weighting")
+        try await waitUntil { model.isPreviewCurrent }
+        let report = try XCTUnwrap(model.preview?.weighting)
+        XCTAssertEqual(report.preset, .late)
+        XCTAssertLessThan(report.effectiveFrameCount, 150)
+        XCTAssertNotEqual(model.preview?.image.dataProvider?.data as Data?, flatPreview.image.dataProvider?.data as Data?)
+
+        // Custom points edited as one interactive step.
+        model.weighting.preset = .custom
+        model.beginInteractiveEdit()
+        model.weighting.points[0].weight = 1
+        model.weighting.points[4].weight = 0
+        model.endInteractiveEdit()
+        XCTAssertEqual(undo.undoActionName, "Change Weighting")
+        undo.undo()
+        XCTAssertEqual(model.weighting.points, WeightCurve.defaultCustomPoints, "the whole drag is one step")
+        undo.undo()
+        XCTAssertEqual(model.weighting.preset, .late)
+
+        // Project round trip and an export that matches the preview's weighting.
+        try await waitUntil { model.isPreviewCurrent }
+        let projectURL = directory.appendingPathComponent("weighted.framestack")
+        XCTAssertTrue(model.save(to: projectURL))
+        XCTAssertTrue(try String(contentsOf: projectURL, encoding: .utf8).contains("\"preset\" : \"late\""))
+        let reopened = AppModel(defaults: UserDefaults(suiteName: "WeightingApp-\(UUID().uuidString)")!)
+        reopened.open(projectURL)
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.weighting, WeightCurve(preset: .late))
+        XCTAssertEqual(reopened.preview?.weighting?.preset, .late)
+        reopened.exportSettings = ExportSettings(format: .png, bitDepth: .eight)
+        let out = directory.appendingPathComponent("late.png")
+        reopened.export(to: out)
+        try await waitUntil { !reopened.isExporting }
+        guard case .finished = reopened.exportActivity else { return XCTFail("\(reopened.exportActivity)") }
+        let exported = try readBackPixels8(out)
+        // Block 0 (bit 7, set in frames 128…149) is late in the clip: under "late" it is brighter than its flat 22/150.
+        let block0 = exported[(20 * 320 + 20) * 3]
+        XCTAssertGreaterThan(Double(block0) / 255, SRGBTransfer.encode(22.0 / 150) + 0.05)
+
+        // A fresh clip resets to flat.
+        reopened.open(fixtures.appendingPathComponent("moving_square_24f.mp4"))
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.weighting, .flat)
+    }
+
+    private func readBackPixels8(_ url: URL) throws -> [UInt8] {
+        let source = CGImageSourceCreateWithURL(url as CFURL, nil)!
+        let image = CGImageSourceCreateImageAtIndex(source, 0, nil)!
+        let w = image.width, h = image.height
+        var buffer = [UInt8](repeating: 0, count: w * h * 4)
+        buffer.withUnsafeMutableBytes { raw in
+            let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for p in 0..<(w * h) { for c in 0..<3 { rgb[p * 3 + c] = buffer[p * 4 + c] } }
+        return rgb
+    }
+}

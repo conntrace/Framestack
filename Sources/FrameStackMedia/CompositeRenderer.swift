@@ -16,21 +16,24 @@ public struct CompositeRequest: Sendable {
     public var maxLongEdge: Int?
     /// Pre-blend registration (M5b); off by default.
     public var alignment: AlignmentSettings
+    /// Temporal weighting over the selection's timestamps (M6a); flat by default.
+    public var weighting: WeightCurve
 
     public init(source: MediaSource, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
-                alignment: AlignmentSettings = .off) {
+                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat) {
         self.source = source
         self.frames = frames
         self.blendMode = blendMode
         self.opacity = opacity
         self.maxLongEdge = maxLongEdge
         self.alignment = alignment
+        self.weighting = weighting
     }
 
     public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
-                alignment: AlignmentSettings = .off) {
+                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat) {
         self.init(source: .video(source), frames: frames, blendMode: blendMode, opacity: opacity, maxLongEdge: maxLongEdge,
-                  alignment: alignment)
+                  alignment: alignment, weighting: weighting)
     }
 }
 
@@ -64,9 +67,12 @@ public struct CompositeResult: Sendable {
     public let elapsedSeconds: Double
     /// Present when the request asked for alignment and more than one frame was selected.
     public let alignment: AlignmentReport?
+    /// Present when the request's weighting was not flat.
+    public let weighting: WeightingReport?
 
     public init(image: LinearImage, framesComposited: Int, missingFrames: [FrameTime], decodeFailures: [DecodeFailure],
-                deliveredInPresentationOrder: Bool, elapsedSeconds: Double, alignment: AlignmentReport? = nil) {
+                deliveredInPresentationOrder: Bool, elapsedSeconds: Double, alignment: AlignmentReport? = nil,
+                weighting: WeightingReport? = nil) {
         self.image = image
         self.framesComposited = framesComposited
         self.missingFrames = missingFrames
@@ -74,6 +80,7 @@ public struct CompositeResult: Sendable {
         self.deliveredInPresentationOrder = deliveredInPresentationOrder
         self.elapsedSeconds = elapsedSeconds
         self.alignment = alignment
+        self.weighting = weighting
     }
 
     /// One-line explanation of why frames are missing, for the UI.
@@ -84,6 +91,25 @@ public struct CompositeResult: Sendable {
         let gaveUp = decodeFailures.count >= CompositeRenderer.maxDecoderRestarts
             ? "; gave up after \(decodeFailures.count) decoder restarts — the file is badly damaged" : ""
         return "\(first.message) \(at)\(more)\(gaveUp)"
+    }
+}
+
+/// What temporal weighting did during a render.
+public struct WeightingReport: Sendable, Equatable {
+    public let preset: WeightPreset
+    /// The blend mode ignores weights (Lighten / Darken).
+    public let ignoredByMode: Bool
+    /// Every raw weight was zero, so Flat was used.
+    public let usedFlatFallback: Bool
+    /// `1 / Σ w²` of the normalised weights over the *composited* frames.
+    public let effectiveFrameCount: Double
+    public let rawRange: ClosedRange<Double>
+
+    public func summary(framesComposited: Int) -> String {
+        if ignoredByMode { return "\(preset.displayName): this blend mode has no weights (per-channel extremum)." }
+        if usedFlatFallback { return "Every weight was zero — Flat was used instead." }
+        return String(format: "%@: raw weights %.2f…%.2f · worth %.1f equal frames of %d", preset.displayName,
+                      rawRange.lowerBound, rawRange.upperBound, effectiveFrameCount, framesComposited)
     }
 }
 
@@ -169,12 +195,23 @@ public final class CompositeRenderer: @unchecked Sendable {
         var failures: [DecodeFailure] = []
         let progress: (@Sendable (CompositeProgress) -> Void)?
         var aligner: Aligner?
+        /// Raw curve weight per selected frame (nil when flat).
+        let weights: [FrameTime: Double]?
+        let weightSelection: WeightedSelection?
 
         init(request: CompositeRequest, progress: (@Sendable (CompositeProgress) -> Void)?) {
             self.request = request
             self.wanted = Set(request.frames)
             self.total = wanted.count
             self.progress = progress
+            if request.weighting.isFlat {
+                weights = nil
+                weightSelection = nil
+            } else {
+                let selection = request.weighting.weights(for: request.frames)
+                weightSelection = selection
+                weights = Dictionary(uniqueKeysWithValues: zip(request.frames, selection.raw))
+            }
         }
 
         var isComplete: Bool { seen.count == total }
@@ -257,6 +294,17 @@ public final class CompositeRenderer: @unchecked Sendable {
                 transforms: aligner.transforms.filter { reduction.seen.contains($0.key) || aligner.failed.contains($0.key) }
             )
         }
+        var weightingReport: WeightingReport?
+        if let selection = reduction.weightSelection, let weights = reduction.weights {
+            // Effective count over the frames that were actually composited.
+            let used = request.frames.filter { reduction.seen.contains($0) }.map { weights[$0] ?? 0 }
+            let sum = used.reduce(0, +)
+            let effective = sum > 0 ? 1 / used.map { ($0 / sum) * ($0 / sum) }.reduce(0, +) : 0
+            weightingReport = WeightingReport(
+                preset: request.weighting.preset, ignoredByMode: !reducer.usesWeights,
+                usedFlatFallback: selection.usedFlatFallback, effectiveFrameCount: effective, rawRange: selection.rawRange
+            )
+        }
         return CompositeResult(
             image: image,
             framesComposited: reducer.count,
@@ -264,7 +312,8 @@ public final class CompositeRenderer: @unchecked Sendable {
             decodeFailures: reduction.failures,
             deliveredInPresentationOrder: reduction.inOrder,
             elapsedSeconds: Date().timeIntervalSince(started),
-            alignment: report
+            alignment: report,
+            weighting: weightingReport
         )
     }
 
@@ -386,7 +435,14 @@ public final class CompositeRenderer: @unchecked Sendable {
             image = moved
         }
         renderFrame(image, sourceSize: size, outputSize: r.outputSize, into: &r.frameBuffer)
-        try r.frameBuffer.withUnsafeBufferPointer { try r.reducer!.add($0) }
+        if let weights = r.weights {
+            // Average normalises Σw itself; Additive and the sequential modes
+            // take the raw curve value; Lighten/Darken ignore it.
+            let w = weights[pts] ?? 1
+            try r.frameBuffer.withUnsafeBufferPointer { try r.reducer!.add($0, weight: w) }
+        } else {
+            try r.frameBuffer.withUnsafeBufferPointer { try r.reducer!.add($0) }
+        }
         r.seen.insert(pts)
         if let previous = r.previous, !(previous < pts) { r.inOrder = false }
         r.previous = pts

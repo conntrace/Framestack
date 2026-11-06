@@ -20,6 +20,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M5c (crop, straighten, canvas):** a **Crop & Straighten** section with a straighten slider, a crop in canvas pixels, **Crop to Safe Area** (the largest rectangle every aligned frame covers after the angle) and an **Edges** choice (transparent / black / white) — all applied once to the finished composite, so preview and export match exactly. A folder of **mixed-size stills** can be opened with **Fit** (transparent bars) or **Fill** (overflow cropped) instead of being refused; the choice is saved with the project.
 
+**M6a (temporal weighting):** a **Weighting** section — Flat, Favor Early, Favor Late, Favor Middle or a Custom curve with draggable points — weights every selected frame by its real timestamp inside the selection. Average becomes a normalised weighted mean, Additive an exposure accumulation, the sequential modes scale opacity per frame; Lighten/Darken say they have no weights. The curve is drawn with one tick per selected frame and the "effective frame count" the weighting is worth.
+
 | Keys | |
 |---|---|
 | ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
@@ -33,7 +35,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: weighting/masks/motion/color/batches/median (M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
+Not yet: median and max/min-luminance modes, masks, motion accumulation, colour adjustments, presets and batches (rest of M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -105,6 +107,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 14. (M5b) Open a handheld clip, narrow the range to ~10 frames, turn on **Align frames before blending**: the preview re-renders sharper, the caption says "aligned", the Alignment section reports "N aligned to frame at … · max shift … px" and a yellow dashed safe area appears. Click the strip to move the playhead and **Use Playhead Frame**; ⌘Z restores the middle reference. Export: the inspector says "with alpha" because the moved edges are transparent.
 15. (M5c) With alignment on, drag **Straighten** a few degrees: the corners show the checkerboard. **Crop to Safe Area**: the preview shrinks to a clean rectangle and "Output W×H of the canvas" updates; type a Width in the crop fields, Return, and the preview follows; **Edges → Black** fills any remaining transparency (the export report no longer says "with alpha"). ⌘Z steps back through Change Crop / Straighten.
 16. (M5c) Open a folder of photos that mix portrait and landscape: the refusal names the files and offers **Fit** and **Fill**; Fit shows letterboxed stills, the Source section says how many were scaled, and the Canvas menu switches between the three policies.
+17. (M6a) In Weighting choose **Favor Late**: the curve rises, the ticks follow the selected frames, the caption reports the raw range and the effective frame count, and the preview re-renders favouring the end of the range. Choose **Custom** and drag a point: one undo step. Switch Blend to Lighten: the note says the curve is ignored.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

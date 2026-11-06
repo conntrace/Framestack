@@ -34,6 +34,8 @@ struct PreviewSnapshot {
     let elapsedSeconds: Double
     /// What alignment did, when it was on.
     let alignment: AlignmentReport?
+    /// What temporal weighting did, when it was not flat.
+    let weighting: WeightingReport?
     /// Size of the rendered canvas before straighten/crop (`size` is after).
     let canvasSize: PixelSize
 }
@@ -124,6 +126,15 @@ final class AppModel: ObservableObject {
     @Published var alignment: AlignmentSettings = .off { didSet { if alignment != oldValue { settingsChanged() } } }
     /// Post-composite straighten / crop / edge fill (M5c); undoable and saved.
     @Published var geometry: GeometrySettings = .identity { didSet { if geometry != oldValue { settingsChanged() } } }
+    /// Temporal weighting (M6a); undoable and saved.
+    @Published var weighting: WeightCurve = .flat { didSet { if weighting != oldValue { settingsChanged() } } }
+
+    /// The weights the current selection gets (for the curve preview).
+    var currentWeights: WeightedSelection? {
+        let times = selectedTimes
+        guard !times.isEmpty else { return nil }
+        return weighting.weights(for: times)
+    }
     /// A folder of mixed-size stills was refused; the user may reopen it with Fit or Fill.
     @Published private(set) var mixedSizeRetry: [URL]?
     /// Alignment report of the last export.
@@ -246,7 +257,7 @@ final class AppModel: ObservableObject {
     var settings: CompositeSettings {
         CompositeSettings(rangeStart: rangeStart, rangeEnd: rangeEnd, samplingKind: samplingKind,
                           nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity, alignment: alignment,
-                          geometry: geometry)
+                          geometry: geometry, weighting: weighting)
     }
 
     var selectedTimes: [FrameTime] {
@@ -591,6 +602,7 @@ final class AppModel: ObservableObject {
         suppressChanges = true
         alignment = .off
         geometry = .identity
+        weighting = .flat
         suppressChanges = false
         // Export choices follow the user from clip to clip, but a project's
         // choices do not leak into an unrelated video opened afterwards.
@@ -746,6 +758,7 @@ final class AppModel: ObservableObject {
         alignment = s.alignment
         geometry = GeometrySettings(rotationDegrees: min(max(s.geometry.rotationDegrees, -GeometrySettings.maximumRotation), GeometrySettings.maximumRotation),
                                     crop: s.geometry.crop.clamped(in: info.displaySize), edgeFill: s.geometry.edgeFill)
+        weighting = s.weighting
         exportSettings = project.export
         if let quality = project.ui.previewQuality.flatMap(PreviewQuality.init(rawValue:)) { previewQuality = quality }
         if let mode = project.ui.viewMode.flatMap(PreviewViewMode.init(rawValue:)) { viewMode = mode }
@@ -952,6 +965,7 @@ final class AppModel: ObservableObject {
         opacity = s.opacity
         alignment = s.alignment
         geometry = s.geometry
+        weighting = s.weighting
         suppressChanges = false
         settingsChanged()
     }
@@ -1001,6 +1015,7 @@ final class AppModel: ObservableObject {
         if old.geometry.rotationDegrees != new.geometry.rotationDegrees { return "Straighten" }
         if old.geometry.crop != new.geometry.crop { return "Change Crop" }
         if old.geometry.edgeFill != new.geometry.edgeFill { return "Change Edge Fill" }
+        if old.weighting != new.weighting { return "Change Weighting" }
         return "Change Settings"
     }
 
@@ -1021,7 +1036,8 @@ final class AppModel: ObservableObject {
             blendMode: blendMode,
             opacity: Float(opacity),
             maxLongEdge: previewQuality.maxLongEdge,
-            alignment: alignment
+            alignment: alignment,
+            weighting: weighting
         )
         let revision = settingsRevision
         renderActivity = .waiting
@@ -1052,6 +1068,7 @@ final class AppModel: ObservableObject {
                     decodeFailure: result.decodeFailureSummary,
                     elapsedSeconds: result.elapsedSeconds,
                     alignment: result.alignment,
+                    weighting: result.weighting,
                     canvasSize: result.image.size
                 )
                 self.renderActivity = .idle
@@ -1112,7 +1129,8 @@ final class AppModel: ObservableObject {
             blendMode: blendMode,
             opacity: Float(opacity),
             maxLongEdge: exportSettings.sizing.maxLongEdge(for: source.displaySize),
-            alignment: alignment
+            alignment: alignment,
+            weighting: weighting
         )
         let settings = exportSettings
         let geometry = geometry

@@ -22,6 +22,7 @@ struct InspectorView: View {
                         InspectorSection(title: "Time Range", key: "range") { TimeRangeSection(source: source) }
                         InspectorSection(title: "Sampling", key: "sampling") { SamplingSection() }
                         InspectorSection(title: "Blend", key: "blend") { BlendSection() }
+                        InspectorSection(title: "Weighting", key: "weighting") { WeightingSection() }
                         InspectorSection(title: "Alignment", key: "alignment") { AlignmentSection() }
                         InspectorSection(title: "Crop & Straighten", key: "geometry") { GeometrySection() }
                         InspectorSection(title: "Export", key: "export") { ExportSection() }
@@ -457,6 +458,145 @@ private struct BlendSection: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+// MARK: Weighting
+
+private struct WeightingSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("Weighting", selection: presetBinding) {
+                ForEach(WeightPreset.allCases) { Text($0.displayName).tag($0) }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            WeightCurveView(curve: model.weighting, samples: model.currentWeights, editable: model.weighting.preset == .custom) { points in
+                model.weighting.points = points
+            } onEditingChanged: { editing in
+                editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
+            }
+            .frame(height: 96)
+            Text(model.weighting.explanation)
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if !model.weighting.isFlat {
+                if model.weighting.preset == .custom {
+                    Button("Reset Curve") { model.weighting.points = WeightCurve.defaultCustomPoints }
+                        .controlSize(.small)
+                }
+                if let w = model.currentWeights {
+                    Text(summary(w))
+                        .font(.caption).foregroundStyle(w.usedFlatFallback ? Color.orange : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(modeNote)
+                    .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var presetBinding: Binding<WeightPreset> {
+        Binding(get: { model.weighting.preset }, set: { model.weighting.preset = $0 })
+    }
+
+    private func summary(_ w: WeightedSelection) -> String {
+        if w.usedFlatFallback { return "Every weight is zero — Flat is used instead." }
+        return String(format: "Weights %.2f…%.2f over %d frames by timestamp · worth %.1f equal frames", w.rawRange.lowerBound,
+                      w.rawRange.upperBound, w.raw.count, w.effectiveFrameCount)
+    }
+
+    private var modeNote: String {
+        switch model.blendMode {
+        case .average: return "Average: the weighted mean Σw·frame ÷ Σw (weights normalised, so brightness is unchanged)."
+        case .additive: return "Additive: each frame is added × its raw weight (exposure accumulation, not normalised)."
+        case .lighten, .darken: return "Lighten/Darken keep per-channel extremes and have no weights; the curve is ignored."
+        default: return "\(model.blendMode.displayName): each frame's opacity is multiplied by its raw weight; the first frame still initialises the composite."
+        }
+    }
+}
+
+/// The weight function over the selection's normalised time, with one tick
+/// per selected frame at its real timestamp (PRD §5.3 "preview visualizes
+/// weighting distribution/selected samples"). In Custom mode the control
+/// points can be dragged vertically.
+private struct WeightCurveView: View {
+    let curve: WeightCurve
+    let samples: WeightedSelection?
+    let editable: Bool
+    let onPointsChange: ([WeightPoint]) -> Void
+    let onEditingChanged: (Bool) -> Void
+
+    @State private var dragging: Int?
+
+    var body: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+            ZStack {
+                Canvas { context, size in
+                    let inset: CGFloat = 4
+                    let plot = CGRect(x: inset, y: inset, width: size.width - 2 * inset, height: size.height - 2 * inset)
+                    func point(_ t: Double, _ w: Double) -> CGPoint {
+                        CGPoint(x: plot.minX + plot.width * t, y: plot.maxY - plot.height * min(max(w, 0), 1))
+                    }
+                    context.fill(Path(roundedRect: plot.insetBy(dx: -inset, dy: -inset), cornerRadius: 6), with: .color(.black.opacity(0.18)))
+                    // Sample ticks at the selected frames' timestamps.
+                    if let samples {
+                        let step = max(1, samples.times.count / 400)
+                        var ticks = Path()
+                        for i in stride(from: 0, to: samples.times.count, by: step) {
+                            let p = point(samples.times[i], samples.raw[i])
+                            ticks.move(to: CGPoint(x: p.x, y: plot.maxY))
+                            ticks.addLine(to: p)
+                        }
+                        context.stroke(ticks, with: .color(.accentColor.opacity(0.35)), lineWidth: 1)
+                    }
+                    // The curve.
+                    var path = Path()
+                    let steps = 96
+                    for i in 0...steps {
+                        let t = Double(i) / Double(steps)
+                        let p = point(t, curve.weight(at: t))
+                        if i == 0 { path.move(to: p) } else { path.addLine(to: p) }
+                    }
+                    context.stroke(path, with: .color(.primary), lineWidth: 1.5)
+                    if editable {
+                        for cp in curve.points {
+                            let p = point(cp.time, cp.weight)
+                            context.fill(Path(ellipseIn: CGRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8)), with: .color(.accentColor))
+                        }
+                    }
+                }
+                if editable {
+                    Color.clear.contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { value in
+                                    let inset: CGFloat = 4
+                                    let plotWidth = size.width - 2 * inset, plotHeight = size.height - 2 * inset
+                                    var points = curve.points
+                                    if dragging == nil {
+                                        onEditingChanged(true)
+                                        let t = Double((value.startLocation.x - inset) / plotWidth)
+                                        dragging = points.indices.min { abs(points[$0].time - t) < abs(points[$1].time - t) }
+                                    }
+                                    guard let i = dragging, points.indices.contains(i) else { return }
+                                    let w = 1 - Double((value.location.y - inset) / plotHeight)
+                                    points[i].weight = min(max(w, 0), 1)
+                                    onPointsChange(points)
+                                }
+                                .onEnded { _ in
+                                    dragging = nil
+                                    onEditingChanged(false)
+                                }
+                        )
+                }
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Weight curve")
+        .accessibilityValue(curve.preset.displayName)
     }
 }
 

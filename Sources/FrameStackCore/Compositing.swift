@@ -109,6 +109,7 @@ public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
 public enum CompositingError: Error, Equatable, LocalizedError {
     case dimensionMismatch(expected: Int, actual: Int)
     case noFrames
+    case zeroTotalWeight
 
     public var errorDescription: String? {
         switch self {
@@ -116,6 +117,8 @@ public enum CompositingError: Error, Equatable, LocalizedError {
             return "Frame size changed mid-stack (expected \(expected) samples, got \(actual))."
         case .noFrames:
             return "No frames were composited."
+        case .zeroTotalWeight:
+            return "Every frame had zero weight; nothing could be averaged."
         }
     }
 }
@@ -134,6 +137,11 @@ public protocol FrameReducer: AnyObject {
     /// Approximate bytes held, for diagnostics and memory tests.
     var memoryFootprintBytes: Int { get }
     func add(_ frame: UnsafeBufferPointer<Float>) throws
+    /// Adds a frame with a temporal weight (PRD §5.3). Modes that cannot use
+    /// a weight (Lighten/Darken) ignore it; see each reducer.
+    func add(_ frame: UnsafeBufferPointer<Float>, weight: Double) throws
+    /// Whether this mode's result changes with temporal weights.
+    var usesWeights: Bool { get }
     func result() throws -> LinearImage
 }
 
@@ -141,6 +149,18 @@ public extension FrameReducer {
     func add(_ image: LinearImage) throws {
         try image.pixels.withUnsafeBufferPointer { try add($0) }
     }
+
+    func add(_ image: LinearImage, weight: Double) throws {
+        try image.pixels.withUnsafeBufferPointer { try add($0, weight: weight) }
+    }
+
+    /// Default: the weight is ignored.
+    func add(_ frame: UnsafeBufferPointer<Float>, weight: Double) throws {
+        try add(frame)
+    }
+
+    /// Whether this mode's result changes with temporal weights.
+    var usesWeights: Bool { true }
 
     var sampleCount: Int { width * height * LinearImage.channelCount }
 
@@ -171,6 +191,8 @@ public final class AverageAccumulator: FrameReducer {
     public let width: Int
     public let height: Int
     public private(set) var count: Int = 0
+    /// Σ weights of the frames added (equals `count` when unweighted).
+    public private(set) var weightTotal: Double = 0
 
     private var sums: [Double]
     #if canImport(Accelerate)
@@ -198,9 +220,17 @@ public final class AverageAccumulator: FrameReducer {
 
     /// Adds one frame given as interleaved RGBA Float32 in the working space.
     public func add(_ frame: UnsafeBufferPointer<Float>) throws {
+        try add(frame, weight: 1)
+    }
+
+    /// Adds `weight × frame` (weighted Average / exposure accumulation).
+    /// A weight of exactly 1 reproduces the unweighted sum bit for bit.
+    public func add(_ frame: UnsafeBufferPointer<Float>, weight: Double) throws {
         try checkDimensions(frame)
+        precondition(weight.isFinite && weight >= 0, "weights must be finite and non-negative")
         guard let src = frame.baseAddress else { return }
         let total = frame.count
+        var w = weight
         sums.withUnsafeMutableBufferPointer { accBuffer in
             let acc = accBuffer.baseAddress!
             #if canImport(Accelerate)
@@ -210,23 +240,31 @@ public final class AverageAccumulator: FrameReducer {
                 while offset < total {
                     let n = min(Self.chunkSize, total - offset)
                     vDSP_vspdp(src + offset, 1, tmp, 1, vDSP_Length(n))
-                    vDSP_vaddD(acc + offset, 1, tmp, 1, acc + offset, 1, vDSP_Length(n))
+                    if weight == 1 {
+                        vDSP_vaddD(acc + offset, 1, tmp, 1, acc + offset, 1, vDSP_Length(n))
+                    } else {
+                        // acc = tmp × w + acc
+                        vDSP_vsmaD(tmp, 1, &w, acc + offset, 1, acc + offset, 1, vDSP_Length(n))
+                    }
                     offset += n
                 }
             }
             #else
             for i in 0..<total {
-                acc[i] += Double(src[i])
+                acc[i] += Double(src[i]) * w
             }
             #endif
         }
         count += 1
+        weightTotal += weight
     }
 
-    /// The mean of all added frames. The accumulator stays usable.
+    /// The weighted mean of all added frames (`Σ w·frame / Σ w`; the plain
+    /// mean when unweighted). The accumulator stays usable.
     public func result() throws -> LinearImage {
         guard count > 0 else { throw CompositingError.noFrames }
-        return scaled(by: 1 / Double(count))
+        guard weightTotal > 0 else { throw CompositingError.zeroTotalWeight }
+        return scaled(by: 1 / weightTotal)
     }
 
     /// The sum of all added frames times `scale` (Additive).
@@ -283,6 +321,9 @@ public final class AdditiveReducer: FrameReducer {
     public var count: Int { sums.count }
     public var memoryFootprintBytes: Int { sums.memoryFootprintBytes }
     public func add(_ frame: UnsafeBufferPointer<Float>) throws { try sums.add(frame) }
+    /// Exposure accumulation: the raw curve weight scales each frame's
+    /// contribution (not normalised — "intentionally using exposure accumulation").
+    public func add(_ frame: UnsafeBufferPointer<Float>, weight: Double) throws { try sums.add(frame, weight: weight) }
     public func result() throws -> LinearImage { try sums.sum(scaledBy: Double(opacity)) }
 }
 
@@ -309,6 +350,8 @@ public final class ExtremumReducer: FrameReducer {
     }
 
     public var memoryFootprintBytes: Int { state.count * MemoryLayout<Float>.stride }
+    /// A per-channel extremum has no notion of weight.
+    public var usesWeights: Bool { false }
 
     public func add(_ frame: UnsafeBufferPointer<Float>) throws {
         try checkDimensions(frame)
@@ -380,10 +423,16 @@ public final class SequentialReducer: FrameReducer {
     public var memoryFootprintBytes: Int { state.count * MemoryLayout<Float>.stride }
 
     public func add(_ frame: UnsafeBufferPointer<Float>) throws {
+        try add(frame, weight: 1)
+    }
+
+    /// The raw curve weight scales this frame's opacity (`opacity × weight`).
+    /// The first frame initialises the composite regardless of its weight.
+    public func add(_ frame: UnsafeBufferPointer<Float>, weight: Double) throws {
         try checkDimensions(frame)
         guard let src = frame.baseAddress else { return }
         let total = frame.count
-        let a = opacity
+        let a = opacity * Float(min(max(weight, 0), 1))
         let operation = self.operation
         state.withUnsafeMutableBufferPointer { buffer in
             let c = buffer.baseAddress!
