@@ -71,36 +71,48 @@ public enum PixelEncoder {
     /// 8-bit RGB samples in `colorSpace`. Display P3 output first converts
     /// the linear sRGB working values to linear P3 (3×3 matrix, Float64),
     /// then applies the same transfer curve, clamp and rounding.
-    public static func encode8(_ image: LinearImage, colorSpace: OutputColorSpace) -> [UInt8] {
-        var out = [UInt8](repeating: 0, count: image.width * image.height * 3)
-        encode(image, colorSpace: colorSpace, maxValue: 255) { i, v in out[i] = UInt8(v) }
+    /// With `alpha`, 4 samples per pixel: straight (un-premultiplied) RGB
+    /// and a linear alpha channel — what PNG and TIFF store. Without it, 3
+    /// samples: the premultiplied RGB as-is, which equals the image
+    /// composited over black.
+    public static func encode8(_ image: LinearImage, colorSpace: OutputColorSpace, alpha: Bool = false) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: image.width * image.height * (alpha ? 4 : 3))
+        encode(image, colorSpace: colorSpace, alpha: alpha, maxValue: 255) { i, v in out[i] = UInt8(v) }
         return out
     }
 
-    public static func encode16(_ image: LinearImage, colorSpace: OutputColorSpace) -> [UInt16] {
-        var out = [UInt16](repeating: 0, count: image.width * image.height * 3)
-        encode(image, colorSpace: colorSpace, maxValue: 65_535) { i, v in out[i] = UInt16(v) }
+    public static func encode16(_ image: LinearImage, colorSpace: OutputColorSpace, alpha: Bool = false) -> [UInt16] {
+        var out = [UInt16](repeating: 0, count: image.width * image.height * (alpha ? 4 : 3))
+        encode(image, colorSpace: colorSpace, alpha: alpha, maxValue: 65_535) { i, v in out[i] = UInt16(v) }
         return out
     }
 
     @inline(__always)
-    private static func encode(_ image: LinearImage, colorSpace: OutputColorSpace, maxValue: Int,
+    private static func encode(_ image: LinearImage, colorSpace: OutputColorSpace, alpha: Bool, maxValue: Int,
                                store: (Int, Int) -> Void) {
         let pixelCount = image.width * image.height
         let matrix = ColorPrimaries.matrix(fromSRGBTo: colorSpace)
+        let stride = alpha ? 4 : 3
         image.pixels.withUnsafeBufferPointer { src in
             for p in 0..<pixelCount {
                 let s = p * LinearImage.channelCount
-                let d = p * 3
+                let d = p * stride
+                var r = Double(src[s]), g = Double(src[s + 1]), b = Double(src[s + 2])
+                if alpha {
+                    let a = Double(src[s + 3])
+                    if a > 0, a < 1 { r /= a; g /= a; b /= a }
+                    // Alpha is coverage, not light: linear, no transfer curve.
+                    let coverage = min(max(a.isNaN ? 0 : a, 0), 1)
+                    store(d + 3, Int((coverage * Double(maxValue)).rounded()))
+                }
                 if let m = matrix {
-                    let r = Double(src[s]), g = Double(src[s + 1]), b = Double(src[s + 2])
                     store(d, quantizeDouble(m[0] * r + m[1] * g + m[2] * b, maxValue: maxValue))
                     store(d + 1, quantizeDouble(m[3] * r + m[4] * g + m[5] * b, maxValue: maxValue))
                     store(d + 2, quantizeDouble(m[6] * r + m[7] * g + m[8] * b, maxValue: maxValue))
                 } else {
-                    store(d, quantize(linear: src[s], maxValue: maxValue))
-                    store(d + 1, quantize(linear: src[s + 1], maxValue: maxValue))
-                    store(d + 2, quantize(linear: src[s + 2], maxValue: maxValue))
+                    store(d, quantizeDouble(r, maxValue: maxValue))
+                    store(d + 1, quantizeDouble(g, maxValue: maxValue))
+                    store(d + 2, quantizeDouble(b, maxValue: maxValue))
                 }
             }
         }

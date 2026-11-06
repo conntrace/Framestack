@@ -49,7 +49,7 @@ final class AppModelTests: XCTestCase {
         let model = AppModel()
         try await openAndWait(model, "count_5s_30fps")
 
-        let source = try XCTUnwrap(model.source)
+        let source = try XCTUnwrap(model.video)
         XCTAssertEqual(source.fileName, "count_5s_30fps.mp4")
         XCTAssertEqual(source.displaySize, PixelSize(width: 320, height: 180))
         XCTAssertEqual(source.estimatedFrameCount, 150, "estimate shown before the scan")

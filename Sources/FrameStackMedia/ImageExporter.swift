@@ -14,6 +14,11 @@ public struct ExportReport: Sendable, Equatable {
     public let fileSizeBytes: Int64
     /// Container type as identified by ImageIO when reading back ("public.png", …).
     public let typeIdentifier: String?
+    /// The file carries an alpha channel.
+    public let hasAlpha: Bool
+    /// The composite had transparency but the format cannot store it; it
+    /// was composited over black.
+    public let alphaFlattened: Bool
 
     public var format: ExportFormat? {
         switch typeIdentifier {
@@ -42,17 +47,20 @@ public enum ImageExporter {
 
     /// Builds a CGImage (used for both export and the on-screen preview,
     /// so they share the exact same conversion).
+    /// `alpha`: keep transparency as a straight alpha channel; otherwise the
+    /// premultiplied colour is written as-is (= composited over black).
     public static func makeCGImage(_ image: LinearImage, bitDepth: ExportBitDepth,
-                                   colorSpace: OutputColorSpace = .sRGB) throws -> CGImage {
+                                   colorSpace: OutputColorSpace = .sRGB, alpha: Bool = false) throws -> CGImage {
         let width = image.width
         let height = image.height
+        let channels = alpha ? 4 : 3
         let data: Data
         switch bitDepth {
         case .eight:
-            data = Data(PixelEncoder.encode8(image, colorSpace: colorSpace))
+            data = Data(PixelEncoder.encode8(image, colorSpace: colorSpace, alpha: alpha))
         case .sixteen:
             // CoreGraphics' default byte order for 16-bit components is big-endian.
-            let samples = PixelEncoder.encode16(image, colorSpace: colorSpace).map { $0.bigEndian }
+            let samples = PixelEncoder.encode16(image, colorSpace: colorSpace, alpha: alpha).map { $0.bigEndian }
             data = samples.withUnsafeBufferPointer { Data(buffer: $0) }
         }
         guard let provider = CGDataProvider(data: data as CFData),
@@ -60,10 +68,10 @@ public enum ImageExporter {
                 width: width,
                 height: height,
                 bitsPerComponent: bitDepth.rawValue,
-                bitsPerPixel: bitDepth.rawValue * 3,
-                bytesPerRow: width * 3 * (bitDepth.rawValue / 8),
+                bitsPerPixel: bitDepth.rawValue * channels,
+                bytesPerRow: width * channels * (bitDepth.rawValue / 8),
                 space: cgColorSpace(colorSpace),
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                bitmapInfo: CGBitmapInfo(rawValue: (alpha ? CGImageAlphaInfo.last : CGImageAlphaInfo.none).rawValue),
                 provider: provider,
                 decode: nil,
                 shouldInterpolate: false,
@@ -86,11 +94,10 @@ public enum ImageExporter {
     /// caller renders at the output size (see `OutputSizing.maxLongEdge`).
     @discardableResult
     public static func write(_ image: LinearImage, to url: URL, settings: ExportSettings) throws -> ExportReport {
-        guard image.alphaRange.lowerBound >= 0.999 else {
-            throw MediaError.transparencyNotSupported
-        }
+        let transparent = Self.hasTransparency(image)
+        let keepAlpha = transparent && settings.format != .jpeg
         let bitDepth = settings.effectiveBitDepth
-        let cgImage = try makeCGImage(image, bitDepth: bitDepth, colorSpace: settings.colorSpace)
+        let cgImage = try makeCGImage(image, bitDepth: bitDepth, colorSpace: settings.colorSpace, alpha: keepAlpha)
 
         let type: UTType
         var properties: [CFString: Any] = [:]
@@ -127,7 +134,13 @@ public enum ImageExporter {
             throw MediaError.exportFailed(error.localizedDescription)
         }
 
-        let report = try inspect(url)
+        var report = try inspect(url)
+        report = ExportReport(url: report.url, width: report.width, height: report.height, bitDepth: report.bitDepth,
+                              colorProfileName: report.colorProfileName, fileSizeBytes: report.fileSizeBytes,
+                              typeIdentifier: report.typeIdentifier, hasAlpha: report.hasAlpha, alphaFlattened: transparent && !keepAlpha)
+        guard report.hasAlpha == keepAlpha else {
+            throw MediaError.exportVerificationFailed(keepAlpha ? "the file lost its alpha channel" : "the file unexpectedly has an alpha channel")
+        }
         guard report.width == image.width, report.height == image.height else {
             throw MediaError.exportVerificationFailed("expected \(image.width)×\(image.height), file is \(report.width)×\(report.height)")
         }
@@ -156,7 +169,13 @@ public enum ImageExporter {
         let profile = props[kCGImagePropertyProfileName] as? String
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
         let type = CGImageSourceGetType(source) as String?
+        let alpha = (props[kCGImagePropertyHasAlpha] as? NSNumber)?.boolValue ?? false
         return ExportReport(url: url, width: width, height: height, bitDepth: depth, colorProfileName: profile,
-                            fileSizeBytes: size, typeIdentifier: type)
+                            fileSizeBytes: size, typeIdentifier: type, hasAlpha: alpha, alphaFlattened: false)
+    }
+
+    /// Any pixel with alpha below 1 (within half an 8-bit step).
+    public static func hasTransparency(_ image: LinearImage) -> Bool {
+        image.alphaRange.lowerBound < 1 - 0.5 / 255
     }
 }

@@ -19,8 +19,8 @@ struct ContentView: View {
             BottomBar()
         }
         .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            model.open(url)
+            guard !urls.isEmpty else { return false }
+            model.open(urls)
             return true
         }
         .toolbar {
@@ -101,7 +101,7 @@ private struct PreviewArea: View {
             VStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle").font(.largeTitle).foregroundStyle(.orange)
                 Text(message).multilineTextAlignment(.center).frame(maxWidth: 420)
-                Button("Open Another Video…") { model.presentOpenPanel() }
+                Button("Open Another…") { model.presentOpenPanel() }
             }
             .padding()
         case let .relink(request):
@@ -215,8 +215,8 @@ private struct DropHint: View {
             Image(systemName: "square.stack.3d.down.right")
                 .font(.system(size: 48, weight: .light))
                 .foregroundStyle(.secondary)
-            Text("Drop a video here").font(.title2)
-            Text("MOV or MP4 — anything this Mac can decode").foregroundStyle(.secondary)
+            Text("Drop a video or a folder of images here").font(.title2)
+            Text("MOV or MP4 — anything this Mac can decode; JPEG, PNG, TIFF or HEIF stills").foregroundStyle(.secondary)
             Button("Open Video…") { model.presentOpenPanel() }
                 .keyboardShortcut(.defaultAction)
         }

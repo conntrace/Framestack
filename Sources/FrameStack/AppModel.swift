@@ -54,13 +54,15 @@ struct RelinkRequest {
     let differences: [String]
 
     var savedFileName: String { project.source.identity.fileName }
+    var isSequence: Bool { project.source.kind == .imageSequence }
+    var mediaWord: String { isSequence ? "image folder" : "video" }
 
     var message: String {
         if let candidate {
             let what = differences.isEmpty ? "" : " (\(differences.joined(separator: ", ")))"
-            return "“\(candidate.lastPathComponent)” is not the video this project was saved with\(what). Using it would change the result."
+            return "“\(candidate.lastPathComponent)” is not the \(mediaWord) this project was saved with\(what). Using it would change the result."
         }
-        return "The video “\(savedFileName)” could not be found at \(project.source.absolutePath)."
+        return "The \(mediaWord) “\(savedFileName)” could not be found at \(project.source.absolutePath)."
     }
 }
 
@@ -94,7 +96,10 @@ enum ExportActivity: Equatable {
 final class AppModel: ObservableObject {
     // Source
     @Published private(set) var sourceState: SourceState = .empty
-    @Published private(set) var source: VideoSourceInfo?
+    @Published private(set) var source: MediaSource?
+
+    var video: VideoSourceInfo? { source?.video }
+    var imageSequence: ImageSequenceInfo? { source?.imageSequence }
     @Published private(set) var timeline: FrameTimeline?
     @Published private(set) var scanResult: FrameScanResult?
     @Published private(set) var scanned: Int = 0
@@ -309,22 +314,61 @@ final class AppModel: ObservableObject {
 
     func presentOpenPanel() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.movie, Self.projectType]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.message = "Choose a video to stack, or a FrameStack project"
-        if panel.runModal() == .OK, let url = panel.url {
-            open(url)
+        panel.allowedContentTypes = [.movie, Self.projectType] + ImageSequenceLoader.imageTypes
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.message = "Choose a video, a FrameStack project, a folder of images, or several images"
+        if panel.runModal() == .OK, !panel.urls.isEmpty {
+            open(panel.urls)
         }
     }
 
-    /// Opens a video or a `.framestack` project.
+    /// Opens a video, a `.framestack` project, a folder of stills (one
+    /// image stands for its whole folder) or an explicit set of stills.
     func open(_ url: URL) {
-        if Self.isProject(url) {
-            openProject(url)
+        open([url])
+    }
+
+    func open(_ urls: [URL]) {
+        guard let first = urls.first else { return }
+        if urls.count == 1, Self.isProject(first) {
+            openProject(first)
+        } else if urls.count == 1, !ImageSequenceLoader.isDirectory(first), !ImageSequenceLoader.isImageFile(first) {
+            load(.video(first), project: nil, projectURL: nil)
         } else {
-            load(video: url, project: nil, projectURL: nil)
+            load(.sequence(urls), project: nil, projectURL: nil)
         }
+    }
+
+    /// Re-times or reverses the open image sequence. Frame identity is kept:
+    /// the selected first/last frames stay the same images.
+    func setSequence(framesPerSecond: Double? = nil, reversed: Bool? = nil) {
+        guard let sequence = imageSequence, let timeline else { return }
+        let fps = framesPerSecond ?? sequence.framesPerSecond
+        guard fps > 0, fps.isFinite, fps <= 10_000 else { return }
+        let updated = sequence.with(framesPerSecond: fps, reversed: reversed)
+        guard updated != sequence else { return }
+        let oldRange = timeline.frameIndices(in: range)
+        var first = oldRange?.lowerBound ?? 0
+        var last = oldRange?.upperBound ?? max(timeline.count - 1, 0)
+        if updated.reversed != sequence.reversed {
+            // The same images, now at mirrored indices.
+            (first, last) = (timeline.count - 1 - last, timeline.count - 1 - first)
+        }
+        let newTimeline = updated.timeline
+        source = .imageSequence(updated)
+        self.timeline = newTimeline
+        sourceIdentity = SourceIdentity.compute(forSequence: updated)
+        sourceFrame = nil
+        withUndoGroup {
+            let new = newTimeline.range(firstFrame: first, lastFrame: last, end: updated.duration)
+            rangeStart = new.start
+            rangeEnd = new.end
+        }
+        if rangeStart == settings.rangeStart, rangeEnd == settings.rangeEnd { settingsChanged(debounce: false) }
+        loadThumbnails(for: .imageSequence(updated), timeline: newTimeline)
+        scheduleSourceFrame()
     }
 
     // MARK: Projects
@@ -340,7 +384,7 @@ final class AppModel: ObservableObject {
         }
         switch SourceLocator.resolve(project.source, projectURL: url) {
         case let .found(media):
-            load(video: media, project: project, projectURL: url)
+            load(Self.spec(for: media, in: project), project: project, projectURL: url)
         case let .changed(media, differences):
             reset()
             sourceState = .relink(RelinkRequest(project: project, projectURL: url, candidate: media, differences: differences))
@@ -356,7 +400,8 @@ final class AppModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.movie]
         panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
+        panel.canChooseDirectories = request.isSequence
+        panel.canChooseFiles = !request.isSequence
         panel.message = "Locate “\(request.savedFileName)” for this project"
         panel.directoryURL = URL(fileURLWithPath: request.project.source.absolutePath).deletingLastPathComponent()
         if panel.runModal() == .OK, let url = panel.url {
@@ -368,9 +413,9 @@ final class AppModel: ObservableObject {
     /// asks again, now naming the chosen file as the candidate.
     func relink(to url: URL) {
         guard case let .relink(request) = sourceState else { return }
-        switch SourceLocator.check(url, against: request.project.source.identity) {
+        switch SourceLocator.check(url, against: request.project.source) {
         case let .found(media):
-            load(video: media, project: request.project, projectURL: request.projectURL)
+            load(Self.spec(for: media, in: request.project), project: request.project, projectURL: request.projectURL)
         case let .changed(media, differences):
             sourceState = .relink(RelinkRequest(project: request.project, projectURL: request.projectURL,
                                                 candidate: media, differences: differences))
@@ -384,7 +429,8 @@ final class AppModel: ObservableObject {
     /// media. The project is marked edited and the notice stays visible.
     func useRelinkCandidateAnyway() {
         guard case let .relink(request) = sourceState, let candidate = request.candidate else { return }
-        load(video: candidate, project: request.project, projectURL: request.projectURL, relinkedToChangedMedia: true)
+        load(Self.spec(for: candidate, in: request.project), project: request.project, projectURL: request.projectURL,
+             relinkedToChangedMedia: true)
     }
 
     func cancelRelink() {
@@ -395,10 +441,7 @@ final class AppModel: ObservableObject {
     /// The document as it would be written now.
     func currentProject(for projectURL: URL?) -> ProjectFile? {
         guard let source, let timeline, let sourceIdentity else { return nil }
-        let reference = SourceReference.make(
-            url: source.url, identity: sourceIdentity, duration: source.duration, displaySize: source.displaySize,
-            frameCount: timeline.count, projectURL: projectURL
-        )
+        let reference = SourceReference.make(source: source, identity: sourceIdentity, frameCount: timeline.count, projectURL: projectURL)
         return ProjectFile(
             source: reference, settings: settings, export: exportSettings,
             ui: ProjectFile.UIState(previewQuality: previewQuality.rawValue, viewMode: viewMode.rawValue, scrubIndex: scrubIndex),
@@ -482,33 +525,87 @@ final class AppModel: ObservableObject {
         sourceState = .empty
     }
 
-    /// Loads a video; when `project` is given, its settings are applied once
-    /// the clip is scanned and the document becomes the window's project.
-    private func load(video url: URL, project: ProjectFile?, projectURL: URL?, relinkedToChangedMedia: Bool = false) {
+    /// What to load: a movie file, stills chosen by the user, or a saved
+    /// sequence (exactly the saved file names inside a folder).
+    enum MediaSpec {
+        case video(URL)
+        case sequence([URL])
+        case savedSequence(folder: URL, SequenceReference)
+
+        var displayName: String {
+            switch self {
+            case let .video(url): return url.lastPathComponent
+            case let .sequence(urls):
+                guard let first = urls.first else { return "" }
+                return (urls.count == 1 && ImageSequenceLoader.isDirectory(first)) ? first.lastPathComponent
+                    : first.deletingLastPathComponent().lastPathComponent
+            case let .savedSequence(folder, _): return folder.lastPathComponent
+            }
+        }
+
+        var url: URL? {
+            switch self {
+            case let .video(url): return url
+            case let .sequence(urls): return urls.first
+            case let .savedSequence(folder, _): return folder
+            }
+        }
+    }
+
+    private static func spec(for media: URL, in project: ProjectFile) -> MediaSpec {
+        if let sequence = project.source.sequence { return .savedSequence(folder: media, sequence) }
+        return .video(media)
+    }
+
+    /// Loads media; when `project` is given, its settings are applied once
+    /// the frames are known and the document becomes the window's project.
+    private func load(_ spec: MediaSpec, project: ProjectFile?, projectURL: URL?, relinkedToChangedMedia: Bool = false) {
         reset()
-        sourceState = .loading(fileName: url.lastPathComponent, step: "Reading metadata…")
+        sourceState = .loading(fileName: spec.displayName, step: "Reading metadata…")
 
         loadTask = Task { [weak self] in
             do {
-                let info = try await VideoSourceLoader.load(url: url)
-                guard let self, !Task.isCancelled else { return }
-                self.source = info
-                self.sourceState = .loading(fileName: info.fileName, step: "Scanning frame timestamps…")
-                async let identityTask = Task.detached(priority: .utility) { try SourceIdentity.compute(for: url) }.value
-                let scan = try await FrameScanner.scan(info) { [weak self] count in
-                    self?.reportScanProgress(count)
+                let media: MediaSource
+                let timeline: FrameTimeline
+                var scan: FrameScanResult?
+                let identity: SourceIdentity
+                switch spec {
+                case let .video(url):
+                    let info = try await VideoSourceLoader.load(url: url)
+                    guard let self, !Task.isCancelled else { return }
+                    self.source = .video(info)
+                    self.sourceState = .loading(fileName: info.fileName, step: "Scanning frame timestamps…")
+                    async let identityTask = Task.detached(priority: .utility) { try SourceIdentity.compute(for: url) }.value
+                    let result = try await FrameScanner.scan(info) { [weak self] count in
+                        self?.reportScanProgress(count)
+                    }
+                    identity = try await identityTask
+                    media = .video(info)
+                    timeline = result.timeline
+                    scan = result
+                case let .sequence(urls):
+                    let info = try await ImageSequenceLoader.load(urls)
+                    media = .imageSequence(info)
+                    timeline = info.timeline
+                    identity = SourceIdentity.compute(forSequence: info)
+                case let .savedSequence(folder, saved):
+                    let info = try await ImageSequenceLoader.load(folder: folder, fileNames: saved.fileNames,
+                                                                  framesPerSecond: saved.framesPerSecond, reversed: saved.reversed)
+                    media = .imageSequence(info)
+                    timeline = info.timeline
+                    identity = SourceIdentity.compute(forSequence: info)
                 }
-                let identity = try await identityTask
-                guard !Task.isCancelled else { return }
-                self.timeline = scan.timeline
+                guard let self, !Task.isCancelled else { return }
+                self.source = media
+                self.timeline = timeline
                 self.scanResult = scan
-                self.scanned = scan.timeline.count
+                self.scanned = timeline.count
                 self.sourceIdentity = identity
                 self.suppressChanges = true
                 self.rangeStart = .zero
-                self.rangeEnd = info.duration
+                self.rangeEnd = media.duration
                 if let project {
-                    self.apply(project: project, to: info, timeline: scan.timeline, relinkedToChangedMedia: relinkedToChangedMedia)
+                    self.apply(project: project, to: media, timeline: timeline, relinkedToChangedMedia: relinkedToChangedMedia)
                 }
                 self.suppressChanges = false
                 self.sourceState = .ready
@@ -519,12 +616,12 @@ final class AppModel: ObservableObject {
                 if let project, let projectURL {
                     self.projectURL = projectURL
                     self.savedProject = project
-                    self.sourceRelinked = relinkedToChangedMedia || project.source.absolutePath != url.standardizedFileURL.path
+                    self.sourceRelinked = relinkedToChangedMedia || project.source.absolutePath != media.url.standardizedFileURL.path
                     self.noteRecent(projectURL)
                 } else {
-                    self.noteRecent(url)
+                    self.noteRecent(media.url)
                 }
-                self.loadThumbnails(for: info, timeline: scan.timeline)
+                self.loadThumbnails(for: media, timeline: timeline)
             } catch is CancellationError {
                 return
             } catch {
@@ -538,16 +635,17 @@ final class AppModel: ObservableObject {
     /// Applies a project's settings to a freshly scanned clip. Values that
     /// no longer fit (a range past the end of a shorter clip) are clamped and
     /// reported in `sourceNotice`; nothing is silently dropped.
-    private func apply(project: ProjectFile, to info: VideoSourceInfo, timeline: FrameTimeline, relinkedToChangedMedia: Bool) {
+    private func apply(project: ProjectFile, to info: MediaSource, timeline: FrameTimeline, relinkedToChangedMedia: Bool) {
         var notices: [String] = []
+        let word = info.isImageSequence ? "image folder" : "video"
         if relinkedToChangedMedia {
-            notices.append("Relinked to “\(info.fileName)”, which differs from the video the project was saved with.")
+            notices.append("Relinked to “\(info.fileName)”, which differs from the \(word) the project was saved with.")
         }
         if timeline.count != project.source.frameCount || info.duration != project.source.duration {
-            notices.append("The video now has \(timeline.count) frames over \(Format.seconds(info.duration.seconds)); the project was saved with \(project.source.frameCount) frames over \(Format.seconds(project.source.duration.seconds)).")
+            notices.append("The \(word) now has \(timeline.count) frames over \(Format.seconds(info.duration.seconds)); the project was saved with \(project.source.frameCount) frames over \(Format.seconds(project.source.duration.seconds)).")
         }
         if info.displaySize != project.source.displaySize {
-            notices.append("The video is \(info.displaySize); the project was saved with \(project.source.displaySize).")
+            notices.append("The \(word) is \(info.displaySize); the project was saved with \(project.source.displaySize).")
         }
         var s = project.settings
         if s.rangeEnd > info.duration || s.rangeStart >= info.duration || !(s.rangeStart < s.rangeEnd) {
@@ -580,7 +678,7 @@ final class AppModel: ObservableObject {
         sourceState = .empty
     }
 
-    private func loadThumbnails(for source: VideoSourceInfo, timeline: FrameTimeline) {
+    private func loadThumbnails(for source: MediaSource, timeline: FrameTimeline) {
         thumbnailTask?.cancel()
         thumbnailTask = Task { [weak self] in
             let images = (try? await SourceFrames.thumbnails(
@@ -819,7 +917,7 @@ final class AppModel: ObservableObject {
                     self?.reportPreviewProgress(progress, revision: revision)
                 }
                 let image = try await Task.detached(priority: .userInitiated) {
-                    try ImageExporter.makeCGImage(result.image, bitDepth: .eight)
+                    try ImageExporter.makeCGImage(result.image, bitDepth: .eight, alpha: ImageExporter.hasTransparency(result.image))
                 }.value
                 guard let self, !Task.isCancelled, revision == self.settingsRevision else { return }
                 self.preview = PreviewSnapshot(

@@ -1,6 +1,6 @@
 # FrameStack
 
-A native, local-first macOS app that turns time into a still image: import a video, choose exactly which frames to use, and combine them into one photograph — starting with a true equal-weight, linear-light **Average** (a "long exposure" from video).
+A native, local-first macOS app that turns time into a still image: import a video or a folder of stills, choose exactly which frames to use, and combine them into one photograph — starting with a true equal-weight, linear-light **Average** (a "long exposure" from video).
 
 Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent rules: [`AGENTS.md`](AGENTS.md) · plan & status: [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) · decisions: [`DECISIONS.md`](DECISIONS.md).
 
@@ -14,9 +14,11 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M4 (robust output and state):** **`.framestack` projects** (⌘S / ⇧⌘S) — one JSON file holding a reference to the video (bookmark + path + size/fingerprint), the time range, sampling, blend, export settings and the playhead; reopening rescans the clip and restores everything. A moved or renamed video is found again; a missing or changed video stops at a **relink** screen (Locate… / Use This File Anyway / Cancel) and is never swapped in silently. **Export** as PNG (8/16-bit), JPEG (quality) or TIFF (8/16-bit), at native size, a long-edge cap or a percentage, in sRGB or Display P3 — every file is read back and its size, depth and profile verified. 10-bit (HEVC Main10 / HDR) clips are decoded to half-float so their precision reaches the composite.
 
+**M5a (image sequences):** open a **folder of JPEG/PNG/TIFF/HEIF stills** (or several chosen files, or one image for its folder) — natural name order, a **sequence rate** field and **Reverse order** toggle, times labelled as *sequence time* because stills have no recorded timestamps; EXIF orientation and embedded profiles (Display P3 phone JPEGs) are honoured; transparent PNGs keep their alpha in PNG/TIFF exports. Mixed sizes are refused with the offending files named; sequences save into projects and relink like videos.
+
 | Keys | |
 |---|---|
-| ⌘O · Open Recent | open a clip or a `.framestack` project |
+| ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
 | ⌘S · ⇧⌘S | save the project · save as |
 | ⌘E | export an image (format, size and color space in the Export section) |
 | ⌘Z / ⇧⌘Z | undo / redo settings |
@@ -27,7 +29,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: image sequences and alignment (M5), weighting/masks/motion/color/batches/median (M6), HDR tone mapping. See the plan.
+Not yet: alignment and crop (M5b/c), weighting/masks/motion/color/batches/median (M6), RAW stills, HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -78,6 +80,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 | `trimmed_editlist.mp4` — stream-copied cut with an MP4 edit list | Only frames inside the edit are counted/used (45…106); fast scan = decoder timestamps |
 | `corrupt_frame_75.mp4` — count clip with one damaged NAL unit | The decoder failure is skipped; the damaged GOP is reported missing, every other frame is composited and keeps its identity |
 | `tenbit_ramp_10f.mp4` — HEVC Main10 (lossless), a 10-bit luma ramp | 10-bit sources are identified and decoded to half-float: 320 distinct ramp values survive (8-bit decode: 205) and a 16-bit PNG keeps them |
+| `sequence_png_12f/` — 12 PNG stills `frame_0…11.png` (+ a stray text file), index in binary blocks, gray bar | Natural sort (frame_10 after frame_9), non-images skipped, sequence time i/rate, every still decodes to itself, Average matches fixed values, reverse order, EXIF orientation and alpha (variants written by the tests) |
 
 ## Manual verification (GUI — all 7 steps passed on the owner's Mac on 2026-11-06)
 
@@ -93,6 +96,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 10. (M4) Change a few settings, ⇧⌘S, save `demo.framestack` next to the clip. The title becomes "demo – clip.mov"; the Project section says Saved. Change the blend: the subtitle shows "Edited"; ⌘Q asks Save / Don't Save / Cancel. Quit with Save, double-click the project in Finder (or ⌘O it): the same settings, selection and preview come back.
 11. (M4) Rename the clip in Finder and open the project: it opens anyway (Project shows "Unsaved changes" for the new location). Move the clip to another disk or delete it and open the project: "Video not found" with Locate…; pick the clip. Put a *different* video under the old name: "Video has changed" lists size/fingerprint differences; Use This File Anyway loads it with an orange notice describing what differs.
 12. (M4) In Export choose JPEG + Percent 50 and export; the inspector reports "Saved 540×960, 8-bit JPEG, sRGB IEC61966-2.1" and Finder agrees. Choose TIFF 16-bit + Display P3; the report says Display P3 and the image looks the same as the sRGB one in Preview (color-managed).
+13. (M5a) Drop a folder of same-size photos (or choose several in ⌘O). Source shows "N (JPEG ×N)", the pixel size after rotation, a Sequence rate field and Reverse order; the Time Range caption says "sequence time". Type 10 in the rate field, Return: End becomes N/10 s and the frames stay selected. Tick Reverse order: the filmstrip flips. Save as a project, quit, reopen: rate and order come back. A folder mixing portrait and landscape shots is refused with the file names.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

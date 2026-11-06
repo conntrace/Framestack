@@ -12,7 +12,12 @@ struct InspectorView: View {
                     if model.timeline != nil {
                         InspectorSection(title: "Project", key: "project") { ProjectSection() }
                     }
-                    InspectorSection(title: "Source", key: "source") { SourceSection(source: source) }
+                    InspectorSection(title: "Source", key: "source") {
+                        switch source {
+                        case let .video(video): SourceSection(source: video)
+                        case let .imageSequence(sequence): SequenceSourceSection(sequence: sequence)
+                        }
+                    }
                     if model.timeline != nil {
                         InspectorSection(title: "Time Range", key: "range") { TimeRangeSection(source: source) }
                         InspectorSection(title: "Sampling", key: "sampling") { SamplingSection() }
@@ -178,11 +183,70 @@ private struct SourceSection: View {
     }
 }
 
+// MARK: Image sequence source
+
+private struct SequenceSourceSection: View {
+    @EnvironmentObject private var model: AppModel
+    let sequence: ImageSequenceInfo
+    /// Draft of the rate field; committed on Return or when focus leaves
+    /// (a `TextField(value:format:)` bound straight to the model dropped
+    /// commits whenever the commit replaced the source).
+    @State private var rateDraft: Double = ImageSequenceInfo.defaultFramesPerSecond
+    @FocusState private var rateFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(sequence.fileName).font(.headline).lineLimit(2).help(sequence.folderURL.path)
+            InfoRow(label: "Images", value: "\(sequence.count) (\(sequence.formatSummary))")
+            InfoRow(label: "Pixels", value: sequence.displaySize.description)
+            InfoRow(label: "Depth", value: "\(sequence.bitsPerComponent)-bit" + (sequence.hasAlpha ? ", with alpha" : ""))
+            InfoRow(label: "Total size", value: Format.bytes(sequence.totalFileSizeBytes))
+            HStack {
+                Text("Sequence rate").foregroundStyle(.secondary)
+                Spacer()
+                TextField("Rate", value: $rateDraft, format: .number.precision(.fractionLength(0...3)))
+                    .textFieldStyle(.roundedBorder).monospacedDigit().frame(width: 72).labelsHidden()
+                    .focused($rateFocused)
+                    .onSubmit(commitRate)
+                    .onChange(of: rateFocused) { _, focused in if !focused { commitRate() } }
+                    .onAppear { rateDraft = sequence.framesPerSecond }
+                    .onChange(of: sequence.framesPerSecond) { _, new in rateDraft = new }
+                Text("fps").foregroundStyle(.secondary)
+            }
+            .font(.callout)
+            Toggle("Reverse order", isOn: reversedBinding)
+                .font(.callout)
+            Text("Stills have no recorded timestamps: times are **sequence time** (image index ÷ rate), \(Format.duration(sequence.duration.seconds)) for \(sequence.count) images.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(sequence.warnings, id: \.self) { warning in
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func commitRate() {
+        guard rateDraft > 0, rateDraft.isFinite, rateDraft <= 10_000 else {
+            rateDraft = sequence.framesPerSecond
+            return
+        }
+        if abs(rateDraft - sequence.framesPerSecond) > 1e-9 { model.setSequence(framesPerSecond: rateDraft) }
+    }
+
+    private var reversedBinding: Binding<Bool> {
+        Binding(get: { sequence.reversed }, set: { model.setSequence(reversed: $0) })
+    }
+}
+
 // MARK: Time range
 
 private struct TimeRangeSection: View {
     @EnvironmentObject private var model: AppModel
-    let source: VideoSourceInfo
+    let source: MediaSource
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -195,7 +259,7 @@ private struct TimeRangeSection: View {
                 FrameIndexField(label: "Last frame", value: lastFrameBinding, maximum: maxIndex)
             }
             HStack {
-                Text("Start inclusive, end exclusive [start, end) · \(Format.seconds(max(0, model.range.durationSeconds)))")
+                Text("Start inclusive, end exclusive [start, end) · \(Format.seconds(max(0, model.range.durationSeconds)))\(source.isImageSequence ? " sequence time" : "")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -427,9 +491,15 @@ private struct ExportSection: View {
             switch model.exportActivity {
             case let .finished(report, missing, decodeFailure):
                 VStack(alignment: .leading, spacing: 4) {
-                    Label("Saved \(report.width)×\(report.height), \(report.bitDepth)-bit \(report.format?.displayName ?? ""), \(report.colorProfileName ?? "untagged")",
+                    Label("Saved \(report.width)×\(report.height), \(report.bitDepth)-bit \(report.format?.displayName ?? "")\(report.hasAlpha ? " with alpha" : ""), \(report.colorProfileName ?? "untagged")",
                           systemImage: "checkmark.circle")
                         .foregroundStyle(.green)
+                    if report.alphaFlattened {
+                        Label("The composite has transparent pixels; JPEG cannot store them, so they were composited over black.",
+                              systemImage: "info.circle")
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if missing > 0 {
                         Label("\(missing) selected frames could not be decoded and were left out" + (decodeFailure.map { " (\($0))" } ?? "") + ".",
                               systemImage: "exclamationmark.triangle")

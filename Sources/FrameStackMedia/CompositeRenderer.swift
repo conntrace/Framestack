@@ -6,7 +6,7 @@ import Foundation
 import FrameStackCore
 
 public struct CompositeRequest: Sendable {
-    public var source: VideoSourceInfo
+    public var source: MediaSource
     /// Presentation timestamps of the selected frames, ascending.
     public var frames: [FrameTime]
     public var blendMode: BlendMode
@@ -15,8 +15,16 @@ public struct CompositeRequest: Sendable {
     /// `nil` renders at native (display-oriented) resolution.
     public var maxLongEdge: Int?
 
-    public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?) {
+    public init(source: MediaSource, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?) {
         self.source = source
+        self.frames = frames
+        self.blendMode = blendMode
+        self.opacity = opacity
+        self.maxLongEdge = maxLongEdge
+    }
+
+    public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?) {
+        self.source = .video(source)
         self.frames = frames
         self.blendMode = blendMode
         self.opacity = opacity
@@ -129,27 +137,12 @@ public final class CompositeRenderer: @unchecked Sendable {
         ])
     }
 
-    public func render(
-        _ request: CompositeRequest,
-        progress: (@Sendable (CompositeProgress) -> Void)? = nil
-    ) async throws -> CompositeResult {
-        let started = Date()
-        guard let first = request.frames.first, let last = request.frames.last else {
-            throw MediaError.noFramesSelected
-        }
-        try Task.checkCancellation()
-
-        let wanted = Set(request.frames)
-        let total = wanted.count
-        let asset = VideoSourceLoader.makeAsset(request.source.url)
-        let track = try await VideoSourceLoader.videoTrack(of: asset, trackID: request.source.trackID)
-        try Task.checkCancellation()
-
-        // Decode only the span containing the selection. The end is one tick
-        // past the last selected timestamp, so that frame is included.
-        let end = CMTimeAdd(last.cmTime, CMTime(value: 1, timescale: last.timescale))
-        let orientation = CGImagePropertyOrientation(rawValue: UInt32(request.source.orientation.rawValue)) ?? .up
-
+    /// Everything the per-frame step needs; shared by the video and the
+    /// image-sequence producers so both reduce frames identically.
+    private final class Reduction {
+        let request: CompositeRequest
+        let wanted: Set<FrameTime>
+        let total: Int
         var seen = Set<FrameTime>()
         var reducer: FrameReducer?
         var frameBuffer: [Float] = []
@@ -158,10 +151,92 @@ public final class CompositeRenderer: @unchecked Sendable {
         var previous: FrameTime?
         var inOrder = true
         var failures: [DecodeFailure] = []
+        let progress: (@Sendable (CompositeProgress) -> Void)?
+
+        init(request: CompositeRequest, progress: (@Sendable (CompositeProgress) -> Void)?) {
+            self.request = request
+            self.wanted = Set(request.frames)
+            self.total = wanted.count
+            self.progress = progress
+        }
+
+        var isComplete: Bool { seen.count == total }
+    }
+
+    public func render(
+        _ request: CompositeRequest,
+        progress: (@Sendable (CompositeProgress) -> Void)? = nil
+    ) async throws -> CompositeResult {
+        let started = Date()
+        guard !request.frames.isEmpty else {
+            throw MediaError.noFramesSelected
+        }
+        try Task.checkCancellation()
+        let reduction = Reduction(request: request, progress: progress)
+
+        switch request.source {
+        case let .video(video):
+            try await decodeVideo(video, into: reduction)
+        case let .imageSequence(sequence):
+            try decodeSequence(sequence, into: reduction)
+        }
+        try Task.checkCancellation()
+
+        guard let reducer = reduction.reducer, reducer.count > 0 else {
+            throw MediaError.noFramesDecoded
+        }
+        let image = try reducer.result()
+        let missing = request.frames.filter { !reduction.seen.contains($0) }
+        return CompositeResult(
+            image: image,
+            framesComposited: reducer.count,
+            missingFrames: missing,
+            decodeFailures: reduction.failures,
+            deliveredInPresentationOrder: reduction.inOrder,
+            elapsedSeconds: Date().timeIntervalSince(started)
+        )
+    }
+
+    /// Orients, size-checks, resamples and reduces one upright frame.
+    private func consume(_ image: CIImage, at pts: FrameTime, into r: Reduction) throws {
+        let size = PixelSize(width: Int(image.extent.width.rounded()), height: Int(image.extent.height.rounded()))
+        if let expected = r.sourceSize {
+            guard expected == size else {
+                throw MediaError.frameSizeChanged(expected: expected, actual: size)
+            }
+        } else {
+            r.sourceSize = size
+            r.outputSize = size.fitting(maxLongEdge: r.request.maxLongEdge)
+            r.reducer = r.request.blendMode.makeReducer(
+                width: r.outputSize.width, height: r.outputSize.height, opacity: r.request.opacity
+            )
+            r.frameBuffer = [Float](repeating: 0, count: r.outputSize.pixelCount * LinearImage.channelCount)
+        }
+        renderFrame(image, sourceSize: size, outputSize: r.outputSize, into: &r.frameBuffer)
+        try r.frameBuffer.withUnsafeBufferPointer { try r.reducer!.add($0) }
+        r.seen.insert(pts)
+        if let previous = r.previous, !(previous < pts) { r.inOrder = false }
+        r.previous = pts
+        r.progress?(CompositeProgress(framesComposited: r.seen.count, framesTotal: r.total))
+    }
+
+    // MARK: Video
+
+    private func decodeVideo(_ source: VideoSourceInfo, into r: Reduction) async throws {
+        let request = r.request
+        guard let first = request.frames.first, let last = request.frames.last else { return }
+        let asset = VideoSourceLoader.makeAsset(source.url)
+        let track = try await VideoSourceLoader.videoTrack(of: asset, trackID: source.trackID)
+        try Task.checkCancellation()
+
+        // Decode only the span containing the selection. The end is one tick
+        // past the last selected timestamp, so that frame is included.
+        let end = CMTimeAdd(last.cmTime, CMTime(value: 1, timescale: last.timescale))
+        let orientation = CGImagePropertyOrientation(rawValue: UInt32(source.orientation.rawValue)) ?? .up
         var resumeFrom = first
 
         readers: while true {
-            let (reader, output) = try makeReader(asset: asset, track: track, codec: request.source.codec, highPrecision: request.source.wantsHighPrecisionDecode,
+            let (reader, output) = try makeReader(asset: asset, track: track, codec: source.codec, highPrecision: source.wantsHighPrecisionDecode,
                                                   from: resumeFrom.cmTime, to: end)
             defer {
                 if reader.status == .reading { reader.cancelReading() }
@@ -175,34 +250,12 @@ public final class CompositeRenderer: @unchecked Sendable {
                     guard let sample = output.copyNextSampleBuffer() else { return true }
                     guard let pts = FrameTime(CMSampleBufferGetPresentationTimeStamp(sample)) else { return false }
                     lastDelivered = pts
-                    guard wanted.contains(pts), !seen.contains(pts),
+                    guard r.wanted.contains(pts), !r.seen.contains(pts),
                           let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
                         return false
                     }
-
-                    let image = orientedImage(pixelBuffer, orientation: orientation)
-                    let size = PixelSize(width: Int(image.extent.width.rounded()), height: Int(image.extent.height.rounded()))
-                    if let expected = sourceSize {
-                        guard expected == size else {
-                            throw MediaError.frameSizeChanged(expected: expected, actual: size)
-                        }
-                    } else {
-                        sourceSize = size
-                        outputSize = size.fitting(maxLongEdge: request.maxLongEdge)
-                        reducer = request.blendMode.makeReducer(
-                            width: outputSize.width, height: outputSize.height, opacity: request.opacity
-                        )
-                        frameBuffer = [Float](repeating: 0, count: outputSize.pixelCount * LinearImage.channelCount)
-                    }
-
-                    renderFrame(image, sourceSize: size, outputSize: outputSize, into: &frameBuffer)
-                    try frameBuffer.withUnsafeBufferPointer { try reducer!.add($0) }
-
-                    seen.insert(pts)
-                    if let previous, !(previous < pts) { inOrder = false }
-                    previous = pts
-                    progress?(CompositeProgress(framesComposited: seen.count, framesTotal: total))
-                    return seen.count == total
+                    try consume(orientedImage(pixelBuffer, orientation: orientation), at: pts, into: r)
+                    return r.isComplete
                 }
                 if finished { break }
             }
@@ -215,30 +268,44 @@ public final class CompositeRenderer: @unchecked Sendable {
             // strictly greater than the anchor, so every restart advances.
             let message = reader.error?.localizedDescription ?? "unknown error"
             let anchor = lastDelivered ?? resumeFrom
-            guard failures.count < Self.maxDecoderRestarts,
-                  let next = request.frames.first(where: { $0 > anchor && !seen.contains($0) }) else {
-                if reducer == nil { throw MediaError.readerFailed(message) }
-                failures.append(DecodeFailure(afterFrame: lastDelivered, resumedAt: last, message: message))
+            guard r.failures.count < Self.maxDecoderRestarts,
+                  let next = request.frames.first(where: { $0 > anchor && !r.seen.contains($0) }) else {
+                if r.reducer == nil { throw MediaError.readerFailed(message) }
+                r.failures.append(DecodeFailure(afterFrame: lastDelivered, resumedAt: last, message: message))
                 break readers
             }
-            failures.append(DecodeFailure(afterFrame: lastDelivered, resumedAt: next, message: message))
+            r.failures.append(DecodeFailure(afterFrame: lastDelivered, resumedAt: next, message: message))
             resumeFrom = next
         }
-        try Task.checkCancellation()
+    }
 
-        guard let reducer, reducer.count > 0 else {
-            throw MediaError.noFramesDecoded
+    // MARK: Image sequence
+
+    /// Decodes each selected still in playback order. A file that cannot be
+    /// decoded is reported as a decode failure and left out — never
+    /// replaced by a neighbour.
+    private func decodeSequence(_ sequence: ImageSequenceInfo, into r: Reduction) throws {
+        for pts in r.request.frames {
+            try Task.checkCancellation()
+            guard let file = sequence.file(at: pts) else {
+                r.failures.append(DecodeFailure(afterFrame: r.previous, resumedAt: pts,
+                                                message: "\(pts) is not a frame time of this sequence"))
+                continue
+            }
+            try autoreleasepool {
+                guard let decoded = CIImage(contentsOf: file.url) else {
+                    r.failures.append(DecodeFailure(afterFrame: r.previous, resumedAt: pts,
+                                                    message: "\(file.fileName) could not be decoded"))
+                    return
+                }
+                // Apply the EXIF orientation the loader read from the header
+                // (the same value the inspector and the canvas size use).
+                let orientation = CGImagePropertyOrientation(rawValue: UInt32(file.orientation)) ?? .up
+                let image = orientation == .up ? decoded : decoded.oriented(orientation)
+                let origin = image.extent.origin
+                try consume(image.transformed(by: CGAffineTransform(translationX: -origin.x, y: -origin.y)), at: pts, into: r)
+            }
         }
-        let image = try reducer.result()
-        let missing = request.frames.filter { !seen.contains($0) }
-        return CompositeResult(
-            image: image,
-            framesComposited: reducer.count,
-            missingFrames: missing,
-            decodeFailures: failures,
-            deliveredInPresentationOrder: inOrder,
-            elapsedSeconds: Date().timeIntervalSince(started)
-        )
     }
 
     private func makeReader(

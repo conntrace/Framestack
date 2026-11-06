@@ -40,6 +40,22 @@ public struct SourceIdentity: Sendable, Codable, Equatable {
         self.fingerprint = fingerprint
     }
 
+    /// Identity of an image sequence: the folder name, the total size, the
+    /// folder's modification date and a SHA-256 over every file's name and
+    /// size in order. Reading each image's bytes is deliberately avoided
+    /// (a sequence may be thousands of stills).
+    public static func compute(forSequence sequence: ImageSequenceInfo) -> SourceIdentity {
+        var hasher = SHA256()
+        for file in sequence.files {
+            hasher.update(data: Data("\(file.fileName)\t\(file.fileSizeBytes)\n".utf8))
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let modified = (try? sequence.folderURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+            .map { Date(timeIntervalSince1970: $0.timeIntervalSince1970.rounded(.down)) }
+        return SourceIdentity(fileName: sequence.fileName, fileSizeBytes: sequence.totalFileSizeBytes,
+                              modificationDate: modified, fingerprint: "sha256-list:\(digest)")
+    }
+
     public static func compute(for url: URL) throws -> SourceIdentity {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
@@ -76,9 +92,36 @@ public struct SourceIdentity: Sendable, Codable, Equatable {
     }
 }
 
+/// How an image sequence is rebuilt from its folder.
+public struct SequenceReference: Sendable, Codable, Equatable {
+    /// File names in natural order (the saved selection, not the whole folder).
+    public var fileNames: [String]
+    public var framesPerSecond: Double
+    public var reversed: Bool
+
+    public init(fileNames: [String], framesPerSecond: Double, reversed: Bool) {
+        self.fileNames = fileNames
+        self.framesPerSecond = framesPerSecond
+        self.reversed = reversed
+    }
+
+    public init(_ sequence: ImageSequenceInfo) {
+        self.init(fileNames: sequence.files.map(\.fileName), framesPerSecond: sequence.framesPerSecond, reversed: sequence.reversed)
+    }
+}
+
+public enum SourceKind: String, Sendable, Codable {
+    case video
+    case imageSequence
+}
+
 /// Where a project's media lives, with enough redundancy to find it again
 /// after a move, a rename or a copy of the whole folder.
 public struct SourceReference: Sendable, Codable, Equatable {
+    /// Video file or image-sequence folder (format 2; absent in format 1 = video).
+    public var kind: SourceKind
+    /// Present for image sequences.
+    public var sequence: SequenceReference?
     /// Alias-style bookmark (follows moves and renames on the same volume).
     public var bookmark: Data?
     public var absolutePath: String
@@ -90,8 +133,10 @@ public struct SourceReference: Sendable, Codable, Equatable {
     /// Scanned frame count when the project was saved.
     public var frameCount: Int
 
-    public init(bookmark: Data?, absolutePath: String, relativePath: String?, identity: SourceIdentity,
-                duration: FrameTime, displaySize: PixelSize, frameCount: Int) {
+    public init(kind: SourceKind = .video, sequence: SequenceReference? = nil, bookmark: Data?, absolutePath: String,
+                relativePath: String?, identity: SourceIdentity, duration: FrameTime, displaySize: PixelSize, frameCount: Int) {
+        self.kind = kind
+        self.sequence = sequence
         self.bookmark = bookmark
         self.absolutePath = absolutePath
         self.relativePath = relativePath
@@ -99,6 +144,34 @@ public struct SourceReference: Sendable, Codable, Equatable {
         self.duration = duration
         self.displaySize = displaySize
         self.frameCount = frameCount
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, sequence, bookmark, absolutePath, relativePath, identity, duration, displaySize, frameCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try c.decodeIfPresent(SourceKind.self, forKey: .kind) ?? .video
+        sequence = try c.decodeIfPresent(SequenceReference.self, forKey: .sequence)
+        bookmark = try c.decodeIfPresent(Data.self, forKey: .bookmark)
+        absolutePath = try c.decode(String.self, forKey: .absolutePath)
+        relativePath = try c.decodeIfPresent(String.self, forKey: .relativePath)
+        identity = try c.decode(SourceIdentity.self, forKey: .identity)
+        duration = try c.decode(FrameTime.self, forKey: .duration)
+        displaySize = try c.decode(PixelSize.self, forKey: .displaySize)
+        frameCount = try c.decode(Int.self, forKey: .frameCount)
+    }
+
+    /// A reference to the open media (video file or sequence folder).
+    public static func make(source: MediaSource, identity: SourceIdentity, frameCount: Int, projectURL: URL?) -> SourceReference {
+        var reference = make(url: source.url, identity: identity, duration: source.duration, displaySize: source.displaySize,
+                             frameCount: frameCount, projectURL: projectURL)
+        if let sequence = source.imageSequence {
+            reference.kind = .imageSequence
+            reference.sequence = SequenceReference(sequence)
+        }
+        return reference
     }
 
     public static func make(url: URL, identity: SourceIdentity, duration: FrameTime, displaySize: PixelSize,
@@ -159,7 +232,7 @@ public enum SourceLocator {
     public static func resolve(_ reference: SourceReference, projectURL: URL?) -> SourceResolution {
         var changed: SourceResolution?
         for url in reference.candidates(projectURL: projectURL) where FileManager.default.fileExists(atPath: url.path) {
-            switch check(url, against: reference.identity) {
+            switch check(url, against: reference) {
             case .found:
                 return .found(url)
             case let other:
@@ -169,20 +242,45 @@ public enum SourceLocator {
         return changed ?? .missing
     }
 
-    /// Compares one file (e.g. chosen in a relink panel) with the saved identity.
-    public static func check(_ url: URL, against identity: SourceIdentity) -> SourceResolution {
+    /// Compares one file or folder (e.g. chosen in a relink panel) with the
+    /// saved reference.
+    public static func check(_ url: URL, against reference: SourceReference) -> SourceResolution {
         guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
-        guard let current = try? SourceIdentity.compute(for: url) else {
+        let current: SourceIdentity
+        if let saved = reference.sequence {
+            guard ImageSequenceLoader.isDirectory(url) else {
+                return .changed(url, differences: ["not a folder of images"])
+            }
+            // Header-only listing of exactly the saved file names.
+            let files = saved.fileNames.compactMap { ImageSequenceLoader.describe(url.appendingPathComponent($0)) }
+            let sequence = ImageSequenceInfo(folderURL: url, files: files, displaySize: files.first?.pixelSize ?? PixelSize(width: 0, height: 0),
+                                             framesPerSecond: saved.framesPerSecond, reversed: saved.reversed, skippedFileNames: [])
+            current = SourceIdentity.compute(forSequence: sequence)
+            var differences = current.differences(from: reference.identity)
+            if files.count != saved.fileNames.count {
+                differences.insert("\(saved.fileNames.count - files.count) of \(saved.fileNames.count) images missing", at: 0)
+            }
+            return differences.isEmpty ? .found(url) : .changed(url, differences: differences)
+        }
+        guard let identity = try? SourceIdentity.compute(for: url) else {
             return .changed(url, differences: ["unreadable"])
         }
-        let differences = current.differences(from: identity)
+        let differences = identity.differences(from: reference.identity)
         return differences.isEmpty ? .found(url) : .changed(url, differences: differences)
+    }
+
+    /// Backwards-compatible form for a plain video file.
+    public static func check(_ url: URL, against identity: SourceIdentity) -> SourceResolution {
+        check(url, against: SourceReference(bookmark: nil, absolutePath: url.path, relativePath: nil, identity: identity,
+                                            duration: .zero, displaySize: PixelSize(width: 0, height: 0), frameCount: 0))
     }
 }
 
 /// The `.framestack` document: a single JSON file (DECISIONS.md D-019).
 public struct ProjectFile: Codable, Equatable, Sendable {
-    public static let currentFormatVersion = 1
+    /// 1: videos only. 2: adds `source.kind` and `source.sequence` (image
+    /// sequences); format-1 files read unchanged.
+    public static let currentFormatVersion = 2
     public static let fileExtension = "framestack"
     public static let typeIdentifier = "local.framestack.project"
 

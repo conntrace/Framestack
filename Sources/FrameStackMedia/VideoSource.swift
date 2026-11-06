@@ -18,6 +18,10 @@ public enum MediaError: Error, LocalizedError, Equatable {
     case transparencyNotSupported
     case exportFailed(String)
     case exportVerificationFailed(String)
+    case noImagesFound(path: String)
+    case mixedImageSizes(canvas: PixelSize, canvasFile: String, offenders: [String], count: Int)
+    case invalidSequenceRate(Double)
+    case imageUndecodable(path: String, reason: String)
 
     public var errorDescription: String? {
         switch self {
@@ -47,6 +51,14 @@ public enum MediaError: Error, LocalizedError, Equatable {
             return "Export failed: \(reason)"
         case let .exportVerificationFailed(reason):
             return "The exported file did not verify: \(reason)"
+        case let .noImagesFound(path):
+            return path.isEmpty ? "No images were chosen." : "“\((path as NSString).lastPathComponent)” contains no readable JPEG, PNG, TIFF or HEIF images."
+        case let .mixedImageSizes(canvas, canvasFile, offenders, count):
+            return "The images are not all the same size: “\(canvasFile)” is \(canvas) but \(count == 1 ? "1 other differs" : "\(count) others differ") (\(offenders.joined(separator: ", "))\(count > offenders.count ? ", …" : "")). FrameStack does not stretch or pad images silently; make them the same size first."
+        case let .invalidSequenceRate(rate):
+            return "The sequence rate must be a positive number of frames per second (got \(rate))."
+        case let .imageUndecodable(path, reason):
+            return "“\((path as NSString).lastPathComponent)” could not be decoded: \(reason)"
         }
     }
 }

@@ -94,7 +94,8 @@ final class ProjectTests: XCTestCase {
         let media = try copyFixture("count_5s_30fps", as: "clip.mp4")
         let (original, projectURL) = try await makeSavedProject(media: media)
         let text = try String(contentsOf: projectURL, encoding: .utf8)
-        XCTAssertTrue(text.contains("\"formatVersion\" : 1"))
+        XCTAssertTrue(text.contains("\"formatVersion\" : 2"))
+        XCTAssertTrue(text.contains("\"kind\" : \"video\""))
         XCTAssertTrue(text.contains("\"relativePath\" : \"media/clip.mp4\""), "project next to the media folder: \(text)")
         XCTAssertTrue(text.contains("\"fingerprint\" : \"sha256:"))
         XCTAssertFalse(text.contains("\"exactCount\" : 0"))
@@ -285,5 +286,152 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(model.suggestedExportName, "moving_square_24f Average 24f.png")
         XCTAssertEqual(model.exportOutputSize, PixelSize(width: 480, height: 272))
         try await waitUntil { model.isPreviewCurrent }
+    }
+}
+
+// MARK: - Image sequences (M5a)
+
+@MainActor
+final class SequenceAppTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("FrameStackSeqApp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var fixtureFolder: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("FrameStackMediaTests/Fixtures/sequence_png_12f")
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 20, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func waitReady(_ model: AppModel) async throws {
+        try await waitUntil { if case .ready = model.sourceState { return true } else { return false } }
+        try await waitUntil { model.isPreviewCurrent }
+    }
+
+    private func makeModel() -> AppModel {
+        AppModel(defaults: UserDefaults(suiteName: "SequenceAppTests-\(UUID().uuidString)")!)
+    }
+
+    func testOpenFolderRetimeReverseAndThumbnails() async throws {
+        let model = makeModel()
+        model.open(fixtureFolder)
+        try await waitReady(model)
+        let seq = try XCTUnwrap(model.imageSequence)
+        XCTAssertEqual(seq.count, 12)
+        XCTAssertEqual(model.timeline?.count, 12)
+        XCTAssertEqual(model.scanned, 12)
+        XCTAssertNil(model.scanResult, "no timestamp scan for stills")
+        XCTAssertEqual(model.source?.displaySize, PixelSize(width: 160, height: 90))
+        XCTAssertEqual(model.rangeEnd, FrameTime(value: 12, timescale: 30))
+        XCTAssertEqual(model.windowTitle, "sequence_png_12f")
+        XCTAssertEqual(model.preview?.framesComposited, 12)
+        try await waitUntil { !model.thumbnails.isEmpty }
+        XCTAssertEqual(model.thumbnails.count, 12)
+        XCTAssertEqual(model.suggestedExportName, "sequence_png_12f Average 12f.png")
+
+        // Retime: same images, new duration; a narrowed range keeps its frames.
+        model.setFrameRange(first: 2, last: 7)
+        model.setSequence(framesPerSecond: 10)
+        XCTAssertEqual(model.imageSequence?.framesPerSecond, 10)
+        XCTAssertEqual(model.source?.duration.seconds ?? 0, 1.2, accuracy: 1e-9)
+        XCTAssertEqual(model.frameRange, 2...7)
+        XCTAssertEqual(model.rangeStart, FrameTime(value: 2000, timescale: 10_000))
+        XCTAssertEqual(model.selectedTimes.count, 6)
+
+        // Reverse: the same six images, now at mirrored indices.
+        model.setSequence(reversed: true)
+        XCTAssertEqual(model.imageSequence?.reversed, true)
+        XCTAssertEqual(model.frameRange, 4...9)
+        XCTAssertEqual(model.imageSequence?.orderedFiles[4].fileName, "frame_7.png")
+        XCTAssertEqual(model.imageSequence?.orderedFiles[9].fileName, "frame_2.png")
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.preview?.framesComposited, 6)
+
+        // Original view shows the still under the playhead.
+        model.scrubIndex = 0
+        model.viewMode = .original
+        try await waitUntil { model.sourceFrame != nil }
+        XCTAssertEqual(model.sourceFrame?.image.width, 160)
+    }
+
+    func testOpenSeveralStillsAndMixedSizesFailClearly() async throws {
+        let model = makeModel()
+        model.open([3, 1, 2].map { fixtureFolder.appendingPathComponent("frame_\($0).png") })
+        try await waitReady(model)
+        XCTAssertEqual(model.imageSequence?.files.map(\.fileName), ["frame_1.png", "frame_2.png", "frame_3.png"])
+
+        let mixed = directory.appendingPathComponent("mixed")
+        try FileManager.default.createDirectory(at: mixed, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fixtureFolder.appendingPathComponent("frame_0.png"), to: mixed.appendingPathComponent("a.png"))
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("FrameStackMediaTests/Fixtures/portrait_rot90cw.mp4"), to: mixed.appendingPathComponent("clip.mp4"))
+        // A folder whose only image is fine but which holds a movie: the movie is skipped with a warning.
+        model.open(mixed)
+        try await waitReady(model)
+        XCTAssertEqual(model.imageSequence?.count, 1)
+        XCTAssertEqual(model.imageSequence?.skippedFileNames, ["clip.mp4"])
+        XCTAssertEqual(model.source?.warnings.count, 1)
+    }
+
+    func testSequenceProjectSavesAndReopensWithRateAndOrder() async throws {
+        let shoot = directory.appendingPathComponent("shoot")
+        try FileManager.default.createDirectory(at: shoot, withIntermediateDirectories: true)
+        for i in 0..<6 {
+            try FileManager.default.copyItem(at: fixtureFolder.appendingPathComponent("frame_\(i).png"), to: shoot.appendingPathComponent("DSC_\(i).png"))
+        }
+        let model = makeModel()
+        model.open(shoot)
+        try await waitReady(model)
+        model.setSequence(framesPerSecond: 5, reversed: true)
+        model.setFrameRange(first: 1, last: 4)
+        model.blendMode = .lighten
+        let projectURL = directory.appendingPathComponent("shoot.framestack")
+        XCTAssertTrue(model.save(to: projectURL))
+        try await waitUntil { model.isPreviewCurrent }
+        let text = try String(contentsOf: projectURL, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"kind\" : \"imageSequence\""), text)
+        XCTAssertTrue(text.contains("\"framesPerSecond\" : 5"), text)
+        XCTAssertTrue(text.contains("\"reversed\" : true"), text)
+        XCTAssertTrue(text.contains("DSC_5.png"))
+        let originalPreview = try XCTUnwrap(model.preview)
+
+        let reopened = makeModel()
+        reopened.open(projectURL)
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.imageSequence?.framesPerSecond, 5)
+        XCTAssertEqual(reopened.imageSequence?.reversed, true)
+        XCTAssertEqual(reopened.frameRange, 1...4)
+        XCTAssertEqual(reopened.blendMode, .lighten)
+        XCTAssertNil(reopened.sourceNotice)
+        XCTAssertFalse(reopened.hasUnsavedChanges)
+        XCTAssertEqual(reopened.preview?.image.dataProvider?.data as Data?, originalPreview.image.dataProvider?.data as Data?)
+
+        // A still deleted from the folder → relink screen naming the loss.
+        try FileManager.default.removeItem(at: shoot.appendingPathComponent("DSC_2.png"))
+        let again = makeModel()
+        again.open(projectURL)
+        guard case let .relink(request) = again.sourceState else { return XCTFail("\(again.sourceState)") }
+        XCTAssertTrue(request.isSequence)
+        XCTAssertEqual(request.candidate?.lastPathComponent, "shoot")
+        XCTAssertEqual(request.differences.first, "1 of 6 images missing")
+        XCTAssertTrue(request.message.contains("image folder"), request.message)
+        again.useRelinkCandidateAnyway()
+        try await waitReady(again)
+        XCTAssertEqual(again.imageSequence?.count, 5)
+        XCTAssertTrue(again.sourceNotice?.contains("5 frames") ?? false, again.sourceNotice ?? "nil")
     }
 }

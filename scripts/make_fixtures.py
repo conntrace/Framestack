@@ -92,6 +92,37 @@ def ten_bit_ramp():
     encode_10bit("tenbit_ramp_10f.mp4", [y] * 10, 30)
 
 
+def png_sequence():
+    """12 PNG stills, 160x90, in Fixtures/sequence_png_12f/, named frame_0.png …
+    frame_11.png (unpadded, so natural sort must place frame_10 after frame_9
+    and lexicographic sort would not). Top 40 rows carry the frame index in
+    8 binary blocks (20 px wide, white = bit set), rows 60–80 a gray bar at
+    sRGB 128; the rest black. Mirrors the count clip so the same tests prove
+    frame identity, order and the linear-light average."""
+    w, h = 160, 90
+    folder = os.path.join(OUT, "sequence_png_12f")
+    os.makedirs(folder, exist_ok=True)
+    for i in range(12):
+        f = np.zeros((h, w, 3), dtype=np.uint8)
+        for b in range(8):
+            if (i >> (7 - b)) & 1:
+                f[0:40, b * 20:(b + 1) * 20] = 255
+        f[60:80, :] = 128
+        path = os.path.join(folder, f"frame_{i}.png")
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-i", "-",
+               "-frames:v", "1", "-pix_fmt", "rgb24", path]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        proc.stdin.write(np.ascontiguousarray(f).tobytes())
+        proc.stdin.close()
+        if proc.wait() != 0:
+            sys.exit(f"ffmpeg failed for {path}")
+    # A stray non-image file that importers must skip, not choke on.
+    with open(os.path.join(folder, "notes.txt"), "w") as fh:
+        fh.write("not an image\n")
+    print(f"wrote {folder} (12 PNGs + notes.txt)")
+
+
 def count_clip():
     """5 s at 30 fps = 150 frames, 320x180.
 
@@ -216,6 +247,9 @@ if __name__ == "__main__":
     if only == ["tenbit"]:
         ten_bit_ramp()
         sys.exit(0)
+    if only == ["sequence"]:
+        png_sequence()
+        sys.exit(0)
     count_clip()
     trimmed_edit_list()
     moving_square()
@@ -223,3 +257,4 @@ if __name__ == "__main__":
     portrait()
     corrupt_frame()
     ten_bit_ramp()
+    png_sequence()

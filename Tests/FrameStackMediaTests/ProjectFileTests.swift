@@ -77,7 +77,7 @@ final class ProjectFileTests: XCTestCase {
         try project.write(to: projectURL)
 
         let text = try String(contentsOf: projectURL, encoding: .utf8)
-        XCTAssertTrue(text.contains("\"formatVersion\" : 1"), "human-readable JSON: \(text.prefix(200))")
+        XCTAssertTrue(text.contains("\"formatVersion\" : 2"), "human-readable JSON: \(text.prefix(200))")
         XCTAssertTrue(text.contains("\"relativePath\" : \"../media/clip.mp4\""), text)
         XCTAssertTrue(text.contains("\"blendMode\" : \"screen\""))
 

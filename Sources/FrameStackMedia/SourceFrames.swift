@@ -3,6 +3,7 @@ import CoreGraphics
 import CoreMedia
 import Foundation
 import FrameStackCore
+import ImageIO
 
 /// A small display-referred image of the source at a time, for the
 /// filmstrip.
@@ -21,6 +22,29 @@ public enum SourceFrames {
     /// `count` thumbnails spread evenly over the clip, each at most
     /// `maxHeight` tall, oriented for display. Frames that fail to decode
     /// are skipped. Fast: the generator may pick a nearby keyframe.
+    public static func thumbnails(
+        for source: MediaSource, timeline: FrameTimeline, count: Int, maxHeight: Int
+    ) async throws -> [TimelineThumbnail] {
+        guard count > 0, timeline.count > 0 else { return [] }
+        switch source {
+        case let .video(video):
+            return try await thumbnails(for: video, timeline: timeline, count: count, maxHeight: maxHeight)
+        case let .imageSequence(sequence):
+            let n = timeline.count
+            var result: [TimelineThumbnail] = []
+            for i in 0..<count {
+                try Task.checkCancellation()
+                let index = min(n - 1, (2 * i + 1) * n / (2 * count))
+                if let last = result.last, !(last.time < timeline.frames[index]) { continue }
+                let files = sequence.orderedFiles
+                guard index < files.count,
+                      let image = stillImage(files[index].url, maxPixelSize: maxHeight * 2) else { continue }
+                result.append(TimelineThumbnail(time: timeline.frames[index], image: image))
+            }
+            return result
+        }
+    }
+
     public static func thumbnails(
         for source: VideoSourceInfo, timeline: FrameTimeline, count: Int, maxHeight: Int
     ) async throws -> [TimelineThumbnail] {
@@ -61,6 +85,36 @@ public enum SourceFrames {
     /// The exact frame at `time` (zero tolerance), oriented for display,
     /// optionally bounded to `maxLongEdge`. Throws if that frame cannot be
     /// produced.
+    public static func frame(
+        for source: MediaSource, at time: FrameTime, maxLongEdge: Int?
+    ) async throws -> CGImage {
+        switch source {
+        case let .video(video):
+            return try await frame(for: video, at: time, maxLongEdge: maxLongEdge)
+        case let .imageSequence(sequence):
+            guard let file = sequence.file(at: time) else {
+                throw MediaError.imageUndecodable(path: sequence.folderURL.path, reason: "\(time) is not a frame of the sequence.")
+            }
+            guard let image = stillImage(file.url, maxPixelSize: maxLongEdge ?? file.pixelSize.longEdge) else {
+                throw MediaError.imageUndecodable(path: file.url.path, reason: "ImageIO could not read it.")
+            }
+            return image
+        }
+    }
+
+    /// A still decoded by ImageIO at most `maxPixelSize` on its long edge,
+    /// with the EXIF orientation applied.
+    static func stillImage(_ url: URL, maxPixelSize: Int) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            kCGImageSourceShouldCache: false,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    }
+
     public static func frame(
         for source: VideoSourceInfo, at time: FrameTime, maxLongEdge: Int?
     ) async throws -> CGImage {
