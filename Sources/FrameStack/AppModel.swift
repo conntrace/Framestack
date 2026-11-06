@@ -137,6 +137,26 @@ final class AppModel: ObservableObject {
     @Published var motionMask: MotionMaskSettings = .off { didSet { if motionMask != oldValue { settingsChanged() } } }
     /// Painted mask (M6d); undoable (one step per stroke) and saved.
     @Published var paintedMask: PaintedMaskSettings = .off { didSet { if paintedMask != oldValue { settingsChanged() } } }
+    /// Post-composite colour (M6e); undoable and saved; applied to the cached composite.
+    @Published var color: ColorAdjustments = .identity { didSet { if color != oldValue { settingsChanged() } } }
+
+    /// The last rendered composite and the compositing settings/quality it
+    /// was rendered for. Colour and geometry changes re-process this instead
+    /// of decoding frames again (PRD §10.1).
+    private var cachedComposite: (key: CompositeCacheKey, result: CompositeResult)?
+    /// How many frame renders the preview has started (for tests and the log).
+    @Published private(set) var previewRenderCount = 0
+
+    struct CompositeCacheKey: Equatable {
+        let sourceURL: URL
+        let settings: CompositeSettings
+        let quality: PreviewQuality
+    }
+
+    /// The post-composite pipeline shared by preview and export: colour, then geometry.
+    nonisolated static func postProcess(_ image: LinearImage, color: ColorAdjustments, geometry: GeometrySettings) throws -> LinearImage {
+        try GeometryProcessor.apply(geometry, to: ColorProcessor.apply(color, to: image))
+    }
     /// Painting tool state (not saved): brush as a fraction of the canvas long edge, softness, erase.
     @Published var brushRadius: Double = 0.04
     @Published var brushSoftness: Double = 0.5
@@ -313,7 +333,7 @@ final class AppModel: ObservableObject {
     var settings: CompositeSettings {
         CompositeSettings(rangeStart: rangeStart, rangeEnd: rangeEnd, samplingKind: samplingKind,
                           nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity, alignment: alignment,
-                          geometry: geometry, weighting: weighting, motionMask: motionMask, paintedMask: paintedMask)
+                          geometry: geometry, weighting: weighting, motionMask: motionMask, paintedMask: paintedMask, color: color)
     }
 
     var selectedTimes: [FrameTime] {
@@ -667,7 +687,9 @@ final class AppModel: ObservableObject {
         weighting = .flat
         motionMask = .off
         paintedMask = .off
+        color = .identity
         suppressChanges = false
+        cachedComposite = nil
         isPainting = false
         // Export choices follow the user from clip to clip, but a project's
         // choices do not leak into an unrelated video opened afterwards.
@@ -826,6 +848,7 @@ final class AppModel: ObservableObject {
         weighting = s.weighting
         motionMask = s.motionMask
         paintedMask = s.paintedMask
+        color = s.color
         exportSettings = project.export
         if let quality = project.ui.previewQuality.flatMap(PreviewQuality.init(rawValue:)) { previewQuality = quality }
         if let mode = project.ui.viewMode.flatMap(PreviewViewMode.init(rawValue:)) { viewMode = mode }
@@ -1035,6 +1058,7 @@ final class AppModel: ObservableObject {
         weighting = s.weighting
         motionMask = s.motionMask
         paintedMask = s.paintedMask
+        color = s.color
         suppressChanges = false
         settingsChanged()
     }
@@ -1093,6 +1117,12 @@ final class AppModel: ObservableObject {
             if new.paintedMask.strokes.isEmpty, !old.paintedMask.strokes.isEmpty { return "Clear Painted Mask" }
             return "Change Painted Mask"
         }
+        if old.color != new.color {
+            if old.color.exposure != new.color.exposure { return "Change Exposure" }
+            if old.color.contrast != new.color.contrast { return "Change Contrast" }
+            if old.color.saturation != new.color.saturation { return "Change Saturation" }
+            return "Change White Balance"
+        }
         return "Change Settings"
     }
 
@@ -1119,22 +1149,31 @@ final class AppModel: ObservableObject {
             paintedMask: paintedMask
         )
         let revision = settingsRevision
-        renderActivity = .waiting
         let renderer = renderer
         let geometry = geometry
+        let color = color
+        let key = CompositeCacheKey(sourceURL: source.url, settings: settings.compositingPart, quality: previewQuality)
+        let cached = cachedComposite?.key == key ? cachedComposite?.result : nil
+        renderActivity = cached == nil ? .waiting : .idle
 
         previewTask = Task { [weak self] in
-            if debounce {
+            if debounce, cached == nil {
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
             guard !Task.isCancelled else { return }
-            self?.renderActivity = .rendering(done: 0, total: request.frames.count)
             do {
-                let result = try await renderer.render(request) { [weak self] progress in
-                    self?.reportPreviewProgress(progress, revision: revision)
+                let result: CompositeResult
+                if let cached {
+                    result = cached
+                } else {
+                    self?.renderActivity = .rendering(done: 0, total: request.frames.count)
+                    self?.previewRenderCount += 1
+                    result = try await renderer.render(request) { [weak self] progress in
+                        self?.reportPreviewProgress(progress, revision: revision)
+                    }
                 }
                 let (image, finalSize, coverageImage) = try await Task.detached(priority: .userInitiated) {
-                    let processed = try GeometryProcessor.apply(geometry, to: result.image)
+                    let processed = try Self.postProcess(result.image, color: color, geometry: geometry)
                     var coverage: CGImage?
                     if let c = result.coverage {
                         // Grayscale: white where every frame moved, black where none did; same geometry as the composite.
@@ -1147,6 +1186,7 @@ final class AppModel: ObservableObject {
                     return (try ImageExporter.makeCGImage(processed, bitDepth: .eight, alpha: ImageExporter.hasTransparency(processed)), processed.size, coverage)
                 }.value
                 guard let self, !Task.isCancelled, revision == self.settingsRevision else { return }
+                self.cachedComposite = (key, result)
                 self.preview = PreviewSnapshot(
                     image: image,
                     revision: revision,
@@ -1227,6 +1267,7 @@ final class AppModel: ObservableObject {
         )
         let settings = exportSettings
         let geometry = geometry
+        let color = color
         let renderer = renderer
         // Keep resource use bounded: one full-resolution render at a time.
         previewTask?.cancel()
@@ -1241,7 +1282,7 @@ final class AppModel: ObservableObject {
                 self?.lastExportAlignment = composite.alignment
                 self?.exportActivity = .writing
                 let report = try await Task.detached(priority: .userInitiated) {
-                    try ImageExporter.write(try GeometryProcessor.apply(geometry, to: composite.image), to: url, settings: settings)
+                    try ImageExporter.write(try Self.postProcess(composite.image, color: color, geometry: geometry), to: url, settings: settings)
                 }.value
                 self?.exportActivity = .finished(
                     report, missingFrames: composite.missingFrames.count, decodeFailure: composite.decodeFailureSummary

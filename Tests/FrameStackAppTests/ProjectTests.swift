@@ -1079,3 +1079,111 @@ final class PaintedMaskAppTests: XCTestCase {
         XCTAssertEqual(reopened.paintedMask, .off)
     }
 }
+
+// MARK: - Post-composite colour and the composite cache (M6e)
+
+@MainActor
+final class ColorAppTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("FrameStackColorApp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var fixtures: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("FrameStackMediaTests/Fixtures")
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 30, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func waitReady(_ model: AppModel) async throws {
+        try await waitUntil { if case .ready = model.sourceState { return true } else { return false } }
+        try await waitUntil { model.isPreviewCurrent }
+    }
+
+    private func readRGB8(_ url: URL) throws -> [UInt8] {
+        let source = CGImageSourceCreateWithURL(url as CFURL, nil)!
+        let image = CGImageSourceCreateImageAtIndex(source, 0, nil)!
+        let w = image.width, h = image.height
+        var buffer = [UInt8](repeating: 0, count: w * h * 4)
+        buffer.withUnsafeMutableBytes { raw in
+            let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for p in 0..<(w * h) { for c in 0..<3 { rgb[p * 3 + c] = buffer[p * 4 + c] } }
+        return rgb
+    }
+
+    func testColorAndGeometryChangesReuseTheCachedCompositeAndExportMatches() async throws {
+        let model = AppModel(defaults: UserDefaults(suiteName: "ColorApp-\(UUID().uuidString)")!)
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        model.open(fixtures.appendingPathComponent("moving_square_24f.mp4"))
+        try await waitReady(model)
+        XCTAssertEqual(model.previewRenderCount, 1)
+        let base = try XCTUnwrap(model.preview)
+
+        model.color.exposure = 1
+        XCTAssertEqual(undo.undoActionName, "Change Exposure")
+        XCTAssertFalse(model.isPreviewCurrent)
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.previewRenderCount, 1, "exposure re-processes the cached composite; no frames decoded")
+        XCTAssertNotEqual(model.preview?.image.dataProvider?.data as Data?, base.image.dataProvider?.data as Data?)
+        model.geometry.crop = NormalizedRect(x: 0, y: 0, width: 0.5, height: 1)
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.previewRenderCount, 1, "geometry too")
+        XCTAssertEqual(model.preview?.size, PixelSize(width: 240, height: 272))
+        model.blendMode = .lighten
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.previewRenderCount, 2, "a compositing change renders again")
+        model.blendMode = .average
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.previewRenderCount, 3, "the cache holds one composite, the latest")
+
+        // The export applies the same colour + geometry: at +1 EV the gray bar is twice as bright in linear light
+        // as the same export at 0 EV (compared through the file, so the whole path is covered).
+        model.geometry = .identity
+        try await waitUntil { model.isPreviewCurrent }
+        model.exportSettings = ExportSettings(format: .png, bitDepth: .eight)
+        let exposed = directory.appendingPathComponent("exposed.png")
+        model.export(to: exposed)
+        try await waitUntil { !model.isExporting }
+        guard case .finished = model.exportActivity else { return XCTFail("\(model.exportActivity)") }
+        model.color.exposure = 0
+        try await waitUntil { model.isPreviewCurrent }
+        let plain = directory.appendingPathComponent("plain.png")
+        model.export(to: plain)
+        try await waitUntil { !model.isExporting }
+        let barIndex = (230 * 480 + 100) * 3
+        let linearExposed = SRGBTransfer.decode(Double(try readRGB8(exposed)[barIndex]) / 255)
+        let linearPlain = SRGBTransfer.decode(Double(try readRGB8(plain)[barIndex]) / 255)
+        XCTAssertEqual(linearExposed / linearPlain, 2, accuracy: 0.05)
+        model.color.exposure = 1
+
+        // Project round trip, reset on a fresh source.
+        let projectURL = directory.appendingPathComponent("colour.framestack")
+        XCTAssertTrue(model.save(to: projectURL))
+        XCTAssertTrue(try String(contentsOf: projectURL, encoding: .utf8).contains("\"exposure\" : 1"))
+        let reopened = AppModel(defaults: UserDefaults(suiteName: "ColorApp-\(UUID().uuidString)")!)
+        reopened.open(projectURL)
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.color.exposure, 1)
+        reopened.open(fixtures.appendingPathComponent("count_5s_30fps.mp4"))
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.color, .identity)
+    }
+}

@@ -27,6 +27,7 @@ struct InspectorView: View {
                         InspectorSection(title: "Motion Mask", key: "motionMask") { MotionMaskSection() }
                         InspectorSection(title: "Painted Mask", key: "paintedMask") { PaintedMaskSection() }
                         InspectorSection(title: "Crop & Straighten", key: "geometry") { GeometrySection() }
+                        InspectorSection(title: "Color", key: "color") { ColorSection() }
                         InspectorSection(title: "Export", key: "export") { ExportSection() }
                     }
                 } else {
@@ -901,6 +902,44 @@ private struct CropField: View {
             TextField(label, value: $value, format: .number)
                 .textFieldStyle(.roundedBorder).monospacedDigit().labelsHidden()
         }
+    }
+}
+
+// MARK: Color
+
+private struct ColorSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            adjustment("Exposure", value: $model.color.exposure, range: -3...3, format: { String(format: "%+.2f EV", $0) })
+            adjustment("Contrast", value: $model.color.contrast, range: -1...1, format: percent)
+            adjustment("Saturation", value: $model.color.saturation, range: -1...1, format: percent)
+            adjustment("Temperature", value: $model.color.temperature, range: -1...1, format: percent)
+            adjustment("Tint", value: $model.color.tint, range: -1...1, format: percent)
+            HStack {
+                Spacer()
+                Button("Reset") { model.color = .identity }
+                    .controlSize(.small)
+                    .disabled(model.color.isIdentity)
+            }
+            Text("Applied to the finished composite, before crop and straighten, without decoding frames again: exposure (× 2^EV), white balance gains and saturation in linear light; contrast around mid-gray in sRGB-encoded values. Exports use exactly this.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func percent(_ v: Double) -> String { String(format: "%+.0f %%", v * 100) }
+
+    private func adjustment(_ label: String, value: Binding<Double>, range: ClosedRange<Double>, format: @escaping (Double) -> String) -> some View {
+        HStack {
+            Text(label).font(.callout).frame(width: 84, alignment: .leading)
+            Slider(value: value, in: range) { editing in
+                editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
+            }
+            Text(format(value.wrappedValue)).font(.callout).monospacedDigit().frame(width: 72, alignment: .trailing)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(label)
     }
 }
 

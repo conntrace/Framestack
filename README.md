@@ -28,6 +28,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M6d (painted mask):** a **Painted Mask** section — paint on the preview with a sized, soft brush (or erase), invert, clear — limits the blend to the painted region; everything else shows the background. Strokes are stored as resolution-independent vectors in the project and each stroke is one undo step.
 
+**M6e (colour):** a **Color** section with exposure, contrast, saturation, temperature and tint, applied to the finished composite before crop and straighten. Colour and geometry changes re-process the cached composite instead of decoding the clip again, so they are instant; exports apply exactly the same maths.
+
 | Keys | |
 |---|---|
 | ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
@@ -41,7 +43,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: colour adjustments, presets and batches (rest of M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
+Not yet: presets and batch variants (rest of M6), tone curves, crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -117,6 +119,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 18. (M6b) Choose Blend → **Median** on a clip with a moving subject: the caption says how many passes the preview needs, the bar counts "pass p of P" on long clips, and the subject disappears from the result while the background stays sharp. **Max Luminance** keeps the brightest frame's whole colour per pixel.
 19. (M6c) Blend → **Normal**, then turn on **Keep only what moves**: the subject appears at every position over a clean background (chronophotography); the section reports the background used and the moving-pixel share. Tick **Show mask coverage**: white where motion was. Raise the threshold until noise disappears; **Invert** shows the still scene only; **Use Playhead Frame** swaps the background for a frame.
 20. (M6d) In Painted Mask turn on **Paint on the preview** and drag a stroke across part of the image: a red stroke appears, the blend applies only inside it and the background shows elsewhere; ⌘Z removes the stroke ("Undo Paint Mask"). Switch the brush to Erase and cross the stroke; **Invert** flips the region.
+21. (M6e) Drag **Exposure** to +1: the preview updates without a render pass (no "Rendering" in the bar) and ⌘Z reads "Undo Change Exposure"; Saturation −100 % gives a neutral image; Reset returns everything. Export and compare with the preview.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 
@@ -124,6 +127,7 @@ Please report anything off — especially colors versus QuickTime Player, and an
 
 - Frames are identified by exact presentation timestamps (rational, like `CMTime`); ranges are start-inclusive/end-exclusive.
 - Each frame is converted by Core Image from its own color tags to **linear light** (extended sRGB primaries, 32-bit float), oriented upright, then added to **64-bit accumulators**. Average = sum ÷ count. Memory depends on output size, not frame count.
+- Colour adjustments run on the finished composite: exposure, white balance and saturation in linear light, contrast around mid-gray in sRGB-encoded values; then straighten/crop/edge fill.
 - Export clamps to [0, 1], applies the sRGB curve once, rounds, and writes an sRGB-tagged file (PNG/JPEG/TIFF), then re-reads the file to verify it. Display P3 output first converts the linear values with the sRGB→P3 primaries matrix. Downscaled exports resample each frame with Lanczos in linear light before accumulation — the same path the preview uses.
 - Other modes use the same frames: Lighten/Darken are per-channel max/min; Additive is the plain sum (× opacity, kept above 1 until export); Screen, Multiply, Difference and Normal run oldest-to-newest from the first selected frame with `C' = C + opacity × (blend(C, F) − C)`. Normal at 100 % is exactly the last selected frame. Median is the exact per-channel median (mean of the two middle values for an even count), computed band by band so memory stays bounded; Max/Min Luminance pick the whole pixel of the frame with the extreme linear luminance.
 

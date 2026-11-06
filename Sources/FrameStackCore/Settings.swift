@@ -38,10 +38,13 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
     public var motionMask: MotionMaskSettings
     /// Painted mask (M6d). Absent = off.
     public var paintedMask: PaintedMaskSettings
+    /// Post-composite colour (M6e). Absent = identity.
+    public var color: ColorAdjustments
 
     public init(rangeStart: FrameTime, rangeEnd: FrameTime, samplingKind: SamplingKind, nth: Int, exactCount: Int,
                 blendMode: BlendMode, opacity: Double, alignment: AlignmentSettings = .off, geometry: GeometrySettings = .identity,
-                weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off, paintedMask: PaintedMaskSettings = .off) {
+                weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off, paintedMask: PaintedMaskSettings = .off,
+                color: ColorAdjustments = .identity) {
         self.rangeStart = rangeStart
         self.rangeEnd = rangeEnd
         self.samplingKind = samplingKind
@@ -54,10 +57,21 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         self.weighting = weighting
         self.motionMask = motionMask
         self.paintedMask = paintedMask
+        self.color = color
+    }
+
+    /// The part of the settings that decides which frames are decoded and
+    /// how they are reduced. Colour and geometry are applied afterwards to
+    /// the cached composite (PRD §10.1).
+    public var compositingPart: CompositeSettings {
+        var s = self
+        s.geometry = .identity
+        s.color = .identity
+        return s
     }
 
     private enum CodingKeys: String, CodingKey {
-        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment, geometry, weighting, motionMask, paintedMask
+        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment, geometry, weighting, motionMask, paintedMask, color
     }
 
     public init(from decoder: Decoder) throws {
@@ -74,6 +88,7 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         weighting = try c.decodeIfPresent(WeightCurve.self, forKey: .weighting) ?? .flat
         motionMask = try c.decodeIfPresent(MotionMaskSettings.self, forKey: .motionMask) ?? .off
         paintedMask = try c.decodeIfPresent(PaintedMaskSettings.self, forKey: .paintedMask) ?? .off
+        color = try c.decodeIfPresent(ColorAdjustments.self, forKey: .color) ?? .identity
     }
 
     public var samplingMode: SamplingMode {
