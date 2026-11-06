@@ -22,6 +22,7 @@ struct InspectorView: View {
                         InspectorSection(title: "Time Range", key: "range") { TimeRangeSection(source: source) }
                         InspectorSection(title: "Sampling", key: "sampling") { SamplingSection() }
                         InspectorSection(title: "Blend", key: "blend") { BlendSection() }
+                        InspectorSection(title: "Alignment", key: "alignment") { AlignmentSection() }
                         InspectorSection(title: "Export", key: "export") { ExportSection() }
                     }
                 } else {
@@ -438,6 +439,82 @@ private struct BlendSection: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+}
+
+// MARK: Alignment
+
+private struct AlignmentSection: View {
+    @EnvironmentObject private var model: AppModel
+    @AppStorage("preview.showSafeArea") private var showSafeArea = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Align frames before blending", isOn: $model.alignment.enabled)
+                .font(.callout)
+            if model.alignment.enabled {
+                Picker("Mode", selection: $model.alignment.mode) {
+                    ForEach(AlignmentMode.allCases) { Text($0.displayName).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Text(model.alignment.mode.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Text("Reference").foregroundStyle(.secondary)
+                    Spacer()
+                    Text(referenceDescription).monospacedDigit()
+                }
+                .font(.callout)
+                HStack {
+                    Button("Use Playhead Frame") { model.useReferenceAtPlayhead() }
+                        .disabled(model.scrubIndex == nil)
+                    Button("Use Middle Frame") { model.useMiddleReference() }
+                        .disabled(model.alignment.reference == .middle)
+                }
+                .controlSize(.small)
+                Toggle("Show safe area in the preview", isOn: $showSafeArea)
+                    .font(.callout)
+                if let report = model.preview?.alignment, model.isPreviewCurrent {
+                    Label(report.summary, systemImage: report.failedFrames.isEmpty ? "scope" : "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(report.failedFrames.isEmpty ? Color.secondary : Color.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !report.validArea.isNull {
+                        Text("Safe area \(Int(report.validArea.width))×\(Int(report.validArea.height)) of \(model.preview?.size.description ?? "") preview px; outside it some frames are missing and the alpha channel records coverage.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Text("Vision registers every frame to the reference at up to 2048 px (about one pixel of precision at that size) before blending. Parallax, moving subjects and rolling shutter cannot be aligned; the frames that fail are used unmoved and counted here.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Off: frames are stacked exactly as recorded. Turn on for handheld footage so a drifting camera does not blur the background (PRD §6.1).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var referenceDescription: String {
+        switch model.alignment.reference {
+        case .middle:
+            if let time = model.alignmentReferenceTime, let index = model.timeline?.nearestIndex(to: time) {
+                return "middle frame \(index) · \(Format.seconds(time.seconds))"
+            }
+            return "middle frame"
+        case let .frame(time):
+            let resolved = model.alignmentReferenceTime
+            let index = resolved.flatMap { model.timeline?.nearestIndex(to: $0) }
+            if resolved != time { return "frame at \(Format.seconds(time.seconds)) (not selected → middle)" }
+            return "frame \(index.map(String.init) ?? "?") · \(Format.seconds(time.seconds))"
         }
     }
 }

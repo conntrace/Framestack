@@ -64,6 +64,7 @@ struct ContentView: View {
 
 private struct PreviewArea: View {
     @EnvironmentObject private var model: AppModel
+    @AppStorage("preview.showSafeArea") private var showSafeArea = true
 
     var body: some View {
         ZStack {
@@ -132,7 +133,8 @@ private struct PreviewArea: View {
                 fullSize: fullSize,
                 zoom: model.zoom,
                 onZoomChange: { model.zoom = $0 },
-                caption: "Composite · \(preview.framesComposited) frames"
+                caption: "Composite · \(preview.framesComposited) frames" + (preview.alignment != nil ? " · aligned" : ""),
+                safeArea: showSafeArea ? safeArea(of: preview) : nil
             )
             .opacity(model.isPreviewCurrent ? 1 : 0.55)
             .overlay(alignment: .topLeading) {
@@ -149,6 +151,14 @@ private struct PreviewArea: View {
         } else {
             ProgressView("Rendering preview…").frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    /// The alignment valid area in full-resolution pixels.
+    private func safeArea(of preview: PreviewSnapshot) -> CGRect? {
+        guard let area = preview.alignment?.validArea, !area.isNull, preview.size.width > 0, preview.size.height > 0 else { return nil }
+        let sx = CGFloat(fullSize.width) / CGFloat(preview.size.width)
+        let sy = CGFloat(fullSize.height) / CGFloat(preview.size.height)
+        return CGRect(x: area.minX * sx, y: area.minY * sy, width: area.width * sx, height: area.height * sy)
     }
 
     @ViewBuilder

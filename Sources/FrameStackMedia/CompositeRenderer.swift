@@ -14,21 +14,23 @@ public struct CompositeRequest: Sendable {
     public var opacity: Float
     /// `nil` renders at native (display-oriented) resolution.
     public var maxLongEdge: Int?
+    /// Pre-blend registration (M5b); off by default.
+    public var alignment: AlignmentSettings
 
-    public init(source: MediaSource, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?) {
+    public init(source: MediaSource, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
+                alignment: AlignmentSettings = .off) {
         self.source = source
         self.frames = frames
         self.blendMode = blendMode
         self.opacity = opacity
         self.maxLongEdge = maxLongEdge
+        self.alignment = alignment
     }
 
-    public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?) {
-        self.source = .video(source)
-        self.frames = frames
-        self.blendMode = blendMode
-        self.opacity = opacity
-        self.maxLongEdge = maxLongEdge
+    public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
+                alignment: AlignmentSettings = .off) {
+        self.init(source: .video(source), frames: frames, blendMode: blendMode, opacity: opacity, maxLongEdge: maxLongEdge,
+                  alignment: alignment)
     }
 }
 
@@ -60,6 +62,19 @@ public struct CompositeResult: Sendable {
     /// presentation order (relevant for order-dependent blend modes).
     public let deliveredInPresentationOrder: Bool
     public let elapsedSeconds: Double
+    /// Present when the request asked for alignment and more than one frame was selected.
+    public let alignment: AlignmentReport?
+
+    public init(image: LinearImage, framesComposited: Int, missingFrames: [FrameTime], decodeFailures: [DecodeFailure],
+                deliveredInPresentationOrder: Bool, elapsedSeconds: Double, alignment: AlignmentReport? = nil) {
+        self.image = image
+        self.framesComposited = framesComposited
+        self.missingFrames = missingFrames
+        self.decodeFailures = decodeFailures
+        self.deliveredInPresentationOrder = deliveredInPresentationOrder
+        self.elapsedSeconds = elapsedSeconds
+        self.alignment = alignment
+    }
 
     /// One-line explanation of why frames are missing, for the UI.
     public var decodeFailureSummary: String? {
@@ -127,6 +142,7 @@ public final class CompositeRenderer: @unchecked Sendable {
     public static let workingColorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
 
     private let context: CIContext
+    private let registration = RegistrationEngine()
 
     public init(useSoftwareRenderer: Bool = false) {
         context = CIContext(options: [
@@ -152,6 +168,7 @@ public final class CompositeRenderer: @unchecked Sendable {
         var inOrder = true
         var failures: [DecodeFailure] = []
         let progress: (@Sendable (CompositeProgress) -> Void)?
+        var aligner: Aligner?
 
         init(request: CompositeRequest, progress: (@Sendable (CompositeProgress) -> Void)?) {
             self.request = request
@@ -161,6 +178,36 @@ public final class CompositeRenderer: @unchecked Sendable {
         }
 
         var isComplete: Bool { seen.count == total }
+    }
+
+    /// Per-render alignment state: the reference at analysis size, the
+    /// transforms found so far, and the running valid area.
+    private final class Aligner {
+        let settings: AlignmentSettings
+        let referenceTime: FrameTime
+        let reference: CGImage
+        let analysisLongEdge: Int
+        let key: RegistrationEngine.Key
+        var outcomes: [FrameTime: RegistrationOutcome]
+        var cachedCount = 0
+        var failed: [FrameTime] = []
+        var fellBack: [FrameTime] = []
+        var aligned = 0
+        var maxShift = 0.0
+        /// Intersection of transformed frames, source pixels, CI coordinates.
+        var validArea: CGRect?
+
+        init(settings: AlignmentSettings, referenceTime: FrameTime, reference: CGImage, analysisLongEdge: Int,
+             key: RegistrationEngine.Key, cached: [FrameTime: RegistrationOutcome]) {
+            self.settings = settings
+            self.referenceTime = referenceTime
+            self.reference = reference
+            self.analysisLongEdge = analysisLongEdge
+            self.key = key
+            self.outcomes = cached
+        }
+
+        var transforms: [FrameTime: AlignmentTransform] { outcomes.mapValues(\.transform) }
     }
 
     public func render(
@@ -173,6 +220,9 @@ public final class CompositeRenderer: @unchecked Sendable {
         }
         try Task.checkCancellation()
         let reduction = Reduction(request: request, progress: progress)
+        if request.alignment.enabled, request.frames.count > 1 {
+            reduction.aligner = try await makeAligner(for: request)
+        }
 
         switch request.source {
         case let .video(video):
@@ -186,15 +236,129 @@ public final class CompositeRenderer: @unchecked Sendable {
             throw MediaError.noFramesDecoded
         }
         let image = try reducer.result()
-        let missing = request.frames.filter { !reduction.seen.contains($0) }
+        let alignmentFailures = Set(reduction.aligner?.failed ?? [])
+        let missing = request.frames.filter { !reduction.seen.contains($0) && !alignmentFailures.contains($0) }
+        var report: AlignmentReport?
+        if let aligner = reduction.aligner, let sourceSize = reduction.sourceSize {
+            registration.store(aligner.outcomes, for: aligner.key)
+            // Valid area → output pixels, origin top-left.
+            let sx = Double(reduction.outputSize.width) / Double(sourceSize.width)
+            let sy = Double(reduction.outputSize.height) / Double(sourceSize.height)
+            let area = aligner.validArea ?? CGRect(x: 0, y: 0, width: sourceSize.width, height: sourceSize.height)
+            let valid = area.isNull ? CGRect.null : CGRect(
+                x: area.minX * sx, y: (Double(sourceSize.height) - area.maxY) * sy,
+                width: area.width * sx, height: area.height * sy
+            )
+            report = AlignmentReport(
+                mode: aligner.settings.mode, referenceTime: aligner.referenceTime, analysisLongEdge: aligner.analysisLongEdge,
+                alignedFrames: aligner.aligned, failedFrames: aligner.failed.sorted(), fallbackFrames: aligner.fellBack.sorted(),
+                maxShiftPixels: aligner.maxShift,
+                validArea: valid, fromCache: aligner.cachedCount > 0 && aligner.cachedCount >= aligner.aligned + aligner.failed.count,
+                transforms: aligner.transforms.filter { reduction.seen.contains($0.key) || aligner.failed.contains($0.key) }
+            )
+        }
         return CompositeResult(
             image: image,
             framesComposited: reducer.count,
             missingFrames: missing,
             decodeFailures: reduction.failures,
             deliveredInPresentationOrder: reduction.inOrder,
-            elapsedSeconds: Date().timeIntervalSince(started)
+            elapsedSeconds: Date().timeIntervalSince(started),
+            alignment: report
         )
+    }
+
+    // MARK: Alignment
+
+    /// Decodes the reference frame at analysis size (through the normal
+    /// pipeline) and looks up transforms already computed for this
+    /// source/reference/mode.
+    private func makeAligner(for request: CompositeRequest) async throws -> Aligner? {
+        guard let referenceTime = request.alignment.reference.resolve(in: request.frames) else { return nil }
+        let analysisLongEdge = min(RegistrationEngine.analysisLongEdge, request.source.displaySize.longEdge)
+        let single = CompositeRequest(source: request.source, frames: [referenceTime], blendMode: .normal,
+                                      maxLongEdge: analysisLongEdge, alignment: .off)
+        let decoded = try await render(single)
+        guard decoded.framesComposited == 1 else { return nil }
+        let reference = try ImageExporter.makeCGImage(decoded.image, bitDepth: .eight)
+        let stamp: String
+        switch request.source {
+        case let .video(v): stamp = "\(v.fileSizeBytes ?? 0)"
+        case let .imageSequence(s): stamp = "\(s.count)-\(s.totalFileSizeBytes)-\(s.framesPerSecond)-\(s.reversed)"
+        }
+        let key = RegistrationEngine.Key(sourcePath: request.source.url.path, sourceStamp: stamp,
+                                         reference: referenceTime, mode: request.alignment.mode)
+        let cached = registration.cached(key)
+        let aligner = Aligner(settings: request.alignment, referenceTime: referenceTime, reference: reference,
+                              analysisLongEdge: analysisLongEdge, key: key, cached: cached)
+        aligner.cachedCount = request.frames.filter { cached[$0] != nil }.count
+        return aligner
+    }
+
+    /// The frame as an 8-bit sRGB CGImage at analysis size (Lanczos in
+    /// linear light, like the reference).
+    private func analysisImage(_ image: CIImage, sourceSize: PixelSize, longEdge: Int) -> CGImage? {
+        let target = sourceSize.fitting(maxLongEdge: longEdge)
+        var scaled = image
+        if target != sourceSize {
+            let scaleY = CGFloat(target.height) / CGFloat(sourceSize.height)
+            let scaleX = CGFloat(target.width) / CGFloat(sourceSize.width)
+            scaled = image.clampedToExtent()
+                .applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: scaleY, kCIInputAspectRatioKey: scaleX / scaleY])
+        }
+        let rect = CGRect(x: 0, y: 0, width: target.width, height: target.height)
+        return context.createCGImage(scaled.cropped(to: rect), from: rect, format: .RGBA8, colorSpace: ImageExporter.outputColorSpace)
+    }
+
+    /// Returns the frame moved onto the reference, recording the transform,
+    /// failures and the valid area — or nil when the frame could not be
+    /// registered, in which case it is left out of the composite.
+    private func aligned(_ image: CIImage, at pts: FrameTime, sourceSize: PixelSize, aligner: Aligner) -> CIImage? {
+        let frameRect = CGRect(x: 0, y: 0, width: sourceSize.width, height: sourceSize.height)
+        var transform: AlignmentTransform
+        if pts == aligner.referenceTime {
+            transform = .identity
+            aligner.outcomes[pts] = RegistrationOutcome(transform: .identity)
+        } else if let known = aligner.outcomes[pts] {
+            if known.failed {
+                aligner.failed.append(pts)
+                return nil
+            }
+            if known.fellBack { aligner.fellBack.append(pts) }
+            transform = known.transform
+        } else if let target = analysisImage(image, sourceSize: sourceSize, longEdge: aligner.analysisLongEdge),
+                  let shift = RegistrationEngine.register(target: target, reference: aligner.reference, mode: .translation),
+                  RegistrationEngine.plausible(shift, in: CGRect(origin: .zero, size: CGSize(width: sourceSize.fitting(maxLongEdge: aligner.analysisLongEdge).width, height: sourceSize.fitting(maxLongEdge: aligner.analysisLongEdge).height))) {
+            let factor = Double(sourceSize.longEdge) / Double(sourceSize.fitting(maxLongEdge: aligner.analysisLongEdge).longEdge)
+            transform = shift.scaled(by: factor)
+            if aligner.settings.mode == .perspective {
+                // A homography is only trusted when it agrees with the plain
+                // shift to within a few pixels; Vision's feature matching can
+                // produce wild warps on low-detail or repetitive content.
+                let analysisSize = sourceSize.fitting(maxLongEdge: aligner.analysisLongEdge)
+                let rect = CGRect(x: 0, y: 0, width: analysisSize.width, height: analysisSize.height)
+                let tolerance = max(4, 0.02 * Double(analysisSize.longEdge))
+                if let warp = RegistrationEngine.register(target: target, reference: aligner.reference, mode: .perspective),
+                   RegistrationEngine.agree(warp, shift, in: rect, tolerance: tolerance),
+                   RegistrationEngine.plausible(warp, in: rect) {
+                    transform = warp.scaled(by: factor)
+                } else {
+                    aligner.fellBack.append(pts)
+                }
+            }
+            aligner.outcomes[pts] = RegistrationOutcome(transform: transform, fellBack: aligner.fellBack.contains(pts))
+        } else {
+            aligner.failed.append(pts)
+            aligner.outcomes[pts] = RegistrationOutcome(transform: .identity, failed: true)
+            return nil
+        }
+        if pts != aligner.referenceTime {
+            aligner.aligned += 1
+            aligner.maxShift = max(aligner.maxShift, transform.maxDisplacement(for: sourceSize))
+        }
+        let inner = transform.innerRect(of: frameRect)
+        aligner.validArea = aligner.validArea.map { $0.intersection(inner) } ?? inner
+        return transform.apply(to: image)
     }
 
     /// Orients, size-checks, resamples and reduces one upright frame.
@@ -211,6 +375,15 @@ public final class CompositeRenderer: @unchecked Sendable {
                 width: r.outputSize.width, height: r.outputSize.height, opacity: r.request.opacity
             )
             r.frameBuffer = [Float](repeating: 0, count: r.outputSize.pixelCount * LinearImage.channelCount)
+        }
+        var image = image
+        if let aligner = r.aligner {
+            guard let moved = aligned(image, at: pts, sourceSize: size, aligner: aligner) else {
+                // Could not be registered: left out, reported, never stacked misaligned.
+                r.progress?(CompositeProgress(framesComposited: r.seen.count, framesTotal: r.total))
+                return
+            }
+            image = moved
         }
         renderFrame(image, sourceSize: size, outputSize: r.outputSize, into: &r.frameBuffer)
         try r.frameBuffer.withUnsafeBufferPointer { try r.reducer!.add($0) }
@@ -343,13 +516,17 @@ public final class CompositeRenderer: @unchecked Sendable {
         if outputSize != sourceSize {
             let scaleY = CGFloat(outputSize.height) / CGFloat(sourceSize.height)
             let scaleX = CGFloat(outputSize.width) / CGFloat(sourceSize.width)
+            // Clamp so Lanczos has neighbours at the frame's own edges, then
+            // crop back to the (scaled) frame so an aligned frame stays
+            // transparent where it does not cover the canvas.
+            let covered = image.extent.applying(CGAffineTransform(scaleX: scaleX, y: scaleY)).intersection(bounds)
             image = image
                 .clampedToExtent()
                 .applyingFilter("CILanczosScaleTransform", parameters: [
                     kCIInputScaleKey: scaleY,
                     kCIInputAspectRatioKey: scaleX / scaleY,
                 ])
-                .cropped(to: bounds)
+                .cropped(to: covered)
         }
         buffer.withUnsafeMutableBytes { raw in
             context.render(

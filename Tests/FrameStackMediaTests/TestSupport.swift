@@ -23,6 +23,9 @@ enum Fixture: String {
     /// 10 frames, 320×180, HEVC Main10 (lossless): a horizontal luma ramp
     /// from 10-bit code 64 to 940, one code step every ~0.37 px.
     case tenBit = "tenbit_ramp_10f"
+    /// 8 frames, 320×180, one static block-noise scene cut at the known
+    /// offsets in scripts/make_fixtures.py `HANDHELD_OFFSETS` (H.264 crf 12).
+    case handheld = "handheld_8f"
 
     var url: URL {
         guard let url = Bundle.module.url(forResource: rawValue, withExtension: "mp4", subdirectory: "Fixtures") else {

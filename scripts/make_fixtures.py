@@ -123,6 +123,51 @@ def png_sequence():
     print(f"wrote {folder} (12 PNGs + notes.txt)")
 
 
+HANDHELD_OFFSETS = [(0, 0), (6, -4), (-9, 3), (12, 8), (3, 1), (-5, -10), (8, -2), (-11, 6)]
+
+
+def handheld_frames():
+    """8 frames, 320x180, cut from one static 400x260 textured scene at the
+    integer offsets HANDHELD_OFFSETS (frame i shows the scene shifted by
+    (-dx, -dy): a camera that drifts by (dx, dy)). Frame 4 (the middle one,
+    the default alignment reference) is at (3, 1). The scene is a seeded
+    random texture plus a bright disc and a dark bar so registration has
+    structure everywhere and no periodic pattern."""
+    rng = np.random.default_rng(20261106)
+    # 4x4-pixel random blocks: plenty of structure for registration, and the
+    # PNGs stay small (per-pixel noise compressed to ~110 KB a frame).
+    coarse = rng.integers(40, 200, size=(65, 100, 3), dtype=np.uint8)
+    big = np.repeat(np.repeat(coarse, 4, axis=0), 4, axis=1)
+    yy, xx = np.mgrid[0:260, 0:400]
+    disc = (xx - 230) ** 2 + (yy - 120) ** 2 < 30 ** 2
+    big[disc] = (240, 240, 240)
+    big[150:160, 80:300] = (10, 10, 10)
+    frames = []
+    for dx, dy in HANDHELD_OFFSETS:
+        x0, y0 = 40 + dx, 40 + dy
+        frames.append(big[y0:y0 + 180, x0:x0 + 320].copy())
+    return frames
+
+
+def handheld_sequence():
+    """Fixtures/handheld_png_8f/ (lossless) and handheld_8f.mp4 (H.264 crf 12)."""
+    frames = handheld_frames()
+    folder = os.path.join(OUT, "handheld_png_8f")
+    os.makedirs(folder, exist_ok=True)
+    for i, f in enumerate(frames):
+        path = os.path.join(folder, f"hand_{i}.png")
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "320x180", "-i", "-",
+               "-frames:v", "1", "-pix_fmt", "rgb24", path]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        proc.stdin.write(np.ascontiguousarray(f).tobytes())
+        proc.stdin.close()
+        if proc.wait() != 0:
+            sys.exit(f"ffmpeg failed for {path}")
+    print(f"wrote {folder} (8 PNGs)")
+    encode("handheld_8f.mp4", frames, 30, extra_output=["-crf", "12", "-g", "4", "-bf", "0"])
+
+
 def count_clip():
     """5 s at 30 fps = 150 frames, 320x180.
 
@@ -250,6 +295,9 @@ if __name__ == "__main__":
     if only == ["sequence"]:
         png_sequence()
         sys.exit(0)
+    if only == ["handheld"]:
+        handheld_sequence()
+        sys.exit(0)
     count_clip()
     trimmed_edit_list()
     moving_square()
@@ -258,3 +306,4 @@ if __name__ == "__main__":
     corrupt_frame()
     ten_bit_ramp()
     png_sequence()
+    handheld_sequence()

@@ -16,6 +16,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M5a (image sequences):** open a **folder of JPEG/PNG/TIFF/HEIF stills** (or several chosen files, or one image for its folder) — natural name order, a **sequence rate** field and **Reverse order** toggle, times labelled as *sequence time* because stills have no recorded timestamps; EXIF orientation and embedded profiles (Display P3 phone JPEGs) are honoured; transparent PNGs keep their alpha in PNG/TIFF exports. Mixed sizes are refused with the offending files named; sequences save into projects and relink like videos.
 
+**M5b (alignment):** an **Alignment** section registers every frame to a reference (middle frame or the playhead frame) with Vision before blending — *Shift only* or guarded *Perspective* — so a drifting handheld camera does not blur the background. The inspector reports how many frames aligned, were left out because they could not be registered, or fell back to a plain shift, and the largest shift; a yellow dashed **safe area** on the preview shows where every frame still has pixels, and exports keep the uncovered edges transparent. Transforms are computed once at ≤ 2048 px, so preview and export align identically and an export reuses the preview's work.
+
 | Keys | |
 |---|---|
 | ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
@@ -29,7 +31,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: alignment and crop (M5b/c), weighting/masks/motion/color/batches/median (M6), RAW stills, HDR tone mapping. See the plan.
+Not yet: crop/straighten and canvas Fit/Fill (M5c), weighting/masks/motion/color/batches/median (M6), RAW stills, HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -81,6 +83,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 | `corrupt_frame_75.mp4` — count clip with one damaged NAL unit | The decoder failure is skipped; the damaged GOP is reported missing, every other frame is composited and keeps its identity |
 | `tenbit_ramp_10f.mp4` — HEVC Main10 (lossless), a 10-bit luma ramp | 10-bit sources are identified and decoded to half-float: 320 distinct ramp values survive (8-bit decode: 205) and a 16-bit PNG keeps them |
 | `sequence_png_12f/` — 12 PNG stills `frame_0…11.png` (+ a stray text file), index in binary blocks, gray bar | Natural sort (frame_10 after frame_9), non-images skipped, sequence time i/rate, every still decodes to itself, Average matches fixed values, reverse order, EXIF orientation and alpha (variants written by the tests) |
+| `handheld_png_8f/` and `handheld_8f.mp4` — one static block-noise scene cut at 8 known offsets (a drifting camera) | Alignment recovers every shift (0.5 px lossless, 1 px H.264), the aligned Average equals the reference inside the safe area while the unaligned one blurs, preview and export share transforms, implausible warps fall back to the shift |
 
 ## Manual verification (GUI — all 7 steps passed on the owner's Mac on 2026-11-06)
 
@@ -97,6 +100,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 11. (M4) Rename the clip in Finder and open the project: it opens anyway (Project shows "Unsaved changes" for the new location). Move the clip to another disk or delete it and open the project: "Video not found" with Locate…; pick the clip. Put a *different* video under the old name: "Video has changed" lists size/fingerprint differences; Use This File Anyway loads it with an orange notice describing what differs.
 12. (M4) In Export choose JPEG + Percent 50 and export; the inspector reports "Saved 540×960, 8-bit JPEG, sRGB IEC61966-2.1" and Finder agrees. Choose TIFF 16-bit + Display P3; the report says Display P3 and the image looks the same as the sRGB one in Preview (color-managed).
 13. (M5a) Drop a folder of same-size photos (or choose several in ⌘O). Source shows "N (JPEG ×N)", the pixel size after rotation, a Sequence rate field and Reverse order; the Time Range caption says "sequence time". Type 10 in the rate field, Return: End becomes N/10 s and the frames stay selected. Tick Reverse order: the filmstrip flips. Save as a project, quit, reopen: rate and order come back. A folder mixing portrait and landscape shots is refused with the file names.
+14. (M5b) Open a handheld clip, narrow the range to ~10 frames, turn on **Align frames before blending**: the preview re-renders sharper, the caption says "aligned", the Alignment section reports "N aligned to frame at … · max shift … px" and a yellow dashed safe area appears. Click the strip to move the playhead and **Use Playhead Frame**; ⌘Z restores the middle reference. Export: the inspector says "with alpha" because the moved edges are transparent.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

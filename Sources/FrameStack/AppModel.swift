@@ -32,6 +32,8 @@ struct PreviewSnapshot {
     /// Why frames are missing (decoder failure), if any.
     let decodeFailure: String?
     let elapsedSeconds: Double
+    /// What alignment did, when it was on.
+    let alignment: AlignmentReport?
 }
 
 enum SourceState {
@@ -116,6 +118,10 @@ final class AppModel: ObservableObject {
     @Published var opacity: Double = 1 {
         didSet { if blendMode.usesOpacity, opacity != oldValue { settingsChanged() } }
     }
+    /// Pre-blend registration (M5b); undoable and saved.
+    @Published var alignment: AlignmentSettings = .off { didSet { if alignment != oldValue { settingsChanged() } } }
+    /// Alignment report of the last export.
+    @Published private(set) var lastExportAlignment: AlignmentReport?
     /// Not part of `CompositeSettings`, so changing it re-renders (new
     /// revision) without an undo step.
     @Published var previewQuality: PreviewQuality = .draft { didSet { settingsChanged() } }
@@ -230,7 +236,7 @@ final class AppModel: ObservableObject {
 
     var settings: CompositeSettings {
         CompositeSettings(rangeStart: rangeStart, rangeEnd: rangeEnd, samplingKind: samplingKind,
-                          nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity)
+                          nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity, alignment: alignment)
     }
 
     var selectedTimes: [FrameTime] {
@@ -660,6 +666,7 @@ final class AppModel: ObservableObject {
         exactCount = max(1, s.exactCount)
         blendMode = s.blendMode
         opacity = min(max(s.opacity, 0), 1)
+        alignment = s.alignment
         exportSettings = project.export
         if let quality = project.ui.previewQuality.flatMap(PreviewQuality.init(rawValue:)) { previewQuality = quality }
         if let mode = project.ui.viewMode.flatMap(PreviewViewMode.init(rawValue:)) { viewMode = mode }
@@ -838,8 +845,25 @@ final class AppModel: ObservableObject {
         exactCount = s.exactCount
         blendMode = s.blendMode
         opacity = s.opacity
+        alignment = s.alignment
         suppressChanges = false
         settingsChanged()
+    }
+
+    /// Aligns to the frame under the playhead (falls back to the middle
+    /// frame if that frame is not selected).
+    func useReferenceAtPlayhead() {
+        guard let time = scrubTime else { return }
+        alignment.reference = .frame(time)
+    }
+
+    func useMiddleReference() {
+        alignment.reference = .middle
+    }
+
+    /// The frame the current selection is aligned to.
+    var alignmentReferenceTime: FrameTime? {
+        alignment.reference.resolve(in: selectedTimes)
     }
 
     private func settingsChanged(debounce: Bool = true) {
@@ -881,6 +905,7 @@ final class AppModel: ObservableObject {
         if old.samplingKind != new.samplingKind || old.nth != new.nth || old.exactCount != new.exactCount { return "Change Sampling" }
         if old.blendMode != new.blendMode { return "Change Blend Mode" }
         if old.opacity != new.opacity { return "Change Opacity" }
+        if old.alignment != new.alignment { return "Change Alignment" }
         return "Change Settings"
     }
 
@@ -900,7 +925,8 @@ final class AppModel: ObservableObject {
             frames: result.selectedTimes(in: timeline),
             blendMode: blendMode,
             opacity: Float(opacity),
-            maxLongEdge: previewQuality.maxLongEdge
+            maxLongEdge: previewQuality.maxLongEdge,
+            alignment: alignment
         )
         let revision = settingsRevision
         renderActivity = .waiting
@@ -927,7 +953,8 @@ final class AppModel: ObservableObject {
                     framesComposited: result.framesComposited,
                     missingFrames: result.missingFrames.count,
                     decodeFailure: result.decodeFailureSummary,
-                    elapsedSeconds: result.elapsedSeconds
+                    elapsedSeconds: result.elapsedSeconds,
+                    alignment: result.alignment
                 )
                 self.renderActivity = .idle
             } catch is CancellationError {
@@ -986,7 +1013,8 @@ final class AppModel: ObservableObject {
             frames: result.selectedTimes(in: timeline),
             blendMode: blendMode,
             opacity: Float(opacity),
-            maxLongEdge: exportSettings.sizing.maxLongEdge(for: source.displaySize)
+            maxLongEdge: exportSettings.sizing.maxLongEdge(for: source.displaySize),
+            alignment: alignment
         )
         let settings = exportSettings
         let renderer = renderer
@@ -1000,6 +1028,7 @@ final class AppModel: ObservableObject {
                     self?.reportExportProgress(progress)
                 }
                 try Task.checkCancellation()
+                self?.lastExportAlignment = composite.alignment
                 self?.exportActivity = .writing
                 let report = try await Task.detached(priority: .userInitiated) {
                     try ImageExporter.write(composite.image, to: url, settings: settings)

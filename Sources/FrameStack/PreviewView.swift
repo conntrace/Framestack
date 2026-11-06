@@ -60,6 +60,9 @@ struct ZoomableImageView: View {
     let zoom: ZoomMode
     let onZoomChange: (ZoomMode) -> Void
     let caption: String
+    /// Rectangle in full-resolution pixels (origin top-left) outlined over
+    /// the image — the alignment safe area.
+    var safeArea: CGRect? = nil
 
     @State private var pinchBase: Double?
 
@@ -76,6 +79,16 @@ struct ZoomableImageView: View {
                     .interpolation(scale >= 2 ? .none : .high)
                     .frame(width: width, height: height)
                     .background(Checkerboard())
+                    .overlay(alignment: .topLeading) {
+                        if let safeArea, !safeArea.isNull {
+                            Rectangle()
+                                .strokeBorder(Color.yellow.opacity(0.9), style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+                                .frame(width: max(1, safeArea.width * scale), height: max(1, safeArea.height * scale))
+                                .offset(x: safeArea.minX * scale, y: safeArea.minY * scale)
+                                .allowsHitTesting(false)
+                                .accessibilityLabel("Safe area \(Int(safeArea.width))×\(Int(safeArea.height))")
+                        }
+                    }
                     .frame(minWidth: viewport.width, minHeight: viewport.height)
             }
             .gesture(

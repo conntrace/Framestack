@@ -435,3 +435,106 @@ final class SequenceAppTests: XCTestCase {
         XCTAssertTrue(again.sourceNotice?.contains("5 frames") ?? false, again.sourceNotice ?? "nil")
     }
 }
+
+// MARK: - Alignment (M5b)
+
+@MainActor
+final class AlignmentAppTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("FrameStackAlignApp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var fixtures: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("FrameStackMediaTests/Fixtures")
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 20, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func waitReady(_ model: AppModel) async throws {
+        try await waitUntil { if case .ready = model.sourceState { return true } else { return false } }
+        try await waitUntil { model.isPreviewCurrent }
+    }
+
+    private func makeModel() -> AppModel {
+        AppModel(defaults: UserDefaults(suiteName: "AlignmentAppTests-\(UUID().uuidString)")!)
+    }
+
+    func testToggleAlignmentRerendersUndoesAndSaves() async throws {
+        let model = makeModel()
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        model.open(fixtures.appendingPathComponent("handheld_8f.mp4"))
+        try await waitReady(model)
+        XCTAssertNil(model.preview?.alignment)
+        XCTAssertEqual(model.alignment, .off)
+
+        model.alignment.enabled = true
+        XCTAssertFalse(model.isPreviewCurrent, "a settings change outdates the preview")
+        XCTAssertEqual(undo.undoActionName, "Change Alignment")
+        try await waitUntil { model.isPreviewCurrent }
+        let report = try XCTUnwrap(model.preview?.alignment)
+        XCTAssertEqual(report.alignedFrames, 7)
+        XCTAssertEqual(report.referenceTime, model.timeline?.frames[4])
+        XCTAssertEqual(model.alignmentReferenceTime, model.timeline?.frames[4])
+        XCTAssertGreaterThan(report.maxShiftPixels, 10)
+        XCTAssertFalse(report.validArea.isNull)
+
+        // Reference at the playhead; undo restores the middle.
+        model.scrubIndex = 0
+        model.useReferenceAtPlayhead()
+        XCTAssertEqual(model.alignment.reference, .frame(model.timeline!.frames[0]))
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.preview?.alignment?.referenceTime, model.timeline?.frames[0])
+        undo.undo()
+        XCTAssertEqual(model.alignment.reference, .middle)
+        undo.undo()
+        XCTAssertFalse(model.alignment.enabled)
+        undo.redo()
+        XCTAssertTrue(model.alignment.enabled)
+        try await waitUntil { model.isPreviewCurrent }
+
+        // Saved and restored with the project; the export carries the report.
+        model.alignment.mode = .perspective
+        let projectURL = directory.appendingPathComponent("aligned.framestack")
+        XCTAssertTrue(model.save(to: projectURL))
+        let text = try String(contentsOf: projectURL, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"alignment\" : {"), text)
+        XCTAssertTrue(text.contains("\"mode\" : \"perspective\""), text)
+        let reopened = makeModel()
+        reopened.open(projectURL)
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.alignment, AlignmentSettings(enabled: true, mode: .perspective, reference: .middle))
+        XCTAssertEqual(reopened.preview?.alignment?.mode, .perspective)
+
+        reopened.exportSettings = ExportSettings(format: .png, bitDepth: .eight)
+        let out = directory.appendingPathComponent("aligned.png")
+        reopened.export(to: out)
+        try await waitUntil { !reopened.isExporting }
+        guard case let .finished(exported, _, _) = reopened.exportActivity else { return XCTFail("\(reopened.exportActivity)") }
+        XCTAssertTrue(exported.hasAlpha, "uncovered edges are transparent")
+        XCTAssertEqual(reopened.lastExportAlignment?.alignedFrames, 7)
+        XCTAssertTrue(reopened.lastExportAlignment?.fromCache ?? false, "the export reused the preview's transforms")
+    }
+
+    func testOldProjectsWithoutAlignmentReadAsOff() throws {
+        let json = """
+        {"rangeStart":{"value":0,"timescale":1},"rangeEnd":{"value":1,"timescale":1},"samplingKind":"all","nth":1,"exactCount":1,"blendMode":"average","opacity":1}
+        """
+        let settings = try JSONDecoder().decode(CompositeSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.alignment, .off)
+    }
+}
