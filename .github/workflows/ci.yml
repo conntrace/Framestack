@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: Build & test (macOS)
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      FRAMESTACK_ARTIFACTS_DIR: ${{ github.workspace }}/ci-artifacts/renders
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Environment
+        shell: bash
+        run: |
+          sw_vers
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          xcodebuild -version
+          swift --version
+          system_profiler SPDisplaysDataType 2>/dev/null | head -20 || true
+
+      - name: Build (debug)
+        shell: bash
+        run: swift build 2>&1 | tee build-debug.log
+
+      - name: Test
+        shell: bash
+        run: |
+          mkdir -p ci-artifacts
+          swift test 2>&1 | tee ci-artifacts/test-output.txt
+
+      - name: Build app bundle (release)
+        shell: bash
+        run: |
+          scripts/make_app_bundle.sh
+          ls -la .build/FrameStack.app/Contents/MacOS
+          plutil -lint .build/FrameStack.app/Contents/Info.plist
+          cd .build && ditto -c -k --keepParent FrameStack.app ../ci-artifacts/FrameStack-app-arm64.zip
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: framestack-ci-${{ github.run_number }}
+          path: |
+            ci-artifacts
+            build-debug.log
+          if-no-files-found: warn
