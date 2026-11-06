@@ -4,6 +4,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.undoManager) private var undoManager
 
     var body: some View {
         VStack(spacing: 0) {
@@ -45,6 +46,8 @@ struct ContentView: View {
             }
         }
         .navigationTitle(model.source?.fileName ?? "FrameStack")
+        .onAppear { model.undoManager = undoManager }
+        .onChange(of: undoManager) { _, new in model.undoManager = new }
     }
 }
 
@@ -134,17 +137,15 @@ private struct BottomBar: View {
 
     var body: some View {
         VStack(spacing: 6) {
-            if let source = model.source, model.timeline != nil {
-                TimelineStrip(
-                    duration: source.duration.seconds,
-                    rangeStart: model.rangeStart.seconds,
-                    rangeEnd: model.rangeEnd.seconds,
-                    selected: model.selectedTimes.map(\.seconds)
-                )
-                .frame(height: 28)
+            if model.source != nil, model.timeline != nil {
+                TimelineStrip()
             }
             HStack(spacing: 12) {
                 selectionSummary
+                if model.timeline != nil {
+                    Divider().frame(height: 14)
+                    PlayheadControls()
+                }
                 Spacer()
                 activity
             }
@@ -215,32 +216,3 @@ private struct BottomBar: View {
     }
 }
 
-/// Source duration with the selected range highlighted and a tick for every
-/// selected frame (at its real timestamp).
-struct TimelineStrip: View {
-    let duration: Double
-    let rangeStart: Double
-    let rangeEnd: Double
-    let selected: [Double]
-
-    var body: some View {
-        Canvas { context, size in
-            let track = Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 4)
-            context.fill(track, with: .color(.secondary.opacity(0.15)))
-            guard duration > 0 else { return }
-            func x(_ t: Double) -> CGFloat { CGFloat(min(max(t / duration, 0), 1)) * size.width }
-
-            let rangeRect = CGRect(x: x(rangeStart), y: 0, width: max(1, x(rangeEnd) - x(rangeStart)), height: size.height)
-            context.fill(Path(roundedRect: rangeRect, cornerRadius: 4), with: .color(.accentColor.opacity(0.25)))
-
-            var ticks = Path()
-            for t in selected {
-                let px = x(t)
-                ticks.move(to: CGPoint(x: px, y: 4))
-                ticks.addLine(to: CGPoint(x: px, y: size.height - 4))
-            }
-            context.stroke(ticks, with: .color(.accentColor), lineWidth: selected.count > Int(size.width / 2) ? 0.5 : 1)
-        }
-        .accessibilityLabel("Timeline: \(selected.count) frames selected between \(Format.seconds(rangeStart)) and \(Format.seconds(rangeEnd))")
-    }
-}

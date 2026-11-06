@@ -64,9 +64,22 @@ enum ExportActivity: Equatable {
     case failed(String)
 }
 
+/// Every user-editable, non-destructive compositing setting — one value
+/// that undo/redo and (later) project files can snapshot.
+struct CompositeSettings: Equatable {
+    var rangeStart: FrameTime
+    var rangeEnd: FrameTime
+    var samplingKind: SamplingKind
+    var nth: Int
+    var exactCount: Int
+    var blendMode: BlendMode
+    var opacity: Double
+}
+
 /// All UI state. Settings are plain values (non-destructive); every change
 /// bumps `settingsRevision`, recomputes the frame selection synchronously
-/// (cheap), and schedules a debounced, cancellable preview render.
+/// (cheap), registers an undo step, and schedules a debounced, cancellable
+/// preview render.
 @MainActor
 final class AppModel: ObservableObject {
     // Source
@@ -75,6 +88,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var timeline: FrameTimeline?
     @Published private(set) var scanResult: FrameScanResult?
     @Published private(set) var scanned: Int = 0
+    @Published private(set) var thumbnails: [TimelineThumbnail] = []
 
     // Settings
     @Published var rangeStart: FrameTime = .zero { didSet { settingsChanged() } }
@@ -87,8 +101,20 @@ final class AppModel: ObservableObject {
     @Published var opacity: Double = 1 {
         didSet { if blendMode.usesOpacity, opacity != oldValue { settingsChanged() } }
     }
+    /// Not part of `CompositeSettings`, so changing it re-renders (new
+    /// revision) without an undo step.
     @Published var previewQuality: PreviewQuality = .draft { didSet { settingsChanged() } }
     @Published var exportBitDepth: ExportBitDepth = .sixteen
+
+    // Playhead (not a compositing setting; not undoable)
+    /// Index into `timeline.frames` of the frame under the playhead.
+    @Published var scrubIndex: Int? {
+        didSet {
+            if let timeline, let i = scrubIndex, !(0..<timeline.count).contains(i) {
+                scrubIndex = min(max(i, 0), timeline.count - 1)
+            }
+        }
+    }
 
     // Derived / results
     @Published private(set) var selection: Result<SamplingResult, SamplingError>?
@@ -97,11 +123,23 @@ final class AppModel: ObservableObject {
     @Published private(set) var renderActivity: RenderActivity = .idle
     @Published private(set) var exportActivity: ExportActivity = .idle
 
+    /// The window's undo manager, handed in by the view. Settings changes
+    /// register undo steps on it.
+    weak var undoManager: UndoManager? {
+        didSet { if undoManager !== oldValue { lastSettings = settings } }
+    }
+
     private let renderer = CompositeRenderer()
     private var loadTask: Task<Void, Never>?
+    private var thumbnailTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     private var exportTask: Task<Void, Never>?
     private var suppressChanges = false
+    private var lastSettings: CompositeSettings?
+    private var interactiveEditDepth = 0
+
+    static let thumbnailCount = 32
+    static let thumbnailHeight = 44
 
     // MARK: Derived values
 
@@ -115,9 +153,24 @@ final class AppModel: ObservableObject {
 
     var range: FrameTimeRange { FrameTimeRange(start: rangeStart, end: rangeEnd) }
 
+    var settings: CompositeSettings {
+        CompositeSettings(rangeStart: rangeStart, rangeEnd: rangeEnd, samplingKind: samplingKind,
+                          nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity)
+    }
+
     var selectedTimes: [FrameTime] {
         guard let timeline, case let .success(result)? = selection else { return [] }
         return result.selectedTimes(in: timeline)
+    }
+
+    /// Inclusive indices of the frames inside the current range (nil if none).
+    var frameRange: ClosedRange<Int>? {
+        timeline?.frameIndices(in: range)
+    }
+
+    var scrubTime: FrameTime? {
+        guard let timeline, let i = scrubIndex, i < timeline.count else { return nil }
+        return timeline.frames[i]
     }
 
     var isPreviewCurrent: Bool { preview?.revision == settingsRevision }
@@ -149,16 +202,21 @@ final class AppModel: ObservableObject {
 
     func open(_ url: URL) {
         loadTask?.cancel()
+        thumbnailTask?.cancel()
         previewTask?.cancel()
         exportTask?.cancel()
         source = nil
         timeline = nil
         scanResult = nil
+        thumbnails = []
         preview = nil
         selection = nil
         scanned = 0
+        scrubIndex = nil
         renderActivity = .idle
         exportActivity = .idle
+        undoManager?.removeAllActions(withTarget: self)
+        lastSettings = nil
         sourceState = .loading(fileName: url.lastPathComponent, step: "Reading metadata…")
 
         loadTask = Task { [weak self] in
@@ -179,7 +237,9 @@ final class AppModel: ObservableObject {
                 self.rangeEnd = info.duration
                 self.suppressChanges = false
                 self.sourceState = .ready
+                self.lastSettings = self.settings
                 self.settingsChanged(debounce: false)
+                self.loadThumbnails(for: info, timeline: scan.timeline)
             } catch is CancellationError {
                 return
             } catch {
@@ -201,18 +261,154 @@ final class AppModel: ObservableObject {
         sourceState = .empty
     }
 
-    // MARK: Settings & preview
+    private func loadThumbnails(for source: VideoSourceInfo, timeline: FrameTimeline) {
+        thumbnailTask?.cancel()
+        thumbnailTask = Task { [weak self] in
+            let images = (try? await SourceFrames.thumbnails(
+                for: source, timeline: timeline, count: min(Self.thumbnailCount, timeline.count),
+                maxHeight: Self.thumbnailHeight * 2
+            )) ?? []
+            guard let self, !Task.isCancelled, self.source == source else { return }
+            self.thumbnails = images
+        }
+    }
+
+    // MARK: Settings, undo, preview
 
     func resetRange() {
         guard let source else { return }
+        withUndoGroup {
+            rangeStart = .zero
+            rangeEnd = source.duration
+        }
+    }
+
+    /// Sets the range to frames `first…last` inclusive (clamped, ordered).
+    func setFrameRange(first: Int, last: Int) {
+        guard let timeline, let source, timeline.count > 0 else { return }
+        let new = timeline.range(firstFrame: first, lastFrame: last, end: source.duration)
+        withUndoGroup {
+            rangeStart = new.start
+            rangeEnd = new.end
+        }
+    }
+
+    func setFirstFrame(_ index: Int) {
+        guard let current = frameRange else { return setFrameRange(first: index, last: index) }
+        setFrameRange(first: index, last: max(index, current.upperBound))
+    }
+
+    func setLastFrame(_ index: Int) {
+        guard let current = frameRange else { return setFrameRange(first: index, last: index) }
+        setFrameRange(first: min(index, current.lowerBound), last: index)
+    }
+
+    /// Moves the in point to the nearest frame boundary at `time`, keeping
+    /// the range non-empty (drag handle).
+    func setRangeStartSnapped(to time: FrameTime) {
+        guard let timeline, let source, let i = timeline.nearestIndex(to: time) else { return }
+        let start = timeline.frames[i]
+        let end = start < rangeEnd ? rangeEnd : timeline.boundary(after: i, end: source.duration)
+        withUndoGroup {
+            rangeStart = start
+            if end != rangeEnd { rangeEnd = end }
+        }
+    }
+
+    /// Moves the out point to the nearest frame boundary at `time`, keeping
+    /// the range non-empty (drag handle).
+    func setRangeEndSnapped(to time: FrameTime) {
+        guard let timeline, let source, timeline.count > 0 else { return }
+        var end = timeline.nearestBoundary(to: time, end: source.duration)
+        if !(rangeStart < end), let i = timeline.index(atOrBefore: rangeStart) {
+            end = timeline.boundary(after: i, end: source.duration)
+        }
+        withUndoGroup {
+            if !(rangeStart < end), let j = timeline.nearestIndex(to: end), j > 0 { rangeStart = timeline.frames[j - 1] }
+            rangeEnd = end
+        }
+    }
+
+    // Playhead
+
+    func stepScrub(by delta: Int) {
+        guard let timeline, timeline.count > 0 else { return }
+        let base = scrubIndex ?? frameRange?.lowerBound ?? 0
+        scrubIndex = min(max(base + delta, 0), timeline.count - 1)
+    }
+
+    func scrub(to time: FrameTime) {
+        guard let timeline else { return }
+        scrubIndex = timeline.nearestIndex(to: time)
+    }
+
+    func setInPointAtPlayhead() {
+        guard let i = scrubIndex else { return }
+        let last = frameRange.map { max($0.upperBound, i) } ?? i
+        setFrameRange(first: i, last: last)
+    }
+
+    func setOutPointAtPlayhead() {
+        guard let i = scrubIndex else { return }
+        let first = frameRange.map { min($0.lowerBound, i) } ?? i
+        setFrameRange(first: first, last: i)
+    }
+
+    /// Groups the settings changes made inside into one undo step; nests.
+    func withUndoGroup(_ body: () -> Void) {
+        beginInteractiveEdit()
+        body()
+        endInteractiveEdit()
+    }
+
+    /// Call around a drag or slider gesture so every intermediate value
+    /// collapses into a single undo step.
+    func beginInteractiveEdit() {
+        if interactiveEditDepth == 0 { undoManager?.beginUndoGrouping() }
+        interactiveEditDepth += 1
+    }
+
+    func endInteractiveEdit() {
+        guard interactiveEditDepth > 0 else { return }
+        interactiveEditDepth -= 1
+        if interactiveEditDepth == 0 { undoManager?.endUndoGrouping() }
+    }
+
+    /// Restores a settings snapshot as one change (undo/redo).
+    func apply(_ s: CompositeSettings) {
         suppressChanges = true
-        rangeStart = .zero
+        rangeStart = s.rangeStart
+        rangeEnd = s.rangeEnd
+        samplingKind = s.samplingKind
+        nth = s.nth
+        exactCount = s.exactCount
+        blendMode = s.blendMode
+        opacity = s.opacity
         suppressChanges = false
-        rangeEnd = source.duration
+        settingsChanged()
     }
 
     private func settingsChanged(debounce: Bool = true) {
         guard !suppressChanges else { return }
+        let new = settings
+        if let old = lastSettings, old != new, let undoManager {
+            // A manager that does not group by event needs an explicit
+            // group around every registration (the window's manager groups
+            // by event; tests use an explicit one).
+            let needsGroup = !undoManager.groupsByEvent && undoManager.groupingLevel == 0
+            if needsGroup { undoManager.beginUndoGrouping() }
+            undoManager.registerUndo(withTarget: self) { model in
+                // Called on the main thread by the undo manager; apply
+                // synchronously so the redo registration lands while
+                // `isUndoing` is still true.
+                MainActor.assumeIsolated { model.apply(old) }
+            }
+            if !undoManager.isUndoing, !undoManager.isRedoing {
+                undoManager.setActionName(Self.actionName(from: old, to: new))
+            }
+            if needsGroup { undoManager.endUndoGrouping() }
+        }
+        lastSettings = new
         settingsRevision += 1
         if let timeline {
             do {
@@ -224,6 +420,14 @@ final class AppModel: ObservableObject {
             }
         }
         schedulePreview(debounce: debounce)
+    }
+
+    private static func actionName(from old: CompositeSettings, to new: CompositeSettings) -> String {
+        if old.rangeStart != new.rangeStart || old.rangeEnd != new.rangeEnd { return "Change Time Range" }
+        if old.samplingKind != new.samplingKind || old.nth != new.nth || old.exactCount != new.exactCount { return "Change Sampling" }
+        if old.blendMode != new.blendMode { return "Change Blend Mode" }
+        if old.opacity != new.opacity { return "Change Opacity" }
+        return "Change Settings"
     }
 
     func renderPreviewNow() {

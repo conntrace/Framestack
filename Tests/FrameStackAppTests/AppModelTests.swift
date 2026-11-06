@@ -236,6 +236,124 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.preview?.framesComposited, 30)
     }
 
+    // M3: frame-accurate range entry, playhead, in/out points.
+    func testFrameRangeEntryAndPlayhead() async throws {
+        let model = AppModel()
+        try await openAndWait(model, "count_5s_30fps")
+        XCTAssertEqual(model.frameRange, 0...149)
+        XCTAssertNil(model.scrubIndex)
+
+        model.setFrameRange(first: 60, last: 149)
+        XCTAssertEqual(model.rangeStart, model.timeline!.frames[60])
+        XCTAssertEqual(model.rangeEnd, model.source!.duration, "last frame inclusive → duration")
+        XCTAssertEqual(try model.selection?.get().eligibleCount, 90)
+
+        model.setLastFrame(89)
+        XCTAssertEqual(model.rangeEnd, model.timeline!.frames[90], "exclusive end = next frame's time")
+        XCTAssertEqual(model.frameRange, 60...89)
+        model.setFirstFrame(95)
+        XCTAssertEqual(model.frameRange, 95...95, "first past last → single frame, never empty")
+
+        // Playhead: stepping clamps; in/out points at the playhead.
+        model.stepScrub(by: -1)
+        XCTAssertEqual(model.scrubIndex, 94, "starts from the range start when unset")
+        model.scrubIndex = 10
+        model.stepScrub(by: -50)
+        XCTAssertEqual(model.scrubIndex, 0)
+        model.stepScrub(by: 1000)
+        XCTAssertEqual(model.scrubIndex, 149)
+        model.scrub(to: FrameTime(seconds: 2.51))
+        XCTAssertEqual(model.scrubIndex, 75)
+        XCTAssertEqual(model.scrubTime, model.timeline!.frames[75])
+
+        model.setInPointAtPlayhead()
+        XCTAssertEqual(model.frameRange, 75...95)
+        model.scrubIndex = 120
+        model.setOutPointAtPlayhead()
+        XCTAssertEqual(model.frameRange, 75...120)
+        model.scrubIndex = 30
+        model.setOutPointAtPlayhead()
+        XCTAssertEqual(model.frameRange, 30...30, "out before in → both move")
+
+        // Snapped handle drags keep the range non-empty.
+        model.setRangeStartSnapped(to: FrameTime(seconds: 1.0))
+        XCTAssertEqual(model.frameRange, 30...30)
+        model.setRangeEndSnapped(to: FrameTime(seconds: 2.0))
+        XCTAssertEqual(model.frameRange, 30...59)
+        model.setRangeStartSnapped(to: FrameTime(seconds: 4.0))
+        XCTAssertEqual(model.frameRange, 120...120, "start dragged past end pushes end along")
+        model.setRangeEndSnapped(to: FrameTime(seconds: 0.0))
+        XCTAssertEqual(model.frameRange?.count, 1, "end dragged before start keeps one frame")
+    }
+
+    func testUndoRedoOfSettings() async throws {
+        let model = AppModel()
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        try await openAndWait(model, "count_5s_30fps")
+        XCTAssertFalse(undo.canUndo, "opening a file is not undoable")
+
+        model.rangeStart = FrameTime(seconds: 1)
+        XCTAssertTrue(undo.canUndo)
+        XCTAssertEqual(undo.undoActionName, "Change Time Range")
+        model.blendMode = .lighten
+        XCTAssertEqual(undo.undoActionName, "Change Blend Mode")
+
+        undo.undo()
+        XCTAssertEqual(model.blendMode, .average)
+        XCTAssertEqual(model.rangeStart, FrameTime(seconds: 1))
+        XCTAssertTrue(undo.canRedo)
+        XCTAssertEqual(undo.redoActionName, "Change Blend Mode")
+        undo.undo()
+        XCTAssertEqual(model.rangeStart, .zero)
+        XCTAssertFalse(undo.canUndo)
+        undo.redo()
+        XCTAssertEqual(model.rangeStart, FrameTime(seconds: 1))
+        XCTAssertEqual(model.blendMode, .average)
+        undo.redo()
+        XCTAssertEqual(model.blendMode, .lighten)
+        XCTAssertFalse(model.isPreviewCurrent, "undo/redo re-render like any change")
+
+        // A grouped edit (drag / slider) is one step.
+        model.blendMode = .normal
+        model.beginInteractiveEdit()
+        for v in [0.9, 0.7, 0.5, 0.3] { model.opacity = v }
+        model.endInteractiveEdit()
+        XCTAssertEqual(model.opacity, 0.3)
+        undo.undo()
+        XCTAssertEqual(model.opacity, 1, "whole drag undone at once")
+        XCTAssertEqual(model.blendMode, .normal)
+
+        // setFrameRange changes start and end as one step.
+        model.setFrameRange(first: 10, last: 20)
+        XCTAssertEqual(model.frameRange, 10...20)
+        undo.undo()
+        XCTAssertEqual(model.frameRange, 30...149)
+
+        // Preview quality is not undoable but does re-render.
+        let revision = model.settingsRevision
+        model.previewQuality = .high
+        XCTAssertEqual(model.settingsRevision, revision + 1)
+        XCTAssertFalse(model.isPreviewCurrent)
+        XCTAssertEqual(undo.undoActionName, "Change Blend Mode", "quality change registered no undo step; top is still the Normal switch")
+
+        // Opening another clip clears the stack.
+        try await openAndWait(model, "moving_square_24f")
+        XCTAssertFalse(undo.canUndo)
+        XCTAssertFalse(undo.canRedo)
+    }
+
+    func testThumbnailsLoadAfterImport() async throws {
+        let model = AppModel()
+        try await openAndWait(model, "portrait_rot90cw")
+        try await waitUntil { !model.thumbnails.isEmpty }
+        XCTAssertEqual(model.thumbnails.count, min(AppModel.thumbnailCount, model.timeline!.count), "10-frame clip → 10 distinct thumbnails")
+        XCTAssertLessThan(model.thumbnails[0].image.width, model.thumbnails[0].image.height, "upright portrait")
+        model.open(fixtureURL("count_5s_30fps"))
+        XCTAssertTrue(model.thumbnails.isEmpty, "cleared on open")
+    }
+
     // A damaged file still produces a composite and says what is missing.
     func testCorruptFileReportsMissingFramesInPreviewAndExport() async throws {
         let model = AppModel()

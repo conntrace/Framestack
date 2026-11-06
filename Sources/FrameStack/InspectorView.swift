@@ -130,12 +130,57 @@ private struct TimeRangeSection: View {
                 SecondsField(label: "End", time: $model.rangeEnd)
             }
             HStack {
+                FrameIndexField(label: "First frame", value: firstFrameBinding, maximum: maxIndex)
+                FrameIndexField(label: "Last frame", value: lastFrameBinding, maximum: maxIndex)
+            }
+            HStack {
                 Text("Start inclusive, end exclusive [start, end) · \(Format.seconds(max(0, model.range.durationSeconds)))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Full Clip") { model.resetRange() }
                     .controlSize(.small)
+            }
+        }
+    }
+}
+
+private extension TimeRangeSection {
+    var maxIndex: Int { max((model.timeline?.count ?? 1) - 1, 0) }
+
+    /// 0-based index of the first selected frame; empty ranges show −1.
+    var firstFrameBinding: Binding<Int> {
+        Binding(
+            get: { model.frameRange?.lowerBound ?? -1 },
+            set: { model.setFirstFrame($0) }
+        )
+    }
+
+    var lastFrameBinding: Binding<Int> {
+        Binding(
+            get: { model.frameRange?.upperBound ?? -1 },
+            set: { model.setLastFrame($0) }
+        )
+    }
+}
+
+/// Frame-accurate range entry: 0-based frame index with a stepper. The
+/// "last frame" is inclusive; the model converts it to the exclusive end.
+private struct FrameIndexField: View {
+    let label: String
+    @Binding var value: Int
+    let maximum: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 2) {
+                TextField(label, value: $value, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                    .monospacedDigit()
+                    .labelsHidden()
+                Stepper(label, value: $value, in: 0...max(maximum, 0))
+                    .labelsHidden()
             }
         }
     }
@@ -249,7 +294,10 @@ private struct BlendSection: View {
             if model.blendMode.usesOpacity {
                 HStack {
                     Text("Opacity").font(.callout)
-                    Slider(value: $model.opacity, in: 0...1)
+                    Slider(value: $model.opacity, in: 0...1) { editing in
+                        // One undo step per drag, not one per pixel.
+                        editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
+                    }
                     Text("\(Int((model.opacity * 100).rounded())) %")
                         .font(.callout)
                         .monospacedDigit()

@@ -30,6 +30,30 @@ struct FrameStackApp: App {
                     .keyboardShortcut("e")
                     .disabled(!model.canExport)
             }
+            CommandMenu("Frame") {
+                Button("Previous Frame") { model.stepScrub(by: -1) }
+                    .keyboardShortcut(.leftArrow, modifiers: .option)
+                Button("Next Frame") { model.stepScrub(by: 1) }
+                    .keyboardShortcut(.rightArrow, modifiers: .option)
+                Button("Back 10 Frames") { model.stepScrub(by: -10) }
+                    .keyboardShortcut(.leftArrow, modifiers: [.option, .shift])
+                Button("Forward 10 Frames") { model.stepScrub(by: 10) }
+                    .keyboardShortcut(.rightArrow, modifiers: [.option, .shift])
+                Divider()
+                Button("Set In Point at Playhead") { model.setInPointAtPlayhead() }
+                    .keyboardShortcut("i", modifiers: .option)
+                    .disabled(model.scrubIndex == nil)
+                Button("Set Out Point at Playhead") { model.setOutPointAtPlayhead() }
+                    .keyboardShortcut("o", modifiers: .option)
+                    .disabled(model.scrubIndex == nil)
+                Button("Go to Range Start") { if let r = model.frameRange { model.scrubIndex = r.lowerBound } }
+                    .keyboardShortcut(.leftArrow, modifiers: [.option, .command])
+                Button("Go to Range End") { if let r = model.frameRange { model.scrubIndex = r.upperBound } }
+                    .keyboardShortcut(.rightArrow, modifiers: [.option, .command])
+                Divider()
+                Button("Full Clip") { model.resetRange() }
+                    .keyboardShortcut("f", modifiers: [.option, .command])
+            }
             CommandMenu("Render") {
                 Button("Render Preview Now") { model.renderPreviewNow() }
                     .keyboardShortcut("r")
