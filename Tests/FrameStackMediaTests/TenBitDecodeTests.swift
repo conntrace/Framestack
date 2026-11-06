@@ -54,13 +54,19 @@ final class TenBitDecodeTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(fileLevels.count, 300, "16-bit PNG keeps the 10-bit ramp: \(fileLevels.count) levels")
     }
 
+    /// The exact count through 8-bit depends on the decoder's YCbCr→RGB
+    /// conversion (205 on the owner's M4 Pro, 256 on the macOS 15 CI VM), so
+    /// the test compares the two paths on the same machine instead of
+    /// hard-coding either number.
     func testEightBitDecodeOfTheSameClipLosesLevels() async throws {
-        CompositeRenderer.forceEightBitDecode = true
         let clip = try await loadFixture(.tenBit)
+        let half = distinctLevels(try await render(clip, indices: Array(0..<10)).image)
+        CompositeRenderer.forceEightBitDecode = true
         let result = try await render(clip, indices: Array(0..<10))
-        let levels = distinctLevels(result.image)
-        XCTAssertLessThanOrEqual(levels, 220, "8-bit limited range has 219 codes; got \(levels)")
-        XCTAssertGreaterThan(levels, 150)
+        let eight = distinctLevels(result.image)
+        XCTAssertLessThanOrEqual(eight, 256, "8-bit can produce at most 256 distinct values; got \(eight)")
+        XCTAssertGreaterThan(eight, 150)
+        XCTAssertGreaterThanOrEqual(half, eight + 60, "half-float \(half) vs 8-bit \(eight)")
         saveArtifact(result.image, name: "tenbit_ramp_average_8bit")
     }
 
