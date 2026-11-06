@@ -26,6 +26,16 @@ public struct CompositeProgress: Sendable, Equatable {
     public let framesTotal: Int
 }
 
+/// A point where the decoder gave up (corrupt or unsupported data) and the
+/// renderer restarted it after the damage.
+public struct DecodeFailure: Sendable, Equatable {
+    /// Last frame the decoder delivered before failing, if any.
+    public let afterFrame: FrameTime?
+    /// Selected frame the renderer resumed from.
+    public let resumedAt: FrameTime
+    public let message: String
+}
+
 public struct CompositeResult: Sendable {
     public let image: LinearImage
     public let framesComposited: Int
@@ -33,10 +43,22 @@ public struct CompositeResult: Sendable {
     /// The composite uses only the frames that were decoded; callers must
     /// surface this list to the user.
     public let missingFrames: [FrameTime]
+    /// Decoder failures encountered and skipped. Empty for a healthy file.
+    public let decodeFailures: [DecodeFailure]
     /// True when composited frames arrived in strictly increasing
     /// presentation order (relevant for order-dependent blend modes).
     public let deliveredInPresentationOrder: Bool
     public let elapsedSeconds: Double
+
+    /// One-line explanation of why frames are missing, for the UI.
+    public var decodeFailureSummary: String? {
+        guard let first = decodeFailures.first else { return nil }
+        let at = first.afterFrame.map { String(format: "after %.3f s", $0.seconds) } ?? "at the start of the selection"
+        let more = decodeFailures.count > 1 ? " (+\(decodeFailures.count - 1) more)" : ""
+        let gaveUp = decodeFailures.count >= CompositeRenderer.maxDecoderRestarts
+            ? "; gave up after \(decodeFailures.count) decoder restarts — the file is badly damaged" : ""
+        return "\(first.message) \(at)\(more)\(gaveUp)"
+    }
 }
 
 /// Decodes the selected frames of a video and reduces them into a composite.
@@ -54,7 +76,16 @@ public struct CompositeResult: Sendable {
 /// Memory: one output-sized Float32 frame buffer + the accumulator; never
 /// proportional to the number of frames. Rendering is cancellable between
 /// frames via Swift task cancellation.
+///
+/// Damaged files: when the decoder fails part-way (AVAssetReader reports
+/// `.failed`, e.g. "Cannot Decode" on an invalid NAL unit), the renderer
+/// restarts a new reader at the next selected frame after the last one the
+/// decoder delivered and keeps going. Frames that never decode are reported
+/// in `missingFrames` with the reason in `decodeFailures`; they are never
+/// replaced by a neighbouring frame. Each restart strictly advances, so the
+/// loop terminates; it is additionally capped at `maxDecoderRestarts`.
 public final class CompositeRenderer: @unchecked Sendable {
+    public static let maxDecoderRestarts = 256
     static let decodeSettings: [String: Any] = [
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
     ]
@@ -88,31 +119,11 @@ public final class CompositeRenderer: @unchecked Sendable {
         let track = try await VideoSourceLoader.videoTrack(of: asset, trackID: request.source.trackID)
         try Task.checkCancellation()
 
-        let reader: AVAssetReader
-        do {
-            reader = try AVAssetReader(asset: asset)
-        } catch {
-            throw MediaError.readerFailed(error.localizedDescription)
-        }
         // Decode only the span containing the selection. The end is one tick
         // past the last selected timestamp, so that frame is included.
         let end = CMTimeAdd(last.cmTime, CMTime(value: 1, timescale: last.timescale))
-        reader.timeRange = CMTimeRange(start: first.cmTime, end: end)
-
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: Self.decodeSettings)
-        output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else {
-            throw MediaError.cannotDecode(codec: request.source.codec, reason: "No decoder output is available for this track.")
-        }
-        reader.add(output)
-        guard reader.startReading() else {
-            throw MediaError.readerFailed(reader.error?.localizedDescription ?? "The reader could not start.")
-        }
-        defer {
-            if reader.status == .reading { reader.cancelReading() }
-        }
-
         let orientation = CGImagePropertyOrientation(rawValue: UInt32(request.source.orientation.rawValue)) ?? .up
+
         var seen = Set<FrameTime>()
         var accumulator: AverageAccumulator?
         var frameBuffer: [Float] = []
@@ -120,44 +131,70 @@ public final class CompositeRenderer: @unchecked Sendable {
         var outputSize = PixelSize(width: 0, height: 0)
         var previous: FrameTime?
         var inOrder = true
+        var failures: [DecodeFailure] = []
+        var resumeFrom = first
 
-        while true {
-            try Task.checkCancellation()
-            let finished: Bool = try autoreleasepool {
-                guard let sample = output.copyNextSampleBuffer() else { return true }
-                guard let pts = FrameTime(CMSampleBufferGetPresentationTimeStamp(sample)),
-                      wanted.contains(pts), !seen.contains(pts),
-                      let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
-                    return false
-                }
-
-                let image = orientedImage(pixelBuffer, orientation: orientation)
-                let size = PixelSize(width: Int(image.extent.width.rounded()), height: Int(image.extent.height.rounded()))
-                if let expected = sourceSize {
-                    guard expected == size else {
-                        throw MediaError.frameSizeChanged(expected: expected, actual: size)
-                    }
-                } else {
-                    sourceSize = size
-                    outputSize = size.fitting(maxLongEdge: request.maxLongEdge)
-                    accumulator = AverageAccumulator(width: outputSize.width, height: outputSize.height)
-                    frameBuffer = [Float](repeating: 0, count: outputSize.pixelCount * LinearImage.channelCount)
-                }
-
-                renderFrame(image, sourceSize: size, outputSize: outputSize, into: &frameBuffer)
-                try frameBuffer.withUnsafeBufferPointer { try accumulator!.add($0) }
-
-                seen.insert(pts)
-                if let previous, !(previous < pts) { inOrder = false }
-                previous = pts
-                progress?(CompositeProgress(framesComposited: seen.count, framesTotal: total))
-                return seen.count == total
+        readers: while true {
+            let (reader, output) = try makeReader(asset: asset, track: track, codec: request.source.codec,
+                                                  from: resumeFrom.cmTime, to: end)
+            defer {
+                if reader.status == .reading { reader.cancelReading() }
             }
-            if finished { break }
-        }
+            /// Last timestamp the decoder delivered in this pass, wanted or not.
+            var lastDelivered: FrameTime?
 
-        if reader.status == .failed {
-            throw MediaError.readerFailed(reader.error?.localizedDescription ?? "unknown error")
+            while true {
+                try Task.checkCancellation()
+                let finished: Bool = try autoreleasepool {
+                    guard let sample = output.copyNextSampleBuffer() else { return true }
+                    guard let pts = FrameTime(CMSampleBufferGetPresentationTimeStamp(sample)) else { return false }
+                    lastDelivered = pts
+                    guard wanted.contains(pts), !seen.contains(pts),
+                          let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
+                        return false
+                    }
+
+                    let image = orientedImage(pixelBuffer, orientation: orientation)
+                    let size = PixelSize(width: Int(image.extent.width.rounded()), height: Int(image.extent.height.rounded()))
+                    if let expected = sourceSize {
+                        guard expected == size else {
+                            throw MediaError.frameSizeChanged(expected: expected, actual: size)
+                        }
+                    } else {
+                        sourceSize = size
+                        outputSize = size.fitting(maxLongEdge: request.maxLongEdge)
+                        accumulator = AverageAccumulator(width: outputSize.width, height: outputSize.height)
+                        frameBuffer = [Float](repeating: 0, count: outputSize.pixelCount * LinearImage.channelCount)
+                    }
+
+                    renderFrame(image, sourceSize: size, outputSize: outputSize, into: &frameBuffer)
+                    try frameBuffer.withUnsafeBufferPointer { try accumulator!.add($0) }
+
+                    seen.insert(pts)
+                    if let previous, !(previous < pts) { inOrder = false }
+                    previous = pts
+                    progress?(CompositeProgress(framesComposited: seen.count, framesTotal: total))
+                    return seen.count == total
+                }
+                if finished { break }
+            }
+
+            guard reader.status == .failed else { break readers }
+
+            // The decoder gave up. Skip past the damage: resume at the next
+            // selected frame after the last one delivered (or after the
+            // start of this pass if nothing was delivered). `next` is
+            // strictly greater than the anchor, so every restart advances.
+            let message = reader.error?.localizedDescription ?? "unknown error"
+            let anchor = lastDelivered ?? resumeFrom
+            guard failures.count < Self.maxDecoderRestarts,
+                  let next = request.frames.first(where: { $0 > anchor && !seen.contains($0) }) else {
+                if accumulator == nil { throw MediaError.readerFailed(message) }
+                failures.append(DecodeFailure(afterFrame: lastDelivered, resumedAt: last, message: message))
+                break readers
+            }
+            failures.append(DecodeFailure(afterFrame: lastDelivered, resumedAt: next, message: message))
+            resumeFrom = next
         }
         try Task.checkCancellation()
 
@@ -174,9 +211,32 @@ public final class CompositeRenderer: @unchecked Sendable {
             image: image,
             framesComposited: accumulator.count,
             missingFrames: missing,
+            decodeFailures: failures,
             deliveredInPresentationOrder: inOrder,
             elapsedSeconds: Date().timeIntervalSince(started)
         )
+    }
+
+    private func makeReader(
+        asset: AVAsset, track: AVAssetTrack, codec: String, from start: CMTime, to end: CMTime
+    ) throws -> (AVAssetReader, AVAssetReaderTrackOutput) {
+        let reader: AVAssetReader
+        do {
+            reader = try AVAssetReader(asset: asset)
+        } catch {
+            throw MediaError.readerFailed(error.localizedDescription)
+        }
+        reader.timeRange = CMTimeRange(start: start, end: end)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: Self.decodeSettings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else {
+            throw MediaError.cannotDecode(codec: codec, reason: "No decoder output is available for this track.")
+        }
+        reader.add(output)
+        guard reader.startReading() else {
+            throw MediaError.readerFailed(reader.error?.localizedDescription ?? "The reader could not start.")
+        }
+        return (reader, output)
     }
 
     private func orientedImage(_ pixelBuffer: CVPixelBuffer, orientation: CGImagePropertyOrientation) -> CIImage {

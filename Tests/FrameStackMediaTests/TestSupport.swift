@@ -17,6 +17,9 @@ enum Fixture: String {
     /// Stream-copied cut of `count`: stores frames 30…106, edit list
     /// presents frames 45…106 (62 frames) starting at t = 0.
     case trimmed = "trimmed_editlist"
+    /// The count clip with the NAL length of frame 75 (pts 2.5 s) overwritten
+    /// with 0xFFFFFFFF, so the decoder fails on that sample.
+    case corrupt = "corrupt_frame_75"
 
     var url: URL {
         guard let url = Bundle.module.url(forResource: rawValue, withExtension: "mp4", subdirectory: "Fixtures") else {

@@ -32,6 +32,20 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>LSApplicationCategoryType</key><string>public.app-category.photography</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
+    <!-- Lets Finder offer FrameStack under "Open With" for movies, and makes
+         `open -a FrameStack clip.mov` and Dock-icon drops work. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>Video</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.movie</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST

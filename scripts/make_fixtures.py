@@ -143,10 +143,43 @@ def trimmed_edit_list():
     print(f"wrote {dst} ({os.path.getsize(dst)} bytes)")
 
 
+def corrupt_frame():
+    """Copy of the count clip with frame 75 (pts 2.5 s) made undecodable.
+
+    The first four bytes of that sample — the AVC NAL length prefix — are
+    overwritten with 0xFFFFFFFF, which is what a damaged file looks like in
+    practice (ffmpeg: "Invalid NAL unit size"). AVFoundation's reader fails
+    at that sample; FrameStack must report the frame as missing, keep the
+    other 149, and not substitute another frame. Derived from the committed
+    count clip so it does not depend on the local encoder.
+    """
+    import json
+    src = os.path.join(OUT, "count_5s_30fps.mp4")
+    dst = os.path.join(OUT, "corrupt_frame_75.mp4")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "packet=pts_time,pos,size", "-of", "json", src],
+        check=True, capture_output=True, text=True)
+    packets = json.loads(probe.stdout)["packets"]
+    target = [k for k in packets if abs(float(k["pts_time"]) - 2.5) < 1e-6]
+    assert len(target) == 1, target
+    pos, size = int(target[0]["pos"]), int(target[0]["size"])
+    data = bytearray(open(src, "rb").read())
+    assert size > 8
+    data[pos:pos + 4] = b"\xff\xff\xff\xff"
+    open(dst, "wb").write(data)
+    print(f"wrote {dst} ({len(data)} bytes; sample at {pos} corrupted)")
+
+
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
+    only = sys.argv[1:]
+    if only == ["corrupt"]:
+        corrupt_frame()
+        sys.exit(0)
     count_clip()
     trimmed_edit_list()
     moving_square()
     black_white()
     portrait()
+    corrupt_frame()

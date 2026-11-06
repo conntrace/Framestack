@@ -160,6 +160,11 @@ private struct SecondsField: View {
         Binding(
             get: { time.seconds },
             set: { newValue in
+                // The field shows at most 6 decimals, so re-committing the
+                // displayed text of an exact time (e.g. 6242/600 shown as
+                // 10.403333) must not count as a change; otherwise pressing
+                // Return in an untouched field re-renders the same selection.
+                guard abs(newValue - time.seconds) >= 1e-6 else { return }
                 let candidate = FrameTime(seconds: max(0, newValue))
                 if candidate != time { time = candidate }
             }
@@ -274,14 +279,16 @@ private struct ExportSection: View {
             .disabled(!model.canExport)
 
             switch model.exportActivity {
-            case let .finished(report, missing):
+            case let .finished(report, missing, decodeFailure):
                 VStack(alignment: .leading, spacing: 4) {
                     Label("Saved \(report.width)×\(report.height), \(report.bitDepth)-bit, \(report.colorProfileName ?? "untagged")",
                           systemImage: "checkmark.circle")
                         .foregroundStyle(.green)
                     if missing > 0 {
-                        Label("\(missing) selected frames could not be decoded and were left out.", systemImage: "exclamationmark.triangle")
+                        Label("\(missing) selected frames could not be decoded and were left out" + (decodeFailure.map { " (\($0))" } ?? "") + ".",
+                              systemImage: "exclamationmark.triangle")
                             .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Button("Show in Finder") { model.revealExport() }
                         .controlSize(.small)

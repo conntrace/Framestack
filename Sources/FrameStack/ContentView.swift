@@ -73,6 +73,10 @@ private struct PreviewArea: View {
                 if model.scanned > 0 {
                     Text("\(model.scanned) frames found").monospacedDigit().foregroundStyle(.secondary)
                 }
+                Button("Cancel") { model.cancelLoading() }
+                    .keyboardShortcut(.cancelAction)
+                    .controlSize(.small)
+                    .padding(.top, 4)
             }
         case let .failed(message):
             VStack(spacing: 10) {
@@ -190,8 +194,11 @@ private struct BottomBar: View {
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                 if preview.missingFrames > 0 {
-                    Label("\(preview.missingFrames) selected frames could not be decoded", systemImage: "exclamationmark.triangle")
+                    Label("\(preview.missingFrames) selected frames could not be decoded" + (preview.decodeFailure.map { ": \($0)" } ?? ""),
+                          systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
+                        .lineLimit(1)
+                        .help("The composite uses the \(preview.framesComposited) frames that did decode; no frame was substituted.")
                 }
             }
         case .waiting:

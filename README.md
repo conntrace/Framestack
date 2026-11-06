@@ -6,7 +6,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 ## Status
 
-**M1 (first useful slice):** open a MOV/MP4 (drag & drop or ⌘O) → see metadata and the scanned frame count → pick a `[start, end)` range and **All / Every Nth / Exact Count** → live preview of the **Average** → export a **full-resolution 8- or 16-bit sRGB PNG**. Rendering runs off the main thread with progress and cancel.
+**M1 (first useful slice) — verified on the owner's Mac (macOS 27, Apple M4 Pro, Xcode 27):** open a MOV/MP4 (drag & drop, ⌘O, Finder "Open With", drop on the Dock icon, or `open -a FrameStack clip.mov`) → see metadata and the scanned frame count → pick a `[start, end)` range and **All / Every Nth / Exact Count** → live preview of the **Average** → export a **full-resolution 8- or 16-bit sRGB PNG**. Rendering runs off the main thread with progress and cancel. Damaged frames are skipped and reported (never replaced by a neighbour); iCloud files that are not downloaded are refused with a clear message.
 
 Not yet: other blend modes (M2), filmstrip scrubbing/zoom/compare (M3), project files and JPEG/TIFF (M4), image sequences and alignment (M5), weighting/masks/motion/color/batches (M6). See the plan.
 
@@ -40,6 +40,14 @@ swift test
 FRAMESTACK_ARTIFACTS_DIR=/tmp/framestack-renders swift test
 ```
 
+To run the engine on your own footage and get frame counts, timings, memory use and a color cross-check against Apple's decoder:
+
+```bash
+FRAMESTACK_REAL_CLIPS="/path/a.mov:/path/b.mp4" FRAMESTACK_ARTIFACTS_DIR=/tmp/framestack-renders swift test --filter RealClipTests
+```
+
+`FrameStackAppTests` drives the app's model through the manual checklist below, so the checklist is covered by `swift test` too.
+
 The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures` (regenerate with `python3 scripts/make_fixtures.py`, needs numpy + ffmpeg):
 
 | Fixture | What it proves |
@@ -49,8 +57,9 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 | `black_white_30f.mp4` — alternating black/white frames | Linear 0.5 → 188/255; every-2nd = only black frames |
 | `portrait_rot90cw.mp4` — 90° display matrix | Portrait clips render upright with correct dimensions |
 | `trimmed_editlist.mp4` — stream-copied cut with an MP4 edit list | Only frames inside the edit are counted/used (45…106); fast scan = decoder timestamps |
+| `corrupt_frame_75.mp4` — count clip with one damaged NAL unit | The decoder failure is skipped; the damaged GOP is reported missing, every other frame is composited and keeps its identity |
 
-## Manual verification (GUI — please run once on your Mac)
+## Manual verification (GUI — all 7 steps passed on the owner's Mac on 2026-11-06)
 
 1. Launch, drop any phone clip on the window. Inspector shows file name, pixels (and rotation for portrait clips), duration, nominal fps, codec, color tags; "Frames" first shows `≈ … (estimate)` then the scanned count.
 2. Preview appears within a moment; bottom bar shows `N frames in range → N selected` and the timeline strip shows ticks.

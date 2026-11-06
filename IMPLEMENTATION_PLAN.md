@@ -5,10 +5,11 @@ Living checklist (AGENTS.md §2). Status keys: `[x]` done and verified · `[~]` 
 
 ## Current status (update every session)
 
-- **Milestone:** M1 — core vertical slice. **Engine verified on macOS CI; GUI awaiting the owner's manual pass.**
-- **Last CI:** run 42248417651 on commit 8126110 — macOS 15.8.2, Xcode 16.4, Swift 6.1.2, Apple M1 (virtual): debug build OK, **56/56 tests passed**, release `.app` bundle built.
-- **Next task:** Owner runs the README "Manual verification" checklist on their Mac and reports issues → fix → mark M1 done. Then M2: generalize the reducer in `FrameStackCore/Compositing.swift` and add Lighten/Darken first (streaming, simplest), with 1×1 reference tests and fixture renders.
-- **Blockers / open questions for owner (non-blocking):** target Mac model + macOS + Xcode version (D-003); a few real clips (phone + camera; one portrait; one 10-bit/HDR) for photographic acceptance; whether to create a `main` branch so work can go through pull requests (the repo currently has only `claude/determined-planck-58a6hw`).
+- **Milestone:** **M1 done and verified on the owner's Mac** (macOS 27.0, Apple M4 Pro, Xcode 27.0, Swift 6.4 — D-003). M2 (blend modes) starts next.
+- **Last local run (2026-11-06):** `swift build` OK; `swift test` **67 tests, 0 failures, 1 skipped** (34 core, 25 media incl. the opt-in real-clip test, 8 app-model); release `.app` built; GUI checklist steps 1–7 all pass (owner confirmed 1–3 by eye; the agent drove 1–7 through accessibility scripting, see log). Four of the owner's own clips rendered and exported with 0 missing frames; colors match Apple's own decoder within 1/255.
+- **Last CI:** run 42248417651 on commit 8126110 (macOS 15.8.2, Xcode 16.4) — 56/56. The commits from this session have not been through CI yet at the time of writing.
+- **Next task:** M2 — generalize the reducer in `FrameStackCore/Compositing.swift` (`FrameReducer` protocol: `add(frame)`, `result()`), add Lighten/Darken (streaming per-channel max/min), then Screen/Multiply/Additive/Difference/Normal; blend picker + info text + opacity; 1×1 reference tests per mode and fixture renders (moving square, black/white).
+- **Blockers / open questions for owner (non-blocking):** whether to create a `main` branch so work can go through pull requests (the repo has only `claude/determined-planck-58a6hw`); a 10-bit/HDR clip and the 6.7 GB Sony `C0036.MP4` (iCloud placeholder, could not be downloaded in-session) for M4 stress/color work.
 
 ## Architecture (summary)
 
@@ -43,6 +44,10 @@ FRAMESTACK_ARTIFACTS_DIR=/tmp/fs-renders swift test   # also writes rendered PNG
 swift run -c release FrameStack   # launch the app
 scripts/make_app_bundle.sh && open .build/FrameStack.app
 python3 scripts/make_fixtures.py  # regenerate fixtures (needs numpy + ffmpeg with libx264)
+python3 scripts/make_fixtures.py corrupt   # only the corrupt-frame fixture (derived from the committed count clip)
+swift test --filter FrameStackAppTests     # the README checklist, driven through AppModel
+FRAMESTACK_REAL_CLIPS="/path/a.mov:/path/b.mp4" FRAMESTACK_ARTIFACTS_DIR=/tmp/fs swift test --filter RealClipTests  # owner's footage
+open -a .build/FrameStack.app /path/clip.mov   # open a clip without the panel
 ```
 CI: `.github/workflows/ci.yml` runs build, tests, release app bundle; uploads test output + rendered PNGs + zipped app.
 
@@ -70,13 +75,17 @@ Engine (verified by automated tests on macOS CI):
 - [x] PNG export 8/16-bit sRGB: full resolution, atomic write, bit depth + profile verified by read-back, pixel values match
 - [x] Portrait (90° display matrix) renders upright
 
-App UI (compiles; not exercisable in CI — owner manual pass):
-- [~] Open panel + drag & drop; inspector source info; estimate → scanned count
-- [~] Range fields (µs precision) + Full Clip; sampling controls; "N in range → K selected"; timeline strip with sample ticks
-- [~] Debounced (250 ms) cancellable preview, "Preview outdated" indicator, progress + Cancel, 1080/2160/Full quality
-- [~] Export panel, progress + Cancel, verified result summary, Show in Finder
-- [ ] Owner manual GUI pass (README checklist)
-- **Exit:** real 5 s/30 fps clip + synthetic tests incl. actual file export — **met on CI**; GUI pass by owner pending.
+- [x] Damaged files: decoder failures skipped, missing frames + reason reported, never substituted (D-013; `corrupt_frame_75.mp4` fixture + real damaged m4v)
+- [x] iCloud placeholders refused with a clear message; loading cancellable (D-016)
+
+App UI (verified on the owner's Mac — `AppModelTests` + accessibility-driven GUI pass, D-015):
+- [x] Open panel, drag & drop, Finder "Open With" / Dock drop / `open -a` / launch argument (D-014); inspector source info; estimate → scanned count
+- [x] Range fields (µs precision) + Full Clip; sampling controls; "N in range → K selected"; timeline strip with sample ticks
+- [x] Debounced (250 ms) cancellable preview, "Preview outdated" indicator, progress + Cancel (button, ⌘., Render menu), 1080/2160/Full quality
+- [x] Export panel, progress + Cancel, verified result summary, Show in Finder (button present; not clicked in the automated pass), missing-frame warning with reason
+- [x] GUI checklist steps 1–7 (owner confirmed 1–3 by eye; all 7 driven and read back via accessibility on 2026-11-06)
+- **Exit:** real 5 s/30 fps clip + synthetic tests incl. actual file export, GUI pass — **met on the owner's Mac**.
+- Known limitations carried forward: 8-bit decode (D-009); HDR clipped (D-004); scanner decode-fallback not damage-tolerant (D-013); bottom-bar warning truncates to one line (full text in the export report / tooltip).
 
 ## M2 — Essential creative blending (P1)
 - [ ] Generalize reducer protocol (`accumulate(frame)`, `finish()`), chronological-order guarantee (renderer already reports `deliveredInPresentationOrder`; enforce for order-dependent modes)
@@ -136,4 +145,10 @@ App UI (compiles; not exercisable in CI — owner manual pass):
 | 2026-11-06 | Linux container | `python3 scripts/make_fixtures.py` + ffmpeg decode check | 150/150 frame-index codes decode correctly; moving-square linear avg → 81.5/255 (gamma avg 21.2); black/white linear avg → 187.5/255; portrait display matrix (0,1,−1,0) |
 | 2026-11-06 | GitHub Actions macos-15, run 42247670128 (commit e26f890) | `swift build`, `swift test` | Build OK. 54 tests ran; 4 tests failed (166 assertion failures), all from one bug: sample-table timestamps were in media time, decoder timestamps in presentation time (edit list ignored) → timestamp k decoded frame k+2 on the B-frame clip. Fixed in the next commit (D-006). |
 | 2026-11-06 | GitHub Actions macos-15 (macOS 15.8.2, Xcode 16.4, Swift 6.1.2, Apple M1 virtual), run 42248417651 (commit 8126110) | `swift build`, `swift test`, `scripts/make_app_bundle.sh` | Build OK; **56 tests, 0 failures** (8.5 s); release app bundle built and Info.plist lints OK. Rendered PNGs uploaded as artifact `framestack-ci-2`. |
-| — | — | GUI | Not executed anywhere yet (no display in CI) — owner checklist in README. |
+| 2026-11-06 | Owner's Mac (macOS 27.0, Apple M4 Pro, 24 GB, Xcode 27.0, Swift 6.4) | `swift build` | Build complete, 8.5 s (debug), no errors. |
+| 2026-11-06 | Owner's Mac | `FRAMESTACK_ARTIFACTS_DIR=/tmp/framestack-renders swift test` | **56 tests, 0 failures** (FrameStackMediaTests 22 in 1.8 s; FrameStackCoreTests 34 in 0.14 s). Rendered PNGs inspected: `count_all150_average.png` shows the 8 bit-blocks at increasing brightness (bit 7 set in 22/150 frames → darkest, bit 0 in 75/150 → brightest) over uniform gray; `moving_square_all24_average.png` shows the 2-of-24 trail and the untouched gray bar; `portrait_upright.png` is 180×320 with the red marker top-right; `moving_square_preview_240.png` matches the full-res render at 240 px. |
+| 2026-11-06 | Owner's Mac | `scripts/make_app_bundle.sh && open .build/FrameStack.app` | Release build 8.5 s; ad-hoc signed bundle launched (process alive). GUI checklist in progress with the owner. |
+| 2026-11-06 | Owner's Mac | `FRAMESTACK_REAL_CLIPS=… FRAMESTACK_ARTIFACTS_DIR=/tmp/framestack-renders/real swift test --filter RealClipTests` (new opt-in test, debug build) | 4 local clips, **0 missing frames, 0 warnings**, all renders upright, 16-bit sRGB PNGs verified by read-back. Color cross-check of one frame vs `AVAssetImageGenerator`: mean \|Δ\| ≤ 0.03/255, max 1/255 on every clip. Per clip (scan method · frames · 1080 preview · full Average · export · process footprint peak above baseline): **IMG_9656.MOV** iPhone H.264 1920×1080 rotated 90° CW, 59.97 fps VFR (intervals 16.7–18.3 ms): sampleTable · 624 (= ffprobe) · 1.85 s · 2.66 s (235 fps) · 0.92 s · 315 MB. **fireworks-preview-4k.mov** HEVC 2160×3840 untagged color, 15 fps: sampleTable · 180 (container est. 181) · 1.49 s · 2.98 s (60 fps) · 3.50 s · 848 MB. **fireworks-preview-original.mov** HEVC 1080×1920 rotated 90° CCW, VFR 33–133 ms, edit list starts mid-frame → **decode fallback** (0.20 s) · 183 frames (ffmpeg with edit list: 182, without: 188, stored: 191 — FrameStack counts exactly what the AVFoundation decoder delivers) · 0.61 s · 0.80 s · 0.90 s · 174 MB. **file 960x540 …m4v** H.264 29.97 fps CFR: sampleTable · 309 (= ffprobe) · 0.38 s · 0.39 s (802 fps) · 0.23 s · 173 MB. iCloud-only (dataless) Desktop clips could not be downloaded (`brctl download` made no progress), so the Sony 6.7 GB C0036.MP4 stress case is still untested. |
+| 2026-11-06 | Owner's Mac, GUI (release bundle) | README checklist, steps 1–3 by the owner's eye; all 7 driven by the agent via `osascript`/System Events + `screencapture -l` (D-015) | **1** IMG_9656.MOV opened via `open -a`: inspector shows name, 1080×1920 (Rotated 90° clockwise), 10.403 s, 59.971 fps (nominal), 624 (scanned), avc1, 31.1 MB, color tags (the "≈ 624 (estimate)" label is visible only until the 0.02 s scan ends). **2** Preview 608×1080 in 3.00 s; bar "624 frames in range → 624 selected"; dense tick band. **3** Start=1 → 564 in range + "Preview outdated" + "Preview pending…" immediately; End=2 → 60; new preview 0.31 s; caption "· 1.000 s"; screenshots show the dimmed/badged old preview then the new one. **4** Every Nth default 2 → 30; N=3 → 20 (0.13 s); Exact Count 20 → 20; 5000 → orange notice "Requested 5000 frames but only 60 are in range; using all 60." **5** synthetic 3840×2160 30 fps 1200-frame clip (ffmpeg testsrc2): Rendering 157/1,200 → Cancel button → idle within 0.2 s; ⌘. and Render › Cancel Rendering likewise; new render accepted at once; RSS ≈ 200 MB, 0 % CPU after cancel. **6** Export PNG… → Save window (standalone panel, not a sheet) → 400-frame 4K export finished in 7 s, inspector "Saved 3,840×2,160, 16-bit, sRGB IEC61966-2.1", file verified with sips. **7** switched to Exact Count (clamped to all 1200) and exported again without re-import: 19 s, verified. **Bugs found and fixed in the same session:** iCloud placeholder hang (D-016); whole render aborting on a damaged frame (D-013); re-committing an untouched time field re-rendered the same selection. |
+| 2026-11-06 | Owner's Mac | `swift test` after fixes | **67 tests, 0 failures, 1 skipped** (RealClipTests skips without `FRAMESTACK_REAL_CLIPS`); `corrupt_frame_75.mp4`: 131 composited + 19 missing (frames 73–91), identity of frames 100/149 verified. Damaged real m4v in the GUI: "4911 selected frames could not be decoded: Cannot Decode after 3.003 s (+256 more); gave up after 257 decoder restarts — the file is badly damaged", 73-frame composite shown. |
+| 2026-11-06 | Owner's Mac | `swift test --filter FrameStackAppTests` | 8/8 pass in 3.2 s: import/metadata/preview, range edit → outdated preview, sampling modes + clamping notice, cancel preview then render again, cancel loading, missing file message, export → change settings → export again (16-bit then 8-bit, verified), corrupt file reports missing frames in preview and export. |

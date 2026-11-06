@@ -5,6 +5,8 @@ import FrameStackCore
 
 public enum MediaError: Error, LocalizedError, Equatable {
     case fileNotFound(path: String)
+    /// The file is an iCloud placeholder whose contents are not on this Mac.
+    case notDownloaded(path: String)
     case unreadable(path: String, reason: String)
     case noVideoTrack(path: String)
     case unsupportedTransform(String)
@@ -21,6 +23,8 @@ public enum MediaError: Error, LocalizedError, Equatable {
         switch self {
         case let .fileNotFound(path):
             return "The file “\((path as NSString).lastPathComponent)” could not be found."
+        case let .notDownloaded(path):
+            return "“\((path as NSString).lastPathComponent)” is stored in iCloud and has not been downloaded to this Mac. Download it in Finder first, then open it again."
         case let .unreadable(path, reason):
             return "“\((path as NSString).lastPathComponent)” is not a readable movie. \(reason)"
         case let .noVideoTrack(path):
@@ -122,6 +126,13 @@ public enum VideoSourceLoader {
         let path = url.path
         guard FileManager.default.fileExists(atPath: path) else {
             throw MediaError.fileNotFound(path: path)
+        }
+        // An iCloud placeholder (Desktop & Documents sync, iCloud Drive) looks
+        // like a normal file but AVFoundation would block on the download —
+        // possibly forever. Say so instead.
+        if let values = try? url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]),
+           let status = values.ubiquitousItemDownloadingStatus, status == .notDownloaded {
+            throw MediaError.notDownloaded(path: path)
         }
         let asset = makeAsset(url)
 

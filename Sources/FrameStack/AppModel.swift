@@ -36,6 +36,8 @@ struct PreviewSnapshot {
     let size: PixelSize
     let framesComposited: Int
     let missingFrames: Int
+    /// Why frames are missing (decoder failure), if any.
+    let decodeFailure: String?
     let elapsedSeconds: Double
 }
 
@@ -57,7 +59,7 @@ enum ExportActivity: Equatable {
     case idle
     case rendering(done: Int, total: Int)
     case writing
-    case finished(ExportReport, missingFrames: Int)
+    case finished(ExportReport, missingFrames: Int, decodeFailure: String?)
     case cancelled
     case failed(String)
 }
@@ -184,6 +186,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Abandons an import that is still reading metadata or scanning (for
+    /// example a file iCloud has not finished downloading).
+    func cancelLoading() {
+        guard case .loading = sourceState else { return }
+        loadTask?.cancel()
+        loadTask = nil
+        source = nil
+        scanned = 0
+        sourceState = .empty
+    }
+
     // MARK: Settings & preview
 
     func resetRange() {
@@ -250,6 +263,7 @@ final class AppModel: ObservableObject {
                     size: result.image.size,
                     framesComposited: result.framesComposited,
                     missingFrames: result.missingFrames.count,
+                    decodeFailure: result.decodeFailureSummary,
                     elapsedSeconds: result.elapsedSeconds
                 )
                 self.renderActivity = .idle
@@ -317,7 +331,9 @@ final class AppModel: ObservableObject {
                 let report = try await Task.detached(priority: .userInitiated) {
                     try ImageExporter.writePNG(composite.image, to: url, bitDepth: depth)
                 }.value
-                self?.exportActivity = .finished(report, missingFrames: composite.missingFrames.count)
+                self?.exportActivity = .finished(
+                    report, missingFrames: composite.missingFrames.count, decodeFailure: composite.decodeFailureSummary
+                )
             } catch is CancellationError {
                 self?.exportActivity = .cancelled
             } catch {
@@ -352,7 +368,7 @@ final class AppModel: ObservableObject {
     }
 
     func revealExport() {
-        if case let .finished(report, _) = exportActivity {
+        if case let .finished(report, _, _) = exportActivity {
             NSWorkspace.shared.activateFileViewerSelecting([report.url])
         }
     }
