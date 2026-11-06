@@ -210,6 +210,32 @@ final class AppModelTests: XCTestCase {
         try await waitUntil { model.isPreviewCurrent }
     }
 
+    // M2: blend mode and opacity drive re-renders and the export name.
+    func testBlendModeAndOpacityChanges() async throws {
+        let model = AppModel()
+        try await openAndWait(model, "black_white_30f")
+        let revision = model.settingsRevision
+
+        model.opacity = 0.5
+        XCTAssertEqual(model.settingsRevision, revision, "opacity is irrelevant to Average: no re-render")
+
+        model.blendMode = .normal
+        XCTAssertEqual(model.settingsRevision, revision + 1)
+        XCTAssertFalse(model.isPreviewCurrent)
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.suggestedExportName, "black_white_30f Normal 50% 30f.png")
+
+        model.opacity = 1
+        XCTAssertEqual(model.settingsRevision, revision + 2)
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.suggestedExportName, "black_white_30f Normal 30f.png")
+
+        model.blendMode = .lighten
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.suggestedExportName, "black_white_30f Lighten 30f.png")
+        XCTAssertEqual(model.preview?.framesComposited, 30)
+    }
+
     // A damaged file still produces a composite and says what is missing.
     func testCorruptFileReportsMissingFramesInPreviewAndExport() async throws {
         let model = AppModel()

@@ -241,13 +241,32 @@ private struct BlendSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionHeader(title: "Blend")
-            // Average is the only M1 mode; this becomes a picker when M2 adds
-            // Lighten/Darken/Screen/Multiply/Additive/Difference/Normal.
-            Text(model.blendMode.displayName).font(.headline)
+            Picker("Blend mode", selection: $model.blendMode) {
+                ForEach(BlendMode.allCases) { Text($0.displayName).tag($0) }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            if model.blendMode.usesOpacity {
+                HStack {
+                    Text("Opacity").font(.callout)
+                    Slider(value: $model.opacity, in: 0...1)
+                    Text("\(Int((model.opacity * 100).rounded())) %")
+                        .font(.callout)
+                        .monospacedDigit()
+                        .frame(width: 44, alignment: .trailing)
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Opacity")
+            }
             Text(model.blendMode.explanation)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if model.blendMode.isOrderDependent {
+                Label("Frames are combined oldest to newest.", systemImage: "arrow.right")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

@@ -8,7 +8,9 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M1 (first useful slice) — verified on the owner's Mac (macOS 27, Apple M4 Pro, Xcode 27):** open a MOV/MP4 (drag & drop, ⌘O, Finder "Open With", drop on the Dock icon, or `open -a FrameStack clip.mov`) → see metadata and the scanned frame count → pick a `[start, end)` range and **All / Every Nth / Exact Count** → live preview of the **Average** → export a **full-resolution 8- or 16-bit sRGB PNG**. Rendering runs off the main thread with progress and cancel. Damaged frames are skipped and reported (never replaced by a neighbour); iCloud files that are not downloaded are refused with a clear message.
 
-Not yet: other blend modes (M2), filmstrip scrubbing/zoom/compare (M3), project files and JPEG/TIFF (M4), image sequences and alignment (M5), weighting/masks/motion/color/batches (M6). See the plan.
+**M2 (creative blending):** a **Blend** menu with **Average, Lighten, Darken, Screen, Multiply, Additive, Difference, Normal (opacity stack)** and an opacity slider for the modes that use it; each mode's exact formula is shown under the menu. All modes share the linear-light pipeline, preview matches export, and every mode has fixed-value reference tests and fixture renders (`DECISIONS.md` D-017).
+
+Not yet: filmstrip scrubbing/zoom/compare (M3), project files and JPEG/TIFF (M4), image sequences and alignment (M5), weighting/masks/motion/color/batches/median (M6). See the plan.
 
 ## Requirements
 
@@ -76,8 +78,9 @@ Please report anything off — especially colors versus QuickTime Player, and an
 - Frames are identified by exact presentation timestamps (rational, like `CMTime`); ranges are start-inclusive/end-exclusive.
 - Each frame is converted by Core Image from its own color tags to **linear light** (extended sRGB primaries, 32-bit float), oriented upright, then added to **64-bit accumulators**. Average = sum ÷ count. Memory depends on output size, not frame count.
 - Export clamps to [0, 1], applies the sRGB curve once, rounds, and writes an sRGB-tagged PNG, then re-reads the file to verify it.
+- Other modes use the same frames: Lighten/Darken are per-channel max/min; Additive is the plain sum (× opacity, kept above 1 until export); Screen, Multiply, Difference and Normal run oldest-to-newest from the first selected frame with `C' = C + opacity × (blend(C, F) − C)`. Normal at 100 % is exactly the last selected frame.
 
-Details and trade-offs: `DECISIONS.md` D-004 to D-009.
+Details and trade-offs: `DECISIONS.md` D-004 to D-009 and D-013 to D-017.
 
 ## Layout
 

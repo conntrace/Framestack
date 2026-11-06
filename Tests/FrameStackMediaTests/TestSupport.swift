@@ -48,12 +48,15 @@ let sharedRenderer = CompositeRenderer(
 func render(
     _ fixture: LoadedFixture,
     indices: [Int],
+    mode: BlendMode = .average,
+    opacity: Float = 1,
     maxLongEdge: Int? = nil
 ) async throws -> CompositeResult {
     let request = CompositeRequest(
         source: fixture.info,
         frames: indices.map { fixture.timeline.frames[$0] },
-        blendMode: .average,
+        blendMode: mode,
+        opacity: opacity,
         maxLongEdge: maxLongEdge
     )
     return try await sharedRenderer.render(request)

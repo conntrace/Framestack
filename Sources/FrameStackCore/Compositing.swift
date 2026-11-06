@@ -3,21 +3,35 @@ import Foundation
 import Accelerate
 #endif
 
-/// How the selected frames are combined.
+/// How the selected frames are combined (PRD §5.2). Every mode works on
+/// FrameStack's working space — linear light, premultiplied Float32 RGBA
+/// (see `LinearImage`) — and the same reducer serves preview and export.
 ///
-/// M1 implements Average only. The remaining PRD §5.2 modes (Lighten,
-/// Darken, Screen, Multiply, Additive, Difference, Normal/Opacity, Median,
-/// luminance max/min, motion accumulation) are planned in
-/// IMPLEMENTATION_PLAN.md (M2, M6) and will be added here as reducers with
-/// their own reference tests.
+/// Order-dependent modes consume frames oldest to newest; the renderer
+/// delivers decoded frames in presentation order. See DECISIONS.md D-017
+/// for the exact formulas, the start frame, the opacity rule and alpha.
 public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
     case average
+    case lighten
+    case darken
+    case screen
+    case multiply
+    case additive
+    case difference
+    case normal
 
     public var id: String { rawValue }
 
     public var displayName: String {
         switch self {
         case .average: return "Average"
+        case .lighten: return "Lighten"
+        case .darken: return "Darken"
+        case .screen: return "Screen"
+        case .multiply: return "Multiply"
+        case .additive: return "Additive"
+        case .difference: return "Difference"
+        case .normal: return "Normal (opacity stack)"
         }
     }
 
@@ -29,6 +43,65 @@ public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
             return "Equal-weight mean: every selected frame contributes exactly 1/N. "
                 + "Computed per channel in linear light with 64-bit accumulators, "
                 + "like a long exposure. Not the same as stacking semi-transparent layers."
+        case .lighten:
+            return "Per-channel maximum across the selected frames: each channel keeps the "
+                + "brightest value it ever had, so light trails stay bright. The result can be "
+                + "a color no single frame contained. Order does not matter."
+        case .darken:
+            return "Per-channel minimum across the selected frames: each channel keeps the "
+                + "darkest value it ever had, so dark trails stay dark. The result can be a "
+                + "color no single frame contained. Order does not matter."
+        case .screen:
+            return "Sequential screen in linear light, oldest to newest, starting from the first "
+                + "selected frame: new = 1 − (1 − composite) × (1 − frame). Each frame can only "
+                + "brighten; many frames wash out toward white. Opacity scales each frame's effect."
+        case .multiply:
+            return "Sequential multiply in linear light, oldest to newest, starting from the first "
+                + "selected frame: new = composite × frame. Each frame can only darken; many frames "
+                + "approach black. Opacity scales each frame's effect."
+        case .additive:
+            return "Sum of all selected frames in linear light (each × opacity), like leaving the "
+                + "shutter open. Values above 1 are kept in float and clipped only on export, so "
+                + "highlights clip unless the scene is dark. Order does not matter."
+        case .difference:
+            return "Sequential absolute difference, oldest to newest, starting from the first "
+                + "selected frame: new = |composite − frame|. Order-dependent; not a variance "
+                + "or motion map. Opacity scales each frame's effect."
+        case .normal:
+            return "Chronological source-over: each frame is laid over the composite at the "
+                + "chosen opacity. At 100 % only the last selected frame is visible; lower "
+                + "opacity fades earlier frames away geometrically. Not an equal-weight average."
+        }
+    }
+
+    /// The result depends on the chronological order of the frames.
+    public var isOrderDependent: Bool {
+        switch self {
+        case .average, .lighten, .darken, .additive: return false
+        case .screen, .multiply, .difference, .normal: return true
+        }
+    }
+
+    /// The opacity parameter changes the result.
+    public var usesOpacity: Bool {
+        switch self {
+        case .average, .lighten, .darken: return false
+        case .screen, .multiply, .additive, .difference, .normal: return true
+        }
+    }
+
+    /// Creates the streaming reducer for this mode at the given output size.
+    /// `opacity` (0…1) is ignored by modes where `usesOpacity` is false.
+    public func makeReducer(width: Int, height: Int, opacity: Float = 1) -> FrameReducer {
+        switch self {
+        case .average: return AverageAccumulator(width: width, height: height)
+        case .lighten: return ExtremumReducer(width: width, height: height, kind: .maximum)
+        case .darken: return ExtremumReducer(width: width, height: height, kind: .minimum)
+        case .additive: return AdditiveReducer(width: width, height: height, opacity: opacity)
+        case .screen: return SequentialReducer(width: width, height: height, operation: .screen, opacity: opacity)
+        case .multiply: return SequentialReducer(width: width, height: height, operation: .multiply, opacity: opacity)
+        case .difference: return SequentialReducer(width: width, height: height, operation: .difference, opacity: opacity)
+        case .normal: return SequentialReducer(width: width, height: height, operation: .normal, opacity: opacity)
         }
     }
 }
@@ -47,7 +120,41 @@ public enum CompositingError: Error, Equatable, LocalizedError {
     }
 }
 
-/// Streaming, order-independent equal-weight mean.
+/// A streaming reduction of frames into one composite.
+///
+/// Frames are added one at a time (interleaved RGBA Float32 in the working
+/// space, `width × height × 4` samples) and discarded; the reducer holds
+/// only output-sized state, never a frame history. `result()` may be called
+/// at any point after the first frame and leaves the reducer usable.
+public protocol FrameReducer: AnyObject {
+    var width: Int { get }
+    var height: Int { get }
+    /// Frames added so far.
+    var count: Int { get }
+    /// Approximate bytes held, for diagnostics and memory tests.
+    var memoryFootprintBytes: Int { get }
+    func add(_ frame: UnsafeBufferPointer<Float>) throws
+    func result() throws -> LinearImage
+}
+
+public extension FrameReducer {
+    func add(_ image: LinearImage) throws {
+        try image.pixels.withUnsafeBufferPointer { try add($0) }
+    }
+
+    var sampleCount: Int { width * height * LinearImage.channelCount }
+
+    func checkDimensions(_ frame: UnsafeBufferPointer<Float>) throws {
+        guard frame.count == sampleCount else {
+            throw CompositingError.dimensionMismatch(expected: sampleCount, actual: frame.count)
+        }
+    }
+}
+
+// MARK: - Average / Additive (Float64 sums)
+
+/// Streaming, order-independent equal-weight mean (also the sum behind
+/// Additive).
 ///
 /// Memory is bounded by the output size, never by frame count: one 64-bit
 /// sum per channel (`width × height × 4 × 8` bytes) plus a small fixed
@@ -60,7 +167,7 @@ public enum CompositingError: Error, Equatable, LocalizedError {
 ///
 /// Alpha: channels are averaged as stored (premultiplied), which is the
 /// coverage-weighted mean of color. For opaque video A stays exactly 1.
-public final class AverageAccumulator {
+public final class AverageAccumulator: FrameReducer {
     public let width: Int
     public let height: Int
     public private(set) var count: Int = 0
@@ -81,9 +188,6 @@ public final class AverageAccumulator {
         #endif
     }
 
-    public var sampleCount: Int { sums.count }
-
-    /// Approximate bytes held by this accumulator.
     public var memoryFootprintBytes: Int {
         #if canImport(Accelerate)
         return (sums.count + scratch.count) * MemoryLayout<Double>.stride
@@ -92,15 +196,9 @@ public final class AverageAccumulator {
         #endif
     }
 
-    public func add(_ image: LinearImage) throws {
-        try image.pixels.withUnsafeBufferPointer { try add($0) }
-    }
-
     /// Adds one frame given as interleaved RGBA Float32 in the working space.
     public func add(_ frame: UnsafeBufferPointer<Float>) throws {
-        guard frame.count == sums.count else {
-            throw CompositingError.dimensionMismatch(expected: sums.count, actual: frame.count)
-        }
+        try checkDimensions(frame)
         guard let src = frame.baseAddress else { return }
         let total = frame.count
         sums.withUnsafeMutableBufferPointer { accBuffer in
@@ -128,8 +226,18 @@ public final class AverageAccumulator {
     /// The mean of all added frames. The accumulator stays usable.
     public func result() throws -> LinearImage {
         guard count > 0 else { throw CompositingError.noFrames }
+        return scaled(by: 1 / Double(count))
+    }
+
+    /// The sum of all added frames times `scale` (Additive).
+    public func sum(scaledBy scale: Double) throws -> LinearImage {
+        guard count > 0 else { throw CompositingError.noFrames }
+        return scaled(by: scale)
+    }
+
+    private func scaled(by scale: Double) -> LinearImage {
         var out = [Float](repeating: 0, count: sums.count)
-        var divisor = Double(count)
+        var factor = scale
         let total = sums.count
         sums.withUnsafeBufferPointer { accBuffer in
             out.withUnsafeMutableBufferPointer { outBuffer in
@@ -141,18 +249,174 @@ public final class AverageAccumulator {
                     var offset = 0
                     while offset < total {
                         let n = min(Self.chunkSize, total - offset)
-                        vDSP_vsdivD(acc + offset, 1, &divisor, tmp, 1, vDSP_Length(n))
+                        vDSP_vsmulD(acc + offset, 1, &factor, tmp, 1, vDSP_Length(n))
                         vDSP_vdpsp(tmp, 1, dst + offset, 1, vDSP_Length(n))
                         offset += n
                     }
                 }
                 #else
                 for i in 0..<total {
-                    dst[i] = Float(acc[i] / divisor)
+                    dst[i] = Float(acc[i] * factor)
                 }
                 #endif
             }
         }
         return LinearImage(width: width, height: height, pixels: out)
+    }
+}
+
+/// Additive: `Σ frame × opacity` in Float64. Values above 1 are preserved
+/// (clipped only when encoding for export). Alpha is summed too, so an
+/// opaque N-frame stack has alpha N × opacity; the exporter treats alpha
+/// ≥ 1 as opaque.
+public final class AdditiveReducer: FrameReducer {
+    private let sums: AverageAccumulator
+    public let opacity: Float
+
+    public init(width: Int, height: Int, opacity: Float) {
+        sums = AverageAccumulator(width: width, height: height)
+        self.opacity = opacity
+    }
+
+    public var width: Int { sums.width }
+    public var height: Int { sums.height }
+    public var count: Int { sums.count }
+    public var memoryFootprintBytes: Int { sums.memoryFootprintBytes }
+    public func add(_ frame: UnsafeBufferPointer<Float>) throws { try sums.add(frame) }
+    public func result() throws -> LinearImage { try sums.sum(scaledBy: Double(opacity)) }
+}
+
+// MARK: - Lighten / Darken (per-channel extremum)
+
+/// Per-channel running maximum (Lighten) or minimum (Darken), Float32,
+/// exact (no arithmetic, only comparisons). Alpha is reduced the same way;
+/// opaque sources stay opaque.
+public final class ExtremumReducer: FrameReducer {
+    public enum Kind: Sendable { case maximum, minimum }
+
+    public let width: Int
+    public let height: Int
+    public let kind: Kind
+    public private(set) var count: Int = 0
+    private var state: [Float]
+
+    public init(width: Int, height: Int, kind: Kind) {
+        precondition(width > 0 && height > 0)
+        self.width = width
+        self.height = height
+        self.kind = kind
+        state = [Float](repeating: 0, count: width * height * LinearImage.channelCount)
+    }
+
+    public var memoryFootprintBytes: Int { state.count * MemoryLayout<Float>.stride }
+
+    public func add(_ frame: UnsafeBufferPointer<Float>) throws {
+        try checkDimensions(frame)
+        guard let src = frame.baseAddress else { return }
+        let total = frame.count
+        let kind = self.kind
+        state.withUnsafeMutableBufferPointer { buffer in
+            let dst = buffer.baseAddress!
+            if count == 0 {
+                dst.update(from: src, count: total)
+                return
+            }
+            #if canImport(Accelerate)
+            // vDSP_vmax/vmin permit in-place operation (output may alias an input).
+            switch kind {
+            case .maximum: vDSP_vmax(dst, 1, src, 1, dst, 1, vDSP_Length(total))
+            case .minimum: vDSP_vmin(dst, 1, src, 1, dst, 1, vDSP_Length(total))
+            }
+            #else
+            switch kind {
+            case .maximum: for i in 0..<total { dst[i] = max(dst[i], src[i]) }
+            case .minimum: for i in 0..<total { dst[i] = min(dst[i], src[i]) }
+            }
+            #endif
+        }
+        count += 1
+    }
+
+    public func result() throws -> LinearImage {
+        guard count > 0 else { throw CompositingError.noFrames }
+        return LinearImage(width: width, height: height, pixels: state)
+    }
+}
+
+// MARK: - Sequential modes (Screen, Multiply, Difference, Normal)
+
+/// Order-dependent compositing, oldest frame first.
+///
+/// The first frame initialises the composite unchanged. Every later frame F
+/// updates each color channel of the composite C as
+///
+///     C' = C + opacity × (B(C, F) − C)
+///
+/// where B is the mode's blend function on linear-light premultiplied values:
+/// screen `C + F − C·F`, multiply `C·F`, difference `|C − F|`, normal `F`.
+/// With opacity 1 this is the plain blend; with opacity 0 nothing changes.
+/// Alpha always uses the normal rule (`A' = A + opacity × (F_A − A)`), so
+/// opaque input stays opaque. State is one Float32 RGBA image.
+public final class SequentialReducer: FrameReducer {
+    public enum Operation: Sendable { case screen, multiply, difference, normal }
+
+    public let width: Int
+    public let height: Int
+    public let operation: Operation
+    public let opacity: Float
+    public private(set) var count: Int = 0
+    private var state: [Float]
+
+    public init(width: Int, height: Int, operation: Operation, opacity: Float) {
+        precondition(width > 0 && height > 0)
+        precondition(opacity.isFinite)
+        self.width = width
+        self.height = height
+        self.operation = operation
+        self.opacity = min(max(opacity, 0), 1)
+        state = [Float](repeating: 0, count: width * height * LinearImage.channelCount)
+    }
+
+    public var memoryFootprintBytes: Int { state.count * MemoryLayout<Float>.stride }
+
+    public func add(_ frame: UnsafeBufferPointer<Float>) throws {
+        try checkDimensions(frame)
+        guard let src = frame.baseAddress else { return }
+        let total = frame.count
+        let a = opacity
+        let operation = self.operation
+        state.withUnsafeMutableBufferPointer { buffer in
+            let c = buffer.baseAddress!
+            if count == 0 {
+                c.update(from: src, count: total)
+                return
+            }
+            var i = 0
+            while i < total {
+                // RGB
+                for k in i..<(i + 3) {
+                    let cv = c[k]
+                    let fv = src[k]
+                    let blended: Float
+                    switch operation {
+                    case .screen: blended = cv + fv - cv * fv
+                    case .multiply: blended = cv * fv
+                    case .difference: blended = abs(cv - fv)
+                    case .normal: blended = fv
+                    }
+                    c[k] = cv + a * (blended - cv)
+                }
+                // Alpha: source-over coverage.
+                let ca = c[i + 3]
+                c[i + 3] = ca + a * (src[i + 3] - ca)
+                i += LinearImage.channelCount
+            }
+        }
+        count += 1
+    }
+
+    public func result() throws -> LinearImage {
+        guard count > 0 else { throw CompositingError.noFrames }
+        return LinearImage(width: width, height: height, pixels: state)
     }
 }

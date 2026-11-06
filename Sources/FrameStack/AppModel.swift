@@ -83,6 +83,10 @@ final class AppModel: ObservableObject {
     @Published var nth: Int = 2 { didSet { settingsChanged() } }
     @Published var exactCount: Int = 20 { didSet { settingsChanged() } }
     @Published var blendMode: BlendMode = .average { didSet { settingsChanged() } }
+    /// 0…1; only modes with `usesOpacity` re-render when it changes.
+    @Published var opacity: Double = 1 {
+        didSet { if blendMode.usesOpacity, opacity != oldValue { settingsChanged() } }
+    }
     @Published var previewQuality: PreviewQuality = .draft { didSet { settingsChanged() } }
     @Published var exportBitDepth: ExportBitDepth = .sixteen
 
@@ -237,6 +241,7 @@ final class AppModel: ObservableObject {
             source: source,
             frames: result.selectedTimes(in: timeline),
             blendMode: blendMode,
+            opacity: Float(opacity),
             maxLongEdge: previewQuality.maxLongEdge
         )
         let revision = settingsRevision
@@ -292,7 +297,9 @@ final class AppModel: ObservableObject {
         guard let source else { return "FrameStack.png" }
         let base = (source.fileName as NSString).deletingPathExtension
         let count = (try? selection?.get().selectedCount) ?? 0
-        return "\(base) \(blendMode.displayName) \(count)f.png"
+        let mode = blendMode == .normal ? "Normal" : blendMode.displayName
+        let opacityPart = blendMode.usesOpacity && opacity < 1 ? " \(Int((opacity * 100).rounded()))%" : ""
+        return "\(base) \(mode)\(opacityPart) \(count)f.png"
     }
 
     func presentExportPanel() {
@@ -313,6 +320,7 @@ final class AppModel: ObservableObject {
             source: source,
             frames: result.selectedTimes(in: timeline),
             blendMode: blendMode,
+            opacity: Float(opacity),
             maxLongEdge: nil
         )
         let depth = exportBitDepth

@@ -10,13 +10,16 @@ public struct CompositeRequest: Sendable {
     /// Presentation timestamps of the selected frames, ascending.
     public var frames: [FrameTime]
     public var blendMode: BlendMode
+    /// 0…1; used only by modes where `blendMode.usesOpacity` is true.
+    public var opacity: Float
     /// `nil` renders at native (display-oriented) resolution.
     public var maxLongEdge: Int?
 
-    public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, maxLongEdge: Int?) {
+    public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?) {
         self.source = source
         self.frames = frames
         self.blendMode = blendMode
+        self.opacity = opacity
         self.maxLongEdge = maxLongEdge
     }
 }
@@ -125,7 +128,7 @@ public final class CompositeRenderer: @unchecked Sendable {
         let orientation = CGImagePropertyOrientation(rawValue: UInt32(request.source.orientation.rawValue)) ?? .up
 
         var seen = Set<FrameTime>()
-        var accumulator: AverageAccumulator?
+        var reducer: FrameReducer?
         var frameBuffer: [Float] = []
         var sourceSize: PixelSize?
         var outputSize = PixelSize(width: 0, height: 0)
@@ -163,12 +166,14 @@ public final class CompositeRenderer: @unchecked Sendable {
                     } else {
                         sourceSize = size
                         outputSize = size.fitting(maxLongEdge: request.maxLongEdge)
-                        accumulator = AverageAccumulator(width: outputSize.width, height: outputSize.height)
+                        reducer = request.blendMode.makeReducer(
+                            width: outputSize.width, height: outputSize.height, opacity: request.opacity
+                        )
                         frameBuffer = [Float](repeating: 0, count: outputSize.pixelCount * LinearImage.channelCount)
                     }
 
                     renderFrame(image, sourceSize: size, outputSize: outputSize, into: &frameBuffer)
-                    try frameBuffer.withUnsafeBufferPointer { try accumulator!.add($0) }
+                    try frameBuffer.withUnsafeBufferPointer { try reducer!.add($0) }
 
                     seen.insert(pts)
                     if let previous, !(previous < pts) { inOrder = false }
@@ -189,7 +194,7 @@ public final class CompositeRenderer: @unchecked Sendable {
             let anchor = lastDelivered ?? resumeFrom
             guard failures.count < Self.maxDecoderRestarts,
                   let next = request.frames.first(where: { $0 > anchor && !seen.contains($0) }) else {
-                if accumulator == nil { throw MediaError.readerFailed(message) }
+                if reducer == nil { throw MediaError.readerFailed(message) }
                 failures.append(DecodeFailure(afterFrame: lastDelivered, resumedAt: last, message: message))
                 break readers
             }
@@ -198,18 +203,14 @@ public final class CompositeRenderer: @unchecked Sendable {
         }
         try Task.checkCancellation()
 
-        guard let accumulator, accumulator.count > 0 else {
+        guard let reducer, reducer.count > 0 else {
             throw MediaError.noFramesDecoded
         }
-        let image: LinearImage
-        switch request.blendMode {
-        case .average:
-            image = try accumulator.result()
-        }
+        let image = try reducer.result()
         let missing = request.frames.filter { !seen.contains($0) }
         return CompositeResult(
             image: image,
-            framesComposited: accumulator.count,
+            framesComposited: reducer.count,
             missingFrames: missing,
             decodeFailures: failures,
             deliveredInPresentationOrder: inOrder,
