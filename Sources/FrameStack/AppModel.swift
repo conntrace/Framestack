@@ -5,13 +5,6 @@ import FrameStackCore
 import FrameStackMedia
 import UniformTypeIdentifiers
 
-enum SamplingKind: String, CaseIterable, Identifiable {
-    case all = "All"
-    case everyNth = "Every Nth"
-    case exactCount = "Exact Count"
-    var id: String { rawValue }
-}
-
 enum PreviewQuality: String, CaseIterable, Identifiable {
     case draft = "1080 px"
     case high = "2160 px"
@@ -46,6 +39,35 @@ enum SourceState {
     case loading(fileName: String, step: String)
     case ready
     case failed(String)
+    /// A project's media must be located or confirmed before it is used.
+    case relink(RelinkRequest)
+}
+
+/// A project whose media could not be found, or was found changed. Nothing
+/// is loaded until the user locates the file or explicitly accepts the
+/// candidate (PRD §9.1: never silently use different media).
+struct RelinkRequest {
+    let project: ProjectFile
+    let projectURL: URL
+    /// A file at a remembered location whose fingerprint does not match.
+    let candidate: URL?
+    let differences: [String]
+
+    var savedFileName: String { project.source.identity.fileName }
+
+    var message: String {
+        if let candidate {
+            let what = differences.isEmpty ? "" : " (\(differences.joined(separator: ", ")))"
+            return "“\(candidate.lastPathComponent)” is not the video this project was saved with\(what). Using it would change the result."
+        }
+        return "The video “\(savedFileName)” could not be found at \(project.source.absolutePath)."
+    }
+}
+
+enum ProjectActivity: Equatable {
+    case idle
+    case saved(URL, Date)
+    case failed(String)
 }
 
 enum RenderActivity: Equatable {
@@ -62,18 +84,6 @@ enum ExportActivity: Equatable {
     case finished(ExportReport, missingFrames: Int, decodeFailure: String?)
     case cancelled
     case failed(String)
-}
-
-/// Every user-editable, non-destructive compositing setting — one value
-/// that undo/redo and (later) project files can snapshot.
-struct CompositeSettings: Equatable {
-    var rangeStart: FrameTime
-    var rangeEnd: FrameTime
-    var samplingKind: SamplingKind
-    var nth: Int
-    var exactCount: Int
-    var blendMode: BlendMode
-    var opacity: Double
 }
 
 /// All UI state. Settings are plain values (non-destructive); every change
@@ -104,7 +114,29 @@ final class AppModel: ObservableObject {
     /// Not part of `CompositeSettings`, so changing it re-renders (new
     /// revision) without an undo step.
     @Published var previewQuality: PreviewQuality = .draft { didSet { settingsChanged() } }
-    @Published var exportBitDepth: ExportBitDepth = .sixteen
+    /// Format, depth, size and color space of exports. Saved in projects;
+    /// not undoable.
+    @Published var exportSettings = ExportSettings()
+
+    var exportBitDepth: ExportBitDepth {
+        get { exportSettings.bitDepth }
+        set { exportSettings.bitDepth = newValue }
+    }
+
+    // Project document
+    @Published private(set) var projectURL: URL?
+    /// The document as last read or written; the basis for "unsaved changes".
+    @Published private(set) var savedProject: ProjectFile?
+    @Published private(set) var projectActivity: ProjectActivity = .idle
+    /// Something about the media differs from what the project recorded
+    /// (frame count, duration, or the user relinked to a changed file).
+    @Published private(set) var sourceNotice: String?
+    /// Fingerprint of the open media, computed once at load.
+    private(set) var sourceIdentity: SourceIdentity?
+    /// Settings right after the clip (or project) finished loading.
+    private var settingsAtOpen: CompositeSettings?
+    private var exportSettingsAtOpen = ExportSettings()
+    private var sourceRelinked = false
 
     // Playhead and viewing (not compositing settings; not undoable)
     /// Index into `timeline.frames` of the frame under the playhead.
@@ -225,20 +257,198 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    /// Pixel size the next export will have.
+    var exportOutputSize: PixelSize? {
+        source.map { exportSettings.sizing.outputSize(for: $0.displaySize) }
+    }
+
+    var canSaveProject: Bool {
+        if case .ready = sourceState, source != nil, timeline != nil { return true }
+        return false
+    }
+
+    /// True when quitting would lose work: settings or export choices differ
+    /// from the saved project, or — for a clip that was never saved — from
+    /// the state right after opening it.
+    var hasUnsavedChanges: Bool {
+        guard canSaveProject else { return false }
+        if let savedProject {
+            return settings != savedProject.settings || exportSettings != savedProject.export || sourceRelinked
+        }
+        return settings != settingsAtOpen || exportSettings != exportSettingsAtOpen
+    }
+
+    var projectName: String? {
+        projectURL?.deletingPathExtension().lastPathComponent
+    }
+
+    var windowTitle: String {
+        projectName ?? source?.fileName ?? sourceStateFileName ?? "FrameStack"
+    }
+
+    var windowSubtitle: String {
+        var parts: [String] = []
+        if projectName != nil, let source { parts.append(source.fileName) }
+        if hasUnsavedChanges { parts.append("Edited") }
+        return parts.joined(separator: " — ")
+    }
+
+    private var sourceStateFileName: String? {
+        if case let .loading(name, _) = sourceState { return name }
+        return nil
+    }
+
     // MARK: Opening
+
+    static let projectType: UTType =
+        UTType(ProjectFile.typeIdentifier) ?? UTType(exportedAs: ProjectFile.typeIdentifier, conformingTo: .json)
+
+    static func isProject(_ url: URL) -> Bool {
+        url.pathExtension.lowercased() == ProjectFile.fileExtension
+    }
 
     func presentOpenPanel() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.movie]
+        panel.allowedContentTypes = [.movie, Self.projectType]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.message = "Choose a video to stack"
+        panel.message = "Choose a video to stack, or a FrameStack project"
         if panel.runModal() == .OK, let url = panel.url {
             open(url)
         }
     }
 
+    /// Opens a video or a `.framestack` project.
     func open(_ url: URL) {
+        if Self.isProject(url) {
+            openProject(url)
+        } else {
+            load(video: url, project: nil, projectURL: nil)
+        }
+    }
+
+    // MARK: Projects
+
+    func openProject(_ url: URL) {
+        let project: ProjectFile
+        do {
+            project = try ProjectFile.read(from: url)
+        } catch {
+            reset()
+            sourceState = .failed(error.localizedDescription)
+            return
+        }
+        switch SourceLocator.resolve(project.source, projectURL: url) {
+        case let .found(media):
+            load(video: media, project: project, projectURL: url)
+        case let .changed(media, differences):
+            reset()
+            sourceState = .relink(RelinkRequest(project: project, projectURL: url, candidate: media, differences: differences))
+        case .missing:
+            reset()
+            sourceState = .relink(RelinkRequest(project: project, projectURL: url, candidate: nil, differences: []))
+        }
+    }
+
+    /// Relink panel: pick the media a project refers to.
+    func presentRelinkPanel() {
+        guard case let .relink(request) = sourceState else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.movie]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = "Locate “\(request.savedFileName)” for this project"
+        panel.directoryURL = URL(fileURLWithPath: request.project.source.absolutePath).deletingLastPathComponent()
+        if panel.runModal() == .OK, let url = panel.url {
+            relink(to: url)
+        }
+    }
+
+    /// Uses `url` as the project's media if its fingerprint matches; otherwise
+    /// asks again, now naming the chosen file as the candidate.
+    func relink(to url: URL) {
+        guard case let .relink(request) = sourceState else { return }
+        switch SourceLocator.check(url, against: request.project.source.identity) {
+        case let .found(media):
+            load(video: media, project: request.project, projectURL: request.projectURL)
+        case let .changed(media, differences):
+            sourceState = .relink(RelinkRequest(project: request.project, projectURL: request.projectURL,
+                                                candidate: media, differences: differences))
+        case .missing:
+            sourceState = .relink(RelinkRequest(project: request.project, projectURL: request.projectURL,
+                                                candidate: nil, differences: []))
+        }
+    }
+
+    /// The user's explicit decision to use a file that differs from the saved
+    /// media. The project is marked edited and the notice stays visible.
+    func useRelinkCandidateAnyway() {
+        guard case let .relink(request) = sourceState, let candidate = request.candidate else { return }
+        load(video: candidate, project: request.project, projectURL: request.projectURL, relinkedToChangedMedia: true)
+    }
+
+    func cancelRelink() {
+        guard case .relink = sourceState else { return }
+        sourceState = .empty
+    }
+
+    /// The document as it would be written now.
+    func currentProject(for projectURL: URL?) -> ProjectFile? {
+        guard let source, let timeline, let sourceIdentity else { return nil }
+        let reference = SourceReference.make(
+            url: source.url, identity: sourceIdentity, duration: source.duration, displaySize: source.displaySize,
+            frameCount: timeline.count, projectURL: projectURL
+        )
+        return ProjectFile(
+            source: reference, settings: settings, export: exportSettings,
+            ui: ProjectFile.UIState(previewQuality: previewQuality.rawValue, viewMode: viewMode.rawValue, scrubIndex: scrubIndex),
+            writer: "FrameStack \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")"
+        )
+    }
+
+    /// Save (⌘S): writes to the current project file or asks where to save.
+    /// Returns false if nothing was written (cancelled panel or error).
+    @discardableResult
+    func saveProject() -> Bool {
+        guard canSaveProject else { return false }
+        if let projectURL { return save(to: projectURL) }
+        return saveProjectAs()
+    }
+
+    @discardableResult
+    func saveProjectAs() -> Bool {
+        guard canSaveProject else { return false }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [Self.projectType]
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.nameFieldStringValue = (projectName ?? (source?.fileName as NSString?)?.deletingPathExtension ?? "Untitled") + ".\(ProjectFile.fileExtension)"
+        panel.message = "Save the project (settings and a reference to the video — the video is not copied)"
+        guard panel.runModal() == .OK, var url = panel.url else { return false }
+        if url.pathExtension.lowercased() != ProjectFile.fileExtension {
+            url.appendPathExtension(ProjectFile.fileExtension)
+        }
+        return save(to: url)
+    }
+
+    @discardableResult
+    func save(to url: URL) -> Bool {
+        guard let project = currentProject(for: url) else { return false }
+        do {
+            try project.write(to: url)
+        } catch {
+            projectActivity = .failed(error.localizedDescription)
+            return false
+        }
+        projectURL = url
+        savedProject = project
+        sourceRelinked = false
+        projectActivity = .saved(url, Date())
+        noteRecent(url)
+        return true
+    }
+
+    private func reset() {
         loadTask?.cancel()
         thumbnailTask?.cancel()
         sourceFrameTask?.cancel()
@@ -257,8 +467,25 @@ final class AppModel: ObservableObject {
         zoom = .fit
         renderActivity = .idle
         exportActivity = .idle
+        projectActivity = .idle
+        sourceNotice = nil
+        sourceIdentity = nil
+        // Export choices follow the user from clip to clip, but a project's
+        // choices do not leak into an unrelated video opened afterwards.
+        if projectURL != nil { exportSettings = ExportSettings() }
+        projectURL = nil
+        savedProject = nil
+        settingsAtOpen = nil
+        sourceRelinked = false
         undoManager?.removeAllActions(withTarget: self)
         lastSettings = nil
+        sourceState = .empty
+    }
+
+    /// Loads a video; when `project` is given, its settings are applied once
+    /// the clip is scanned and the document becomes the window's project.
+    private func load(video url: URL, project: ProjectFile?, projectURL: URL?, relinkedToChangedMedia: Bool = false) {
+        reset()
         sourceState = .loading(fileName: url.lastPathComponent, step: "Reading metadata…")
 
         loadTask = Task { [weak self] in
@@ -267,21 +494,36 @@ final class AppModel: ObservableObject {
                 guard let self, !Task.isCancelled else { return }
                 self.source = info
                 self.sourceState = .loading(fileName: info.fileName, step: "Scanning frame timestamps…")
+                async let identityTask = Task.detached(priority: .utility) { try SourceIdentity.compute(for: url) }.value
                 let scan = try await FrameScanner.scan(info) { [weak self] count in
                     self?.reportScanProgress(count)
                 }
+                let identity = try await identityTask
                 guard !Task.isCancelled else { return }
                 self.timeline = scan.timeline
                 self.scanResult = scan
                 self.scanned = scan.timeline.count
+                self.sourceIdentity = identity
                 self.suppressChanges = true
                 self.rangeStart = .zero
                 self.rangeEnd = info.duration
+                if let project {
+                    self.apply(project: project, to: info, timeline: scan.timeline, relinkedToChangedMedia: relinkedToChangedMedia)
+                }
                 self.suppressChanges = false
                 self.sourceState = .ready
                 self.lastSettings = self.settings
+                self.settingsAtOpen = self.settings
+                self.exportSettingsAtOpen = self.exportSettings
                 self.settingsChanged(debounce: false)
-                self.noteRecent(url)
+                if let project, let projectURL {
+                    self.projectURL = projectURL
+                    self.savedProject = project
+                    self.sourceRelinked = relinkedToChangedMedia || project.source.absolutePath != url.standardizedFileURL.path
+                    self.noteRecent(projectURL)
+                } else {
+                    self.noteRecent(url)
+                }
                 self.loadThumbnails(for: info, timeline: scan.timeline)
             } catch is CancellationError {
                 return
@@ -291,6 +533,40 @@ final class AppModel: ObservableObject {
                 self.sourceState = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// Applies a project's settings to a freshly scanned clip. Values that
+    /// no longer fit (a range past the end of a shorter clip) are clamped and
+    /// reported in `sourceNotice`; nothing is silently dropped.
+    private func apply(project: ProjectFile, to info: VideoSourceInfo, timeline: FrameTimeline, relinkedToChangedMedia: Bool) {
+        var notices: [String] = []
+        if relinkedToChangedMedia {
+            notices.append("Relinked to “\(info.fileName)”, which differs from the video the project was saved with.")
+        }
+        if timeline.count != project.source.frameCount || info.duration != project.source.duration {
+            notices.append("The video now has \(timeline.count) frames over \(Format.seconds(info.duration.seconds)); the project was saved with \(project.source.frameCount) frames over \(Format.seconds(project.source.duration.seconds)).")
+        }
+        if info.displaySize != project.source.displaySize {
+            notices.append("The video is \(info.displaySize); the project was saved with \(project.source.displaySize).")
+        }
+        var s = project.settings
+        if s.rangeEnd > info.duration || s.rangeStart >= info.duration || !(s.rangeStart < s.rangeEnd) {
+            notices.append("The saved time range \(Format.seconds(s.rangeStart.seconds)) – \(Format.seconds(s.rangeEnd.seconds)) does not fit this video; it was clamped.")
+            s.rangeEnd = min(s.rangeEnd, info.duration)
+            if !(s.rangeStart < s.rangeEnd) { s.rangeStart = .zero }
+        }
+        rangeStart = s.rangeStart
+        rangeEnd = s.rangeEnd
+        samplingKind = s.samplingKind
+        nth = max(1, s.nth)
+        exactCount = max(1, s.exactCount)
+        blendMode = s.blendMode
+        opacity = min(max(s.opacity, 0), 1)
+        exportSettings = project.export
+        if let quality = project.ui.previewQuality.flatMap(PreviewQuality.init(rawValue:)) { previewQuality = quality }
+        if let mode = project.ui.viewMode.flatMap(PreviewViewMode.init(rawValue:)) { viewMode = mode }
+        if let index = project.ui.scrubIndex { scrubIndex = min(max(index, 0), timeline.count - 1) }
+        sourceNotice = notices.isEmpty ? nil : notices.joined(separator: " ")
     }
 
     /// Abandons an import that is still reading metadata or scanning (for
@@ -578,21 +854,28 @@ final class AppModel: ObservableObject {
     // MARK: Export
 
     var suggestedExportName: String {
-        guard let source else { return "FrameStack.png" }
-        let base = (source.fileName as NSString).deletingPathExtension
+        let ext = exportSettings.format.fileExtension
+        guard let source else { return "FrameStack.\(ext)" }
+        let base = projectName ?? (source.fileName as NSString).deletingPathExtension
         let count = (try? selection?.get().selectedCount) ?? 0
         let mode = blendMode == .normal ? "Normal" : blendMode.displayName
         let opacityPart = blendMode.usesOpacity && opacity < 1 ? " \(Int((opacity * 100).rounded()))%" : ""
-        return "\(base) \(mode)\(opacityPart) \(count)f.png"
+        let sizePart = exportSettings.sizing == .native ? "" : " \(exportOutputSize?.longEdge ?? 0)px"
+        return "\(base) \(mode)\(opacityPart) \(count)f\(sizePart).\(ext)"
     }
 
     func presentExportPanel() {
         guard canExport else { return }
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.png]
+        switch exportSettings.format {
+        case .png: panel.allowedContentTypes = [.png]
+        case .jpeg: panel.allowedContentTypes = [.jpeg]
+        case .tiff: panel.allowedContentTypes = [.tiff]
+        }
         panel.canCreateDirectories = true
         panel.nameFieldStringValue = suggestedExportName
-        panel.message = "Export the composite at full resolution (\(source?.displaySize.description ?? ""))"
+        let size = exportOutputSize?.description ?? ""
+        panel.message = "Export the composite as \(exportSettings.effectiveBitDepth.displayName) \(exportSettings.format.displayName), \(size), \(exportSettings.colorSpace.displayName)"
         if panel.runModal() == .OK, let url = panel.url {
             export(to: url)
         }
@@ -605,9 +888,9 @@ final class AppModel: ObservableObject {
             frames: result.selectedTimes(in: timeline),
             blendMode: blendMode,
             opacity: Float(opacity),
-            maxLongEdge: nil
+            maxLongEdge: exportSettings.sizing.maxLongEdge(for: source.displaySize)
         )
-        let depth = exportBitDepth
+        let settings = exportSettings
         let renderer = renderer
         // Keep resource use bounded: one full-resolution render at a time.
         previewTask?.cancel()
@@ -621,7 +904,7 @@ final class AppModel: ObservableObject {
                 try Task.checkCancellation()
                 self?.exportActivity = .writing
                 let report = try await Task.detached(priority: .userInitiated) {
-                    try ImageExporter.writePNG(composite.image, to: url, bitDepth: depth)
+                    try ImageExporter.write(composite.image, to: url, settings: settings)
                 }.value
                 self?.exportActivity = .finished(
                     report, missingFrames: composite.missingFrames.count, decodeFailure: composite.decodeFailureSummary

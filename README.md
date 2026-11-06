@@ -12,10 +12,13 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M3 (artist workflow):** a filmstrip with draggable in/out handles and a playhead; frame-accurate First/Last frame fields; **Original / Composite / Side by Side** views of the exact source frame under the playhead; zoom to fit, 100 %, zoom in/out, pinch and pan; undo/redo of every setting; collapsible inspector sections; File › Open Recent.
 
+**M4 (robust output and state):** **`.framestack` projects** (⌘S / ⇧⌘S) — one JSON file holding a reference to the video (bookmark + path + size/fingerprint), the time range, sampling, blend, export settings and the playhead; reopening rescans the clip and restores everything. A moved or renamed video is found again; a missing or changed video stops at a **relink** screen (Locate… / Use This File Anyway / Cancel) and is never swapped in silently. **Export** as PNG (8/16-bit), JPEG (quality) or TIFF (8/16-bit), at native size, a long-edge cap or a percentage, in sRGB or Display P3 — every file is read back and its size, depth and profile verified. 10-bit (HEVC Main10 / HDR) clips are decoded to half-float so their precision reaches the composite.
+
 | Keys | |
 |---|---|
-| ⌘O · Open Recent | open a clip |
-| ⌘E | export PNG |
+| ⌘O · Open Recent | open a clip or a `.framestack` project |
+| ⌘S · ⇧⌘S | save the project · save as |
+| ⌘E | export an image (format, size and color space in the Export section) |
 | ⌘Z / ⇧⌘Z | undo / redo settings |
 | ⌥← ⌥→ (⌥⇧ ×10) | step the playhead; with the timeline focused, plain ← → ⇧ Home End also work |
 | ⌥I / ⌥O | set in / out point at the playhead (I / O when the timeline is focused) |
@@ -24,7 +27,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: project files and JPEG/TIFF (M4), image sequences and alignment (M5), weighting/masks/motion/color/batches/median (M6). See the plan.
+Not yet: image sequences and alignment (M5), weighting/masks/motion/color/batches/median (M6), HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -64,7 +67,7 @@ FRAMESTACK_REAL_CLIPS="/path/a.mov:/path/b.mp4" FRAMESTACK_ARTIFACTS_DIR=/tmp/fr
 
 `FrameStackAppTests` drives the app's model through the manual checklist below, so the checklist is covered by `swift test` too.
 
-The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures` (regenerate with `python3 scripts/make_fixtures.py`, needs numpy + ffmpeg):
+The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures` (regenerate with `python3 scripts/make_fixtures.py`, needs numpy + ffmpeg with libx264 and libx265):
 
 | Fixture | What it proves |
 |---|---|
@@ -74,6 +77,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 | `portrait_rot90cw.mp4` — 90° display matrix | Portrait clips render upright with correct dimensions |
 | `trimmed_editlist.mp4` — stream-copied cut with an MP4 edit list | Only frames inside the edit are counted/used (45…106); fast scan = decoder timestamps |
 | `corrupt_frame_75.mp4` — count clip with one damaged NAL unit | The decoder failure is skipped; the damaged GOP is reported missing, every other frame is composited and keeps its identity |
+| `tenbit_ramp_10f.mp4` — HEVC Main10 (lossless), a 10-bit luma ramp | 10-bit sources are identified and decoded to half-float: 320 distinct ramp values survive (8-bit decode: 205) and a 16-bit PNG keeps them |
 
 ## Manual verification (GUI — all 7 steps passed on the owner's Mac on 2026-11-06)
 
@@ -86,6 +90,9 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 7. Change settings and export again without re-importing.
 8. (M3) Drag the right handle of the filmstrip to the middle; "Last frame" and the count follow, the film outside dims. Click the strip to place the playhead, press → a few times, then I: "First frame" jumps to the playhead. ⌘Z twice restores the range; ⇧⌘Z redoes.
 9. (M3) Switch the toolbar to **Original**, then **Side by Side**; ⌘1 shows 100 %, ⌘= zooms in, scroll pans, ⌘0 fits. Collapse the Source section; it stays collapsed after a relaunch. File › Open Recent lists the clips you opened.
+10. (M4) Change a few settings, ⇧⌘S, save `demo.framestack` next to the clip. The title becomes "demo – clip.mov"; the Project section says Saved. Change the blend: the subtitle shows "Edited"; ⌘Q asks Save / Don't Save / Cancel. Quit with Save, double-click the project in Finder (or ⌘O it): the same settings, selection and preview come back.
+11. (M4) Rename the clip in Finder and open the project: it opens anyway (Project shows "Unsaved changes" for the new location). Move the clip to another disk or delete it and open the project: "Video not found" with Locate…; pick the clip. Put a *different* video under the old name: "Video has changed" lists size/fingerprint differences; Use This File Anyway loads it with an orange notice describing what differs.
+12. (M4) In Export choose JPEG + Percent 50 and export; the inspector reports "Saved 540×960, 8-bit JPEG, sRGB IEC61966-2.1" and Finder agrees. Choose TIFF 16-bit + Display P3; the report says Display P3 and the image looks the same as the sRGB one in Preview (color-managed).
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 
@@ -93,17 +100,17 @@ Please report anything off — especially colors versus QuickTime Player, and an
 
 - Frames are identified by exact presentation timestamps (rational, like `CMTime`); ranges are start-inclusive/end-exclusive.
 - Each frame is converted by Core Image from its own color tags to **linear light** (extended sRGB primaries, 32-bit float), oriented upright, then added to **64-bit accumulators**. Average = sum ÷ count. Memory depends on output size, not frame count.
-- Export clamps to [0, 1], applies the sRGB curve once, rounds, and writes an sRGB-tagged PNG, then re-reads the file to verify it.
+- Export clamps to [0, 1], applies the sRGB curve once, rounds, and writes an sRGB-tagged file (PNG/JPEG/TIFF), then re-reads the file to verify it. Display P3 output first converts the linear values with the sRGB→P3 primaries matrix. Downscaled exports resample each frame with Lanczos in linear light before accumulation — the same path the preview uses.
 - Other modes use the same frames: Lighten/Darken are per-channel max/min; Additive is the plain sum (× opacity, kept above 1 until export); Screen, Multiply, Difference and Normal run oldest-to-newest from the first selected frame with `C' = C + opacity × (blend(C, F) − C)`. Normal at 100 % is exactly the last selected frame.
 
-Details and trade-offs: `DECISIONS.md` D-004 to D-009 and D-013 to D-017.
+Details and trade-offs: `DECISIONS.md` D-004 to D-009 and D-013 to D-021.
 
 ## Layout
 
 ```
 Package.swift
 Sources/FrameStackCore/    time model, sampler, accumulator, color math, orientation (pure Swift)
-Sources/FrameStackMedia/   AVFoundation scan/decode, Core Image conversion, PNG export
+Sources/FrameStackMedia/   AVFoundation scan/decode, Core Image conversion, image export, project file
 Sources/FrameStack/        SwiftUI app
 Tests/FrameStackCoreTests/ unit tests
 Tests/FrameStackMediaTests/ end-to-end tests + fixtures

@@ -50,10 +50,11 @@ struct ContentView: View {
                     Label("Export…", systemImage: "square.and.arrow.up")
                 }
                 .disabled(!model.canExport)
-                .help("Export the composite as a full-resolution PNG (⌘E)")
+                .help("Export the composite as an image (⌘E)")
             }
         }
-        .navigationTitle(model.source?.fileName ?? "FrameStack")
+        .navigationTitle(model.windowTitle)
+        .navigationSubtitle(model.windowSubtitle)
         .onAppear { model.undoManager = undoManager }
         .onChange(of: undoManager) { _, new in model.undoManager = new }
     }
@@ -103,6 +104,8 @@ private struct PreviewArea: View {
                 Button("Open Another Video…") { model.presentOpenPanel() }
             }
             .padding()
+        case let .relink(request):
+            RelinkView(request: request)
         case .ready:
             switch model.viewMode {
             case .composite:
@@ -167,6 +170,40 @@ private struct PreviewArea: View {
         } else {
             ProgressView("Decoding frame…").frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+}
+
+/// Shown when a project's media is missing or is not the saved file. The
+/// user must locate the media, explicitly accept a changed file, or cancel.
+private struct RelinkView: View {
+    @EnvironmentObject private var model: AppModel
+    let request: RelinkRequest
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: request.candidate == nil ? "questionmark.folder" : "exclamationmark.triangle")
+                .font(.system(size: 40, weight: .light))
+                .foregroundStyle(.orange)
+            Text(request.candidate == nil ? "Video not found" : "Video has changed").font(.title2)
+            Text("Project “\(request.projectURL.deletingPathExtension().lastPathComponent)” was saved with “\(request.savedFileName)” (\(request.project.source.frameCount) frames, \(request.project.source.displaySize)).")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Text(request.message)
+                .multilineTextAlignment(.center)
+                .textSelection(.enabled)
+            HStack {
+                Button("Cancel") { model.cancelRelink() }
+                    .keyboardShortcut(.cancelAction)
+                if request.candidate != nil {
+                    Button("Use This File Anyway") { model.useRelinkCandidateAnyway() }
+                }
+                Button("Locate…") { model.presentRelinkPanel() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: 480)
+        .padding()
     }
 }
 
@@ -236,7 +273,7 @@ private struct BottomBar: View {
             Button("Cancel") { model.cancelRendering() }
         case .writing:
             ProgressView().controlSize(.small)
-            Text("Writing PNG…")
+            Text("Writing \(model.exportSettings.format.displayName)…")
         default:
             previewActivity
         }

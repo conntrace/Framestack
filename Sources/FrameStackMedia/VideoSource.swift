@@ -82,8 +82,15 @@ public struct VideoSourceInfo: Sendable, Equatable {
     public let isHDR: Bool
     /// Non-square pixel aspect ratio (h-spacing / v-spacing) if signalled.
     public let pixelAspectRatio: Double?
+    /// Bits per component of the encoded video (8 for most clips, 10 for
+    /// HEVC Main10 / HDR); nil when the container does not say.
+    public let bitsPerComponent: Int?
 
     public var fileName: String { url.lastPathComponent }
+
+    /// Sources with more than 8 bits are decoded to half-float RGBA so the
+    /// extra precision reaches the compositor (DECISIONS.md D-009/D-020).
+    public var wantsHighPrecisionDecode: Bool { (bitsPerComponent ?? 8) > 8 || isHDR }
 
     /// `duration × nominal fps`, clearly an estimate (PRD §4.1). Shown only
     /// until the timestamp scan has produced the actual count.
@@ -106,7 +113,7 @@ public struct VideoSourceInfo: Sendable, Equatable {
     public var warnings: [String] {
         var w: [String] = []
         if isHDR {
-            w.append("HDR video: M1 composites in SDR (extended linear sRGB) and clips highlights above SDR white on export.")
+            w.append("HDR video: frames are decoded at full precision and composited in linear light relative to SDR white; highlights above white are clipped on export (no tone mapping yet).")
         }
         if let par = pixelAspectRatio, abs(par - 1) > 0.001 {
             w.append(String(format: "Non-square pixels (%.3f:1) are not corrected yet; output keeps the encoded pixel grid.", par))
@@ -173,6 +180,7 @@ public enum VideoSourceLoader {
         var transfer: String?
         var matrix: String?
         var par: Double?
+        var bits: Int?
         if let format = formats.first {
             codec = fourCCString(CMFormatDescriptionGetMediaSubType(format))
             let ext = (CMFormatDescriptionGetExtensions(format) as? [String: Any]) ?? [:]
@@ -185,6 +193,7 @@ public enum VideoSourceLoader {
                v > 0 {
                 par = h / v
             }
+            bits = (ext[kCMFormatDescriptionExtension_BitsPerComponent as String] as? NSNumber)?.intValue
         }
 
         let trackEnd = CMTimeRangeGetEnd(timeRange)
@@ -207,24 +216,23 @@ public enum VideoSourceLoader {
             transferFunction: transfer,
             yCbCrMatrix: matrix,
             isHDR: characteristics.contains(.containsHDRVideo),
-            pixelAspectRatio: par
+            pixelAspectRatio: par,
+            bitsPerComponent: bits
         )
 
-        try probeDecode(asset: asset, track: track, codec: codec)
+        try probeDecode(asset: asset, track: track, codec: codec, highPrecision: info.wantsHighPrecisionDecode)
         return info
     }
 
     /// Decodes the first frame; throws `.cannotDecode` if that is impossible.
-    static func probeDecode(asset: AVAsset, track: AVAssetTrack, codec: String) throws {
+    static func probeDecode(asset: AVAsset, track: AVAssetTrack, codec: String, highPrecision: Bool) throws {
         let reader: AVAssetReader
         do {
             reader = try AVAssetReader(asset: asset)
         } catch {
             throw MediaError.cannotDecode(codec: codec, reason: error.localizedDescription)
         }
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: CompositeRenderer.decodeSettings)
-        output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else {
+        guard let output = CompositeRenderer.makeOutput(track: track, highPrecision: highPrecision, reader: reader) else {
             throw MediaError.cannotDecode(codec: codec, reason: "No decoder output is available for this track.")
         }
         reader.add(output)

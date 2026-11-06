@@ -18,11 +18,12 @@ struct FrameStackApp: App {
                     model.open(url)
                     appDelegate.requestedURL = nil
                 }
+                .onAppear { appDelegate.model = model }
         }
         .defaultSize(width: 1320, height: 840)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("Open Video…") { model.presentOpenPanel() }
+                Button("Open…") { model.presentOpenPanel() }
                     .keyboardShortcut("o")
                 Menu("Open Recent") {
                     ForEach(model.recentFiles, id: \.path) { url in
@@ -36,8 +37,15 @@ struct FrameStackApp: App {
                 }
                 .disabled(model.recentFiles.isEmpty)
             }
-            CommandGroup(after: .saveItem) {
-                Button("Export PNG…") { model.presentExportPanel() }
+            CommandGroup(replacing: .saveItem) {
+                Button("Save Project") { model.saveProject() }
+                    .keyboardShortcut("s")
+                    .disabled(!model.canSaveProject)
+                Button("Save Project As…") { model.saveProjectAs() }
+                    .keyboardShortcut("s", modifiers: [.command, .shift])
+                    .disabled(!model.canSaveProject)
+                Divider()
+                Button("Export Image…") { model.presentExportPanel() }
                     .keyboardShortcut("e")
                     .disabled(!model.canExport)
             }
@@ -101,6 +109,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     /// A file the system or the command line asked us to open; consumed by
     /// the main window.
     @Published var requestedURL: URL?
+    /// The window's model, for the quit-with-unsaved-changes prompt.
+    weak var model: AppModel?
 
     /// Size of the preview area, reported by the view so menu zoom steps can
     /// start from the current "fit" scale.
@@ -125,5 +135,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Standard Save / Don't Save / Cancel prompt when quitting with unsaved
+    /// project changes.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model, model.hasUnsavedChanges else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "Save changes to “\(model.windowTitle)” before quitting?"
+        alert.informativeText = model.projectURL == nil
+            ? "The time range, sampling, blend and export settings will be lost unless you save them as a project."
+            : "Your changes will be lost if you don't save them."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Don't Save")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return model.saveProject() ? .terminateNow : .terminateCancel
+        case .alertThirdButtonReturn:
+            return .terminateNow
+        default:
+            return .terminateCancel
+        }
     }
 }

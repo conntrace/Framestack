@@ -9,6 +9,9 @@ struct InspectorView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 if let source = model.source {
+                    if model.timeline != nil {
+                        InspectorSection(title: "Project", key: "project") { ProjectSection() }
+                    }
                     InspectorSection(title: "Source", key: "source") { SourceSection(source: source) }
                     if model.timeline != nil {
                         InspectorSection(title: "Time Range", key: "range") { TimeRangeSection(source: source) }
@@ -67,6 +70,49 @@ private struct InfoRow: View {
     }
 }
 
+// MARK: Project
+
+private struct ProjectSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let url = model.projectURL {
+                Text(url.deletingPathExtension().lastPathComponent).font(.headline).lineLimit(2).help(url.path)
+                InfoRow(label: "Status", value: model.hasUnsavedChanges ? "Unsaved changes" : "Saved")
+            } else {
+                Text("Not saved as a project").font(.callout).foregroundStyle(.secondary)
+                Text("A project stores the settings and a reference to the video, not a copy of it.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Button("Save") { model.saveProject() }
+                    .disabled(!model.canSaveProject || (model.projectURL != nil && !model.hasUnsavedChanges))
+                Button("Save As…") { model.saveProjectAs() }
+                    .disabled(!model.canSaveProject)
+            }
+            .controlSize(.small)
+            if let notice = model.sourceNotice {
+                Label(notice, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            switch model.projectActivity {
+            case let .saved(url, date):
+                Label("Saved \(url.lastPathComponent) at \(date.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+            case let .failed(message):
+                Label(message, systemImage: "xmark.octagon").font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .idle:
+                EmptyView()
+            }
+        }
+    }
+}
+
 // MARK: Source
 
 private struct SourceSection: View {
@@ -80,7 +126,7 @@ private struct SourceSection: View {
             InfoRow(label: "Duration", value: Format.duration(source.duration.seconds))
             InfoRow(label: "Frame rate", value: Format.fps(source.nominalFrameRate))
             InfoRow(label: "Frames", value: framesDescription)
-            InfoRow(label: "Codec", value: source.codec)
+            InfoRow(label: "Codec", value: source.bitsPerComponent.map { "\(source.codec) · \($0)-bit" } ?? source.codec)
             InfoRow(label: "File size", value: Format.bytes(source.fileSizeBytes))
             Text(source.colorDescription)
                 .font(.caption)
@@ -240,7 +286,7 @@ private struct SamplingSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Picker("Sampling", selection: $model.samplingKind) {
-                ForEach(SamplingKind.allCases) { Text($0.rawValue).tag($0) }
+                ForEach(SamplingKind.allCases) { Text($0.displayName).tag($0) }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -339,19 +385,40 @@ private struct ExportSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Picker("Depth", selection: $model.exportBitDepth) {
-                ForEach(ExportBitDepth.allCases) { Text("\($0.displayName) PNG").tag($0) }
+            Picker("Format", selection: $model.exportSettings.format) {
+                ForEach(ExportFormat.allCases) { Text($0.displayName).tag($0) }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            Text("Full resolution (\(model.source?.displaySize.description ?? "")), sRGB. 16-bit avoids banding in smooth averages.")
+            Picker("Depth", selection: $model.exportSettings.bitDepth) {
+                ForEach(ExportBitDepth.allCases) { Text($0.displayName).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(!model.exportSettings.format.supportsSixteenBit)
+            .help(model.exportSettings.format.supportsSixteenBit ? "16-bit avoids banding in smooth averages." : "JPEG is always 8-bit.")
+            if model.exportSettings.format == .jpeg {
+                HStack {
+                    Text("Quality")
+                    Slider(value: $model.exportSettings.jpegQuality, in: 0.5...1)
+                    Text("\(Int((model.exportSettings.jpegQuality * 100).rounded())) %").monospacedDigit().frame(width: 44, alignment: .trailing)
+                }
+                .font(.callout)
+            }
+            SizingControl()
+            Picker("Color", selection: $model.exportSettings.colorSpace) {
+                ForEach(OutputColorSpace.allCases) { Text($0.displayName).tag($0) }
+            }
+            .pickerStyle(.menu)
+            .help("Display P3 keeps saturated colors the sRGB gamut would clip; sRGB is the safe default for sharing.")
+            Text(summary)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button {
                 model.presentExportPanel()
             } label: {
-                Label("Export PNG…", systemImage: "square.and.arrow.up")
+                Label("Export \(model.exportSettings.format.displayName)…", systemImage: "square.and.arrow.up")
                     .frame(maxWidth: .infinity)
             }
             .controlSize(.large)
@@ -360,7 +427,7 @@ private struct ExportSection: View {
             switch model.exportActivity {
             case let .finished(report, missing, decodeFailure):
                 VStack(alignment: .leading, spacing: 4) {
-                    Label("Saved \(report.width)×\(report.height), \(report.bitDepth)-bit, \(report.colorProfileName ?? "untagged")",
+                    Label("Saved \(report.width)×\(report.height), \(report.bitDepth)-bit \(report.format?.displayName ?? ""), \(report.colorProfileName ?? "untagged")",
                           systemImage: "checkmark.circle")
                         .foregroundStyle(.green)
                     if missing > 0 {
@@ -381,5 +448,81 @@ private struct ExportSection: View {
                 EmptyView()
             }
         }
+    }
+
+    private var summary: String {
+        let s = model.exportSettings
+        let size = model.exportOutputSize?.description ?? ""
+        let native = model.source?.displaySize
+        let sizeText = s.sizing == .native ? "Full resolution \(size)" : "\(size) (downscaled from \(native?.description ?? ""), Lanczos in linear light)"
+        return "\(sizeText), \(s.effectiveBitDepth.displayName) \(s.format.displayName), \(s.colorSpace.displayName)."
+    }
+}
+
+/// Native / long-edge / percent output size with a number field.
+private struct SizingControl: View {
+    @EnvironmentObject private var model: AppModel
+
+    private enum Kind: String, CaseIterable, Identifiable {
+        case native = "Native size"
+        case longEdge = "Long edge"
+        case percent = "Percent"
+        var id: String { rawValue }
+    }
+
+    var body: some View {
+        HStack {
+            Picker("Size", selection: kind) {
+                ForEach(Kind.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            switch model.exportSettings.sizing {
+            case .native:
+                EmptyView()
+            case .longEdge:
+                TextField("Pixels", value: longEdge, format: .number)
+                    .textFieldStyle(.roundedBorder).monospacedDigit().frame(width: 72).labelsHidden()
+                Text("px").font(.callout).foregroundStyle(.secondary)
+            case .percent:
+                TextField("Percent", value: percent, format: .number)
+                    .textFieldStyle(.roundedBorder).monospacedDigit().frame(width: 56).labelsHidden()
+                Text("%").font(.callout).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var kind: Binding<Kind> {
+        Binding(
+            get: {
+                switch model.exportSettings.sizing {
+                case .native: return .native
+                case .longEdge: return .longEdge
+                case .percent: return .percent
+                }
+            },
+            set: { new in
+                let native = model.source?.displaySize.longEdge ?? 1920
+                switch new {
+                case .native: model.exportSettings.sizing = .native
+                case .longEdge: model.exportSettings.sizing = .longEdge(min(native, 2048))
+                case .percent: model.exportSettings.sizing = .percent(50)
+                }
+            }
+        )
+    }
+
+    private var longEdge: Binding<Int> {
+        Binding(
+            get: { if case let .longEdge(v) = model.exportSettings.sizing { return v } else { return 0 } },
+            set: { model.exportSettings.sizing = .longEdge(max(1, $0)) }
+        )
+    }
+
+    private var percent: Binding<Int> {
+        Binding(
+            get: { if case let .percent(v) = model.exportSettings.sizing { return v } else { return 100 } },
+            set: { model.exportSettings.sizing = .percent(min(max($0, 1), 100)) }
+        )
     }
 }

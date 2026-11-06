@@ -20,6 +20,9 @@ enum Fixture: String {
     /// The count clip with the NAL length of frame 75 (pts 2.5 s) overwritten
     /// with 0xFFFFFFFF, so the decoder fails on that sample.
     case corrupt = "corrupt_frame_75"
+    /// 10 frames, 320×180, HEVC Main10 (lossless): a horizontal luma ramp
+    /// from 10-bit code 64 to 940, one code step every ~0.37 px.
+    case tenBit = "tenbit_ramp_10f"
 
     var url: URL {
         guard let url = Bundle.module.url(forResource: rawValue, withExtension: "mp4", subdirectory: "Fixtures") else {

@@ -89,9 +89,32 @@ public struct CompositeResult: Sendable {
 /// loop terminates; it is additionally capped at `maxDecoderRestarts`.
 public final class CompositeRenderer: @unchecked Sendable {
     public static let maxDecoderRestarts = 256
+    /// 8-bit sources: 32BGRA (one quantisation by the decoder, D-009).
     static let decodeSettings: [String: Any] = [
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
     ]
+
+    /// 10-bit / HDR sources: half-float RGBA keeps the extra precision and
+    /// values above SDR white (D-020).
+    static let highPrecisionDecodeSettings: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf
+    ]
+
+    /// Tests can force the 8-bit path to prove the difference.
+    nonisolated(unsafe) static var forceEightBitDecode = false
+
+    /// A track output in the best pixel format the reader accepts: half-float
+    /// for >8-bit sources when available, else 32BGRA. `nil` if neither works.
+    static func makeOutput(track: AVAssetTrack, highPrecision: Bool, reader: AVAssetReader) -> AVAssetReaderTrackOutput? {
+        var candidates = [decodeSettings]
+        if highPrecision, !forceEightBitDecode { candidates.insert(highPrecisionDecodeSettings, at: 0) }
+        for settings in candidates {
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+            output.alwaysCopiesSampleData = false
+            if reader.canAdd(output) { return output }
+        }
+        return nil
+    }
 
     public static let workingColorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
 
@@ -138,7 +161,7 @@ public final class CompositeRenderer: @unchecked Sendable {
         var resumeFrom = first
 
         readers: while true {
-            let (reader, output) = try makeReader(asset: asset, track: track, codec: request.source.codec,
+            let (reader, output) = try makeReader(asset: asset, track: track, codec: request.source.codec, highPrecision: request.source.wantsHighPrecisionDecode,
                                                   from: resumeFrom.cmTime, to: end)
             defer {
                 if reader.status == .reading { reader.cancelReading() }
@@ -219,7 +242,7 @@ public final class CompositeRenderer: @unchecked Sendable {
     }
 
     private func makeReader(
-        asset: AVAsset, track: AVAssetTrack, codec: String, from start: CMTime, to end: CMTime
+        asset: AVAsset, track: AVAssetTrack, codec: String, highPrecision: Bool, from start: CMTime, to end: CMTime
     ) throws -> (AVAssetReader, AVAssetReaderTrackOutput) {
         let reader: AVAssetReader
         do {
@@ -228,9 +251,7 @@ public final class CompositeRenderer: @unchecked Sendable {
             throw MediaError.readerFailed(error.localizedDescription)
         }
         reader.timeRange = CMTimeRange(start: start, end: end)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: Self.decodeSettings)
-        output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else {
+        guard let output = Self.makeOutput(track: track, highPrecision: highPrecision, reader: reader) else {
             throw MediaError.cannotDecode(codec: codec, reason: "No decoder output is available for this track.")
         }
         reader.add(output)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the deterministic video fixtures used by FrameStackMediaTests.
 
-Requires: python3, numpy, ffmpeg (with libx264).
+Requires: python3, numpy, ffmpeg (with libx264 and libx265).
 
     python3 scripts/make_fixtures.py
 
@@ -54,6 +54,42 @@ def encode(name, frames, fps, extra_input=None, extra_output=None):
     if proc.wait() != 0:
         sys.exit(f"ffmpeg failed for {name}")
     print(f"wrote {path} ({os.path.getsize(path)} bytes)")
+
+
+def encode_10bit(name, y_planes, fps, lossless=True):
+    """Pipe 10-bit 4:2:0 (yuv420p10le) gray frames into ffmpeg and write an
+    HEVC Main10 MP4 (libx265, Apple-compatible hvc1 tag)."""
+    h, w = y_planes[0].shape
+    path = os.path.join(OUT, name)
+    chroma = np.full((h // 2, w // 2), 512, dtype=np.uint16)
+    params = "lossless=1" if lossless else "qp=4"
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-s", f"{w}x{h}",
+           "-r", str(fps), "-i", "-",
+           "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-profile:v", "main10",
+           "-x265-params", params + ":log-level=error", "-tag:v", "hvc1"]
+    cmd += BT709_TAGS + ["-movflags", "+faststart", "-an", path]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    for y in y_planes:
+        proc.stdin.write(np.ascontiguousarray(y, dtype=np.uint16).tobytes())
+        proc.stdin.write(chroma.tobytes())
+        proc.stdin.write(chroma.tobytes())
+    proc.stdin.close()
+    if proc.wait() != 0:
+        sys.exit(f"ffmpeg failed for {name}")
+    print(f"wrote {path} ({os.path.getsize(path)} bytes)")
+
+
+def ten_bit_ramp():
+    """10 frames, 320x180, HEVC Main10: a horizontal luma ramp from code 64
+    (black) to 940 (white) in 10-bit limited range — 876 steps over 320
+    columns, i.e. every column has its own code. An 8-bit decode can only
+    show 219 distinct values, so the number of distinct column values proves
+    which decode path was used (D-009 revisit in M4)."""
+    w, h = 320, 180
+    codes = np.round(64 + (940 - 64) * np.arange(w) / (w - 1)).astype(np.uint16)
+    y = np.tile(codes, (h, 1))
+    encode_10bit("tenbit_ramp_10f.mp4", [y] * 10, 30)
 
 
 def count_clip():
@@ -177,9 +213,13 @@ if __name__ == "__main__":
     if only == ["corrupt"]:
         corrupt_frame()
         sys.exit(0)
+    if only == ["tenbit"]:
+        ten_bit_ramp()
+        sys.exit(0)
     count_clip()
     trimmed_edit_list()
     moving_square()
     black_white()
     portrait()
     corrupt_frame()
+    ten_bit_ramp()
