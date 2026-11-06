@@ -140,6 +140,32 @@ final class AppModel: ObservableObject {
         didSet { if undoManager !== oldValue { lastSettings = settings } }
     }
 
+    // Recent files (most recent first), persisted.
+    @Published private(set) var recentFiles: [URL] = []
+    static let recentFilesLimit = 10
+    private let defaults: UserDefaults
+    private static let recentFilesKey = "recentFiles"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        recentFiles = (defaults.stringArray(forKey: Self.recentFilesKey) ?? []).map { URL(fileURLWithPath: $0) }
+    }
+
+    private func noteRecent(_ url: URL) {
+        var list = recentFiles.filter { $0.path != url.path }
+        list.insert(url, at: 0)
+        if list.count > Self.recentFilesLimit { list.removeLast(list.count - Self.recentFilesLimit) }
+        recentFiles = list
+        defaults.set(list.map(\.path), forKey: Self.recentFilesKey)
+        NSDocumentController.shared.noteNewRecentDocumentURL(url)
+    }
+
+    func clearRecentFiles() {
+        recentFiles = []
+        defaults.removeObject(forKey: Self.recentFilesKey)
+        NSDocumentController.shared.clearRecentDocuments(nil)
+    }
+
     private let renderer = CompositeRenderer()
     private var loadTask: Task<Void, Never>?
     private var thumbnailTask: Task<Void, Never>?
@@ -255,6 +281,7 @@ final class AppModel: ObservableObject {
                 self.sourceState = .ready
                 self.lastSettings = self.settings
                 self.settingsChanged(debounce: false)
+                self.noteRecent(url)
                 self.loadThumbnails(for: info, timeline: scan.timeline)
             } catch is CancellationError {
                 return

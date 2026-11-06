@@ -7,14 +7,14 @@ struct InspectorView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 14) {
                 if let source = model.source {
-                    SourceSection(source: source)
+                    InspectorSection(title: "Source", key: "source") { SourceSection(source: source) }
                     if model.timeline != nil {
-                        TimeRangeSection(source: source)
-                        SamplingSection()
-                        BlendSection()
-                        ExportSection()
+                        InspectorSection(title: "Time Range", key: "range") { TimeRangeSection(source: source) }
+                        InspectorSection(title: "Sampling", key: "sampling") { SamplingSection() }
+                        InspectorSection(title: "Blend", key: "blend") { BlendSection() }
+                        InspectorSection(title: "Export", key: "export") { ExportSection() }
                     }
                 } else {
                     Text("Open or drop a video to begin.")
@@ -28,12 +28,29 @@ struct InspectorView: View {
     }
 }
 
-private struct SectionHeader: View {
+/// A collapsible inspector section whose open/closed state is remembered
+/// per section (progressive disclosure, PRD §8.2).
+private struct InspectorSection<Content: View>: View {
     let title: String
+    @AppStorage private var expanded: Bool
+    private let content: Content
+
+    init(title: String, key: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        _expanded = AppStorage(wrappedValue: true, "inspector.\(key).expanded")
+        self.content = content()
+    }
+
     var body: some View {
-        Text(title.uppercased())
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
+        DisclosureGroup(isExpanded: $expanded) {
+            content
+                .padding(.top, 6)
+        } label: {
+            Text(title.uppercased())
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .disclosureGroupStyle(.automatic)
     }
 }
 
@@ -58,7 +75,6 @@ private struct SourceSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            SectionHeader(title: "Source")
             Text(source.fileName).font(.headline).lineLimit(2).help(source.url.path)
             InfoRow(label: "Pixels", value: pixelsDescription)
             InfoRow(label: "Duration", value: Format.duration(source.duration.seconds))
@@ -124,7 +140,6 @@ private struct TimeRangeSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionHeader(title: "Time Range")
             HStack {
                 SecondsField(label: "Start", time: $model.rangeStart)
                 SecondsField(label: "End", time: $model.rangeEnd)
@@ -224,7 +239,6 @@ private struct SamplingSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionHeader(title: "Sampling")
             Picker("Sampling", selection: $model.samplingKind) {
                 ForEach(SamplingKind.allCases) { Text($0.rawValue).tag($0) }
             }
@@ -285,7 +299,6 @@ private struct BlendSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionHeader(title: "Blend")
             Picker("Blend mode", selection: $model.blendMode) {
                 ForEach(BlendMode.allCases) { Text($0.displayName).tag($0) }
             }
@@ -326,7 +339,6 @@ private struct ExportSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionHeader(title: "Export")
             Picker("Depth", selection: $model.exportBitDepth) {
                 ForEach(ExportBitDepth.allCases) { Text("\($0.displayName) PNG").tag($0) }
             }

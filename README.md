@@ -10,7 +10,21 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M2 (creative blending):** a **Blend** menu with **Average, Lighten, Darken, Screen, Multiply, Additive, Difference, Normal (opacity stack)** and an opacity slider for the modes that use it; each mode's exact formula is shown under the menu. All modes share the linear-light pipeline, preview matches export, and every mode has fixed-value reference tests and fixture renders (`DECISIONS.md` D-017).
 
-Not yet: filmstrip scrubbing/zoom/compare (M3), project files and JPEG/TIFF (M4), image sequences and alignment (M5), weighting/masks/motion/color/batches/median (M6). See the plan.
+**M3 (artist workflow):** a filmstrip with draggable in/out handles and a playhead; frame-accurate First/Last frame fields; **Original / Composite / Side by Side** views of the exact source frame under the playhead; zoom to fit, 100 %, zoom in/out, pinch and pan; undo/redo of every setting; collapsible inspector sections; File › Open Recent.
+
+| Keys | |
+|---|---|
+| ⌘O · Open Recent | open a clip |
+| ⌘E | export PNG |
+| ⌘Z / ⇧⌘Z | undo / redo settings |
+| ⌥← ⌥→ (⌥⇧ ×10) | step the playhead; with the timeline focused, plain ← → ⇧ Home End also work |
+| ⌥I / ⌥O | set in / out point at the playhead (I / O when the timeline is focused) |
+| ⌥⌘← ⌥⌘→ · ⌥⌘F | playhead to range start / end · full clip |
+| ⌥⌘1 / 2 / 3 | Composite / Original / Side by Side |
+| ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
+| ⌘R · ⌘. | render preview now · cancel |
+
+Not yet: project files and JPEG/TIFF (M4), image sequences and alignment (M5), weighting/masks/motion/color/batches/median (M6). See the plan.
 
 ## Requirements
 
@@ -70,6 +84,8 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 5. While a preview renders on a long clip, click **Cancel** (or ⌘.) — the app stays responsive.
 6. **Export PNG…** (⌘E), 16-bit. When finished the inspector shows the verified size/bit depth/profile; **Show in Finder**; open the file in Preview and compare with the on-screen preview.
 7. Change settings and export again without re-importing.
+8. (M3) Drag the right handle of the filmstrip to the middle; "Last frame" and the count follow, the film outside dims. Click the strip to place the playhead, press → a few times, then I: "First frame" jumps to the playhead. ⌘Z twice restores the range; ⇧⌘Z redoes.
+9. (M3) Switch the toolbar to **Original**, then **Side by Side**; ⌘1 shows 100 %, ⌘= zooms in, scroll pans, ⌘0 fits. Collapse the Source section; it stays collapsed after a relaunch. File › Open Recent lists the clips you opened.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

@@ -407,6 +407,31 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.zoom, .fit)
     }
 
+    // M3: Recent Files.
+    func testRecentFilesArePersistedMostRecentFirstWithoutDuplicates() async throws {
+        let suite = "FrameStackTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let model = AppModel(defaults: defaults)
+        XCTAssertEqual(model.recentFiles, [])
+        model.open(directory.appendingPathComponent("missing.mov"))
+        try await waitUntil { if case .failed = model.sourceState { return true } else { return false } }
+        XCTAssertEqual(model.recentFiles, [], "a failed open is not remembered")
+
+        try await openAndWait(model, "count_5s_30fps")
+        try await openAndWait(model, "moving_square_24f")
+        try await openAndWait(model, "count_5s_30fps")
+        XCTAssertEqual(model.recentFiles.map(\.lastPathComponent), ["count_5s_30fps.mp4", "moving_square_24f.mp4"], "most recent first, no duplicates")
+
+        // Persisted: a new model on the same defaults sees the list.
+        let again = AppModel(defaults: defaults)
+        XCTAssertEqual(again.recentFiles.map(\.lastPathComponent), ["count_5s_30fps.mp4", "moving_square_24f.mp4"])
+        again.clearRecentFiles()
+        XCTAssertEqual(again.recentFiles, [])
+        XCTAssertEqual(AppModel(defaults: defaults).recentFiles, [])
+    }
+
     // A damaged file still produces a composite and says what is missing.
     func testCorruptFileReportsMissingFramesInPreviewAndExport() async throws {
         let model = AppModel()

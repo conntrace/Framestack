@@ -24,6 +24,17 @@ struct FrameStackApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Open Video…") { model.presentOpenPanel() }
                     .keyboardShortcut("o")
+                Menu("Open Recent") {
+                    ForEach(model.recentFiles, id: \.path) { url in
+                        Button(url.lastPathComponent) { model.open(url) }
+                            .help(url.path)
+                    }
+                    if !model.recentFiles.isEmpty {
+                        Divider()
+                        Button("Clear Menu") { model.clearRecentFiles() }
+                    }
+                }
+                .disabled(model.recentFiles.isEmpty)
             }
             CommandGroup(after: .saveItem) {
                 Button("Export PNG…") { model.presentExportPanel() }
