@@ -994,3 +994,88 @@ final class MotionMaskAppTests: XCTestCase {
         XCTAssertEqual(reopened.motionMask, .off, "fresh source resets the mask")
     }
 }
+
+// MARK: - Painted mask (M6d)
+
+@MainActor
+final class PaintedMaskAppTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("FrameStackPaintApp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var fixtures: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("FrameStackMediaTests/Fixtures")
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 30, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func waitReady(_ model: AppModel) async throws {
+        try await waitUntil { if case .ready = model.sourceState { return true } else { return false } }
+        try await waitUntil { model.isPreviewCurrent }
+    }
+
+    func testStrokesUndoCropMappingAndProject() async throws {
+        let model = AppModel(defaults: UserDefaults(suiteName: "PaintApp-\(UUID().uuidString)")!)
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        model.open(fixtures.appendingPathComponent("moving_square_24f.mp4"))
+        try await waitReady(model)
+        XCTAssertTrue(model.canPaint)
+        XCTAssertEqual(model.canvasPoint(fromDisplayed: CGPoint(x: 0.25, y: 0.5)), MaskStroke.Point(x: 0.25, y: 0.5))
+
+        model.blendMode = .lighten
+        model.brushRadius = 0.1
+        model.brushSoftness = 0
+        model.addStroke(points: [.init(x: 0, y: 0.35), .init(x: 0.5, y: 0.35)])
+        XCTAssertTrue(model.paintedMask.enabled, "the first stroke turns the mask on")
+        XCTAssertEqual(undo.undoActionName, "Paint Mask")
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.preview?.motionMask?.paintedStrokes, 1)
+        model.brushErases = true
+        model.addStroke(points: [.init(x: 0.25, y: 0.35)])
+        XCTAssertEqual(undo.undoActionName, "Erase Mask")
+        XCTAssertEqual(model.paintedMask.strokes.count, 2)
+        undo.undo()
+        XCTAssertEqual(model.paintedMask.strokes.count, 1)
+        model.clearStrokes()
+        XCTAssertEqual(undo.undoActionName, "Clear Painted Mask")
+        undo.undo()
+        XCTAssertEqual(model.paintedMask.strokes.count, 1)
+
+        // With a crop, displayed points map into the crop; with a straighten angle painting is refused.
+        model.geometry.crop = NormalizedRect(x: 0.5, y: 0, width: 0.5, height: 1)
+        XCTAssertEqual(model.canvasPoint(fromDisplayed: CGPoint(x: 0, y: 0.2)), MaskStroke.Point(x: 0.5, y: 0.2))
+        model.geometry.rotationDegrees = 2
+        XCTAssertFalse(model.canPaint)
+        XCTAssertNil(model.canvasPoint(fromDisplayed: .zero))
+        model.geometry = .identity
+
+        // Saved and restored; export is opaque (over the background).
+        try await waitUntil { model.isPreviewCurrent }
+        let projectURL = directory.appendingPathComponent("painted.framestack")
+        XCTAssertTrue(model.save(to: projectURL))
+        XCTAssertTrue(try String(contentsOf: projectURL, encoding: .utf8).contains("\"paintedMask\" : {"))
+        let reopened = AppModel(defaults: UserDefaults(suiteName: "PaintApp-\(UUID().uuidString)")!)
+        reopened.open(projectURL)
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.paintedMask, model.paintedMask)
+        XCTAssertEqual(reopened.preview?.motionMask?.paintedStrokes, 1)
+        reopened.open(fixtures.appendingPathComponent("count_5s_30fps.mp4"))
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.paintedMask, .off)
+    }
+}

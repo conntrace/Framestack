@@ -20,9 +20,12 @@ public struct CompositeRequest: Sendable {
     public var weighting: WeightCurve
     /// Motion mask over a background (M6c); off by default.
     public var motionMask: MotionMaskSettings
+    /// Painted mask (M6d); off by default. Shares the motion mask's background.
+    public var paintedMask: PaintedMaskSettings
 
     public init(source: MediaSource, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
-                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off) {
+                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off,
+                paintedMask: PaintedMaskSettings = .off) {
         self.source = source
         self.frames = frames
         self.blendMode = blendMode
@@ -31,12 +34,14 @@ public struct CompositeRequest: Sendable {
         self.alignment = alignment
         self.weighting = weighting
         self.motionMask = motionMask
+        self.paintedMask = paintedMask
     }
 
     public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
-                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off) {
+                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off,
+                paintedMask: PaintedMaskSettings = .off) {
         self.init(source: .video(source), frames: frames, blendMode: blendMode, opacity: opacity, maxLongEdge: maxLongEdge,
-                  alignment: alignment, weighting: weighting, motionMask: motionMask)
+                  alignment: alignment, weighting: weighting, motionMask: motionMask, paintedMask: paintedMask)
     }
 }
 
@@ -65,10 +70,19 @@ public struct MotionMaskReport: Sendable, Equatable {
     /// Pixels where no frame was ever masked in (they show the background only).
     public let backgroundOnlyFraction: Double
     public let inverted: Bool
+    /// The motion (difference) mask was applied.
+    public let motionActive: Bool
+    /// Number of painted strokes applied (nil when the painted mask is off).
+    public let paintedStrokes: Int?
 
     public var summary: String {
-        String(format: "Background: %@ · threshold %.2f · moving pixels %.1f %% of frame·pixels · %.1f %% of the image is background only%@",
-               backgroundDescription, threshold, meanCoverage * 100, backgroundOnlyFraction * 100, inverted ? " · inverted" : "")
+        var parts = ["Background: \(backgroundDescription)"]
+        if motionActive { parts.append(String(format: "threshold %.2f", threshold)) }
+        if let n = paintedStrokes { parts.append("\(n) painted stroke\(n == 1 ? "" : "s")") }
+        parts.append(String(format: "blended pixels %.1f %% of frame·pixels", meanCoverage * 100))
+        parts.append(String(format: "%.1f %% of the image is background only", backgroundOnlyFraction * 100))
+        if inverted { parts.append("motion inverted") }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -296,16 +310,26 @@ public final class CompositeRenderer: @unchecked Sendable {
         let settings: MotionMaskSettings
         let background: LinearImage
         let description: String
+        /// Painted mask at output size (nil when off).
+        let painted: [Float]?
+        let paintedStrokes: Int?
         var coverageSums: [Float]
         var framesMasked = 0
 
-        init(settings: MotionMaskSettings, background: LinearImage, description: String, scale: Double) {
+        init(settings: MotionMaskSettings, painted: PaintedMaskSettings, background: LinearImage, description: String, scale: Double) {
             var scaled = settings
             scaled.feather = Int((Double(settings.feather) * scale).rounded())
             scaled.cleanup = Int((Double(settings.cleanup) * scale).rounded())
             self.settings = scaled
             self.background = background
             self.description = description
+            if painted.enabled {
+                self.painted = PaintedMaskRasterizer.raster(painted, size: background.size)
+                paintedStrokes = painted.strokes.count
+            } else {
+                self.painted = nil
+                paintedStrokes = nil
+            }
             coverageSums = [Float](repeating: 0, count: background.width * background.height)
         }
     }
@@ -333,7 +357,7 @@ public final class CompositeRenderer: @unchecked Sendable {
             background = GeometryProcessor.filled(background, with: SIMD3(0, 0, 0))
         }
         let scale = Double(background.size.longEdge) / Double(max(request.source.displaySize.longEdge, 1))
-        return Masker(settings: settings, background: background, description: description, scale: scale)
+        return Masker(settings: settings, painted: request.paintedMask, background: background, description: description, scale: scale)
     }
 
     private func resetTallies(_ aligner: Aligner) {
@@ -388,7 +412,7 @@ public final class CompositeRenderer: @unchecked Sendable {
             aligner = try await makeAligner(for: request)
         }
         var masker: Masker?
-        if request.motionMask.enabled {
+        if request.motionMask.enabled || request.paintedMask.enabled {
             masker = try await makeMasker(for: request)
         }
         if request.blendMode.requiresFrameHistory {
@@ -514,7 +538,8 @@ public final class CompositeRenderer: @unchecked Sendable {
             let pixels = Double(max(coverage!.count, 1))
             maskReport = MotionMaskReport(backgroundDescription: masker.description, threshold: masker.settings.threshold,
                                           meanCoverage: mean / pixels, backgroundOnlyFraction: Double(backgroundOnly) / pixels,
-                                          inverted: masker.settings.invert)
+                                          inverted: masker.settings.enabled && masker.settings.invert,
+                                          motionActive: masker.settings.enabled, paintedStrokes: masker.paintedStrokes)
         }
         return CompositeResult(
             image: finalImage,
@@ -659,11 +684,21 @@ public final class CompositeRenderer: @unchecked Sendable {
             let width = r.outputSize.width
             let bandPixels = width * rows.count
             let offset = rows.lowerBound * width * LinearImage.channelCount
-            let mask: [Float] = r.frameBuffer.withUnsafeBufferPointer { f in
-                masker.background.pixels.withUnsafeBufferPointer { b in
-                    let slice = UnsafeBufferPointer(rebasing: b[offset..<(offset + bandPixels * LinearImage.channelCount)])
-                    return MaskOps.mask(frame: f, background: slice, width: width, height: rows.count, settings: masker.settings)
+            var mask: [Float]
+            if masker.settings.enabled {
+                mask = r.frameBuffer.withUnsafeBufferPointer { f in
+                    masker.background.pixels.withUnsafeBufferPointer { b in
+                        let slice = UnsafeBufferPointer(rebasing: b[offset..<(offset + bandPixels * LinearImage.channelCount)])
+                        return MaskOps.mask(frame: f, background: slice, width: width, height: rows.count, settings: masker.settings)
+                    }
                 }
+            } else {
+                mask = [Float](repeating: 1, count: bandPixels)
+            }
+            if let painted = masker.painted {
+                // The painted mask limits where any frame may blend.
+                let base = rows.lowerBound * width
+                for i in 0..<bandPixels { mask[i] *= painted[base + i] }
             }
             r.frameBuffer.withUnsafeMutableBufferPointer { MaskOps.apply(mask, to: $0) }
             let base = rows.lowerBound * width

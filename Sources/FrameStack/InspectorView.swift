@@ -25,6 +25,7 @@ struct InspectorView: View {
                         InspectorSection(title: "Weighting", key: "weighting") { WeightingSection() }
                         InspectorSection(title: "Alignment", key: "alignment") { AlignmentSection() }
                         InspectorSection(title: "Motion Mask", key: "motionMask") { MotionMaskSection() }
+                        InspectorSection(title: "Painted Mask", key: "paintedMask") { PaintedMaskSection() }
                         InspectorSection(title: "Crop & Straighten", key: "geometry") { GeometrySection() }
                         InspectorSection(title: "Export", key: "export") { ExportSection() }
                     }
@@ -768,6 +769,59 @@ private struct MotionMaskSection: View {
         case .average: return "Average + mask: a moving subject appears as a ghost proportional to how often it was there; background where it never was."
         case .median: return "Median + mask: a pixel must have moved in more than half the frames to show at all."
         default: return "\(model.blendMode.displayName) + mask: the masked frames feed the blend; uncovered pixels show the background."
+        }
+    }
+}
+
+// MARK: Painted mask
+
+private struct PaintedMaskSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Blend only where painted", isOn: $model.paintedMask.enabled)
+                .font(.callout)
+            Toggle("Paint on the preview (drag)", isOn: $model.isPainting)
+                .font(.callout)
+                .disabled(!model.canPaint)
+            if !model.canPaint, model.source != nil {
+                Text("Set Straighten to 0° to paint; the mask lives on the unrotated canvas.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            Picker("Brush", selection: $model.brushErases) {
+                Text("Paint").tag(false)
+                Text("Erase").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            HStack {
+                Text("Size").font(.callout)
+                Slider(value: $model.brushRadius, in: 0.005...0.25)
+                Text("\(Int((model.brushRadius * 100).rounded())) %").font(.callout).monospacedDigit().frame(width: 40, alignment: .trailing)
+            }
+            HStack {
+                Text("Softness").font(.callout)
+                Slider(value: $model.brushSoftness, in: 0...1)
+                Text("\(Int((model.brushSoftness * 100).rounded())) %").font(.callout).monospacedDigit().frame(width: 40, alignment: .trailing)
+            }
+            Toggle("Invert (painted areas excluded)", isOn: $model.paintedMask.invert).font(.callout)
+            Toggle("Show strokes on the preview", isOn: $model.showPaintedMaskOverlay).font(.callout)
+            HStack {
+                Text("\(model.paintedMask.strokes.count) stroke\(model.paintedMask.strokes.count == 1 ? "" : "s")")
+                    .font(.callout).foregroundStyle(.secondary)
+                Spacer()
+                Button("Clear") { model.clearStrokes() }
+                    .controlSize(.small)
+                    .disabled(model.paintedMask.strokes.isEmpty)
+            }
+            if model.paintedMask.enabled, !model.motionMask.enabled, let report = model.preview?.motionMask, model.isPreviewCurrent {
+                Text(report.summary).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Text(model.paintedMask.enabled
+                 ? "Frames blend only inside the painted strokes (times the motion mask if that is on); elsewhere the background shows — the median of the selection or the playhead frame chosen in Motion Mask. Brush size is a fraction of the canvas, so strokes are resolution-independent and saved with the project. Each stroke is one undo step."
+                 : "Off. Turn on and paint on the preview to limit the blend to the painted region; everything else shows the background.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 }

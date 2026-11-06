@@ -147,7 +147,8 @@ private struct PreviewArea: View {
                 onZoomChange: { model.zoom = $0 },
                 caption: (showingCoverage ? "Mask coverage" : "Composite") + " · \(preview.framesComposited) frames"
                     + (preview.alignment != nil ? " · aligned" : "") + (preview.motionMask != nil && !showingCoverage ? " · masked" : ""),
-                safeArea: showSafeArea ? safeArea(of: preview) : nil
+                safeArea: showSafeArea ? safeArea(of: preview) : nil,
+                paint: paintHandlers(for: preview)
             )
             .opacity(model.isPreviewCurrent ? 1 : 0.55)
             .overlay(alignment: .topLeading) {
@@ -164,6 +165,27 @@ private struct PreviewArea: View {
         } else {
             ProgressView("Rendering preview…").frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    /// Painting on the displayed (cropped, unrotated) composite.
+    private func paintHandlers(for preview: PreviewSnapshot) -> ZoomableImageView.PaintHandlers? {
+        guard model.isPainting, model.canPaint, let canvas = model.canvasSize else { return nil }
+        let crop = model.geometry.crop.clamped(in: canvas)
+        // Canvas-normalised → displayed-normalised.
+        let strokes = model.paintedMask.enabled ? model.paintedMask.strokes.map { s in
+            (points: s.points.map { CGPoint(x: ($0.x - crop.x) / crop.width, y: ($0.y - crop.y) / crop.height) },
+             radius: s.radius / max(crop.width, crop.height), erase: s.erase)
+        } : []
+        return ZoomableImageView.PaintHandlers(
+            strokes: strokes,
+            brushRadius: model.brushRadius / max(crop.width, crop.height),
+            erasing: model.brushErases,
+            showOverlay: model.showPaintedMaskOverlay,
+            onStrokeEnd: { points in
+                let mapped = points.compactMap { model.canvasPoint(fromDisplayed: $0) }
+                model.addStroke(points: mapped)
+            }
+        )
     }
 
     /// The alignment valid area in full-resolution pixels.

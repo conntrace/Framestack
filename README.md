@@ -26,6 +26,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M6c (motion mask):** a **Motion Mask** section keeps only the pixels that differ from a background (the Median of the selection, or the playhead frame): threshold, feather, clean-up and invert, with a **mask coverage** view. The masked frames feed whichever blend you chose and the result is laid over the background — Normal + mask is chronophotography, Average + mask a ghost of the motion, Invert keeps only what stood still.
 
+**M6d (painted mask):** a **Painted Mask** section — paint on the preview with a sized, soft brush (or erase), invert, clear — limits the blend to the painted region; everything else shows the background. Strokes are stored as resolution-independent vectors in the project and each stroke is one undo step.
+
 | Keys | |
 |---|---|
 | ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
@@ -39,7 +41,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: painted masks, colour adjustments, presets and batches (rest of M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
+Not yet: colour adjustments, presets and batches (rest of M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -114,6 +116,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 17. (M6a) In Weighting choose **Favor Late**: the curve rises, the ticks follow the selected frames, the caption reports the raw range and the effective frame count, and the preview re-renders favouring the end of the range. Choose **Custom** and drag a point: one undo step. Switch Blend to Lighten: the note says the curve is ignored.
 18. (M6b) Choose Blend → **Median** on a clip with a moving subject: the caption says how many passes the preview needs, the bar counts "pass p of P" on long clips, and the subject disappears from the result while the background stays sharp. **Max Luminance** keeps the brightest frame's whole colour per pixel.
 19. (M6c) Blend → **Normal**, then turn on **Keep only what moves**: the subject appears at every position over a clean background (chronophotography); the section reports the background used and the moving-pixel share. Tick **Show mask coverage**: white where motion was. Raise the threshold until noise disappears; **Invert** shows the still scene only; **Use Playhead Frame** swaps the background for a frame.
+20. (M6d) In Painted Mask turn on **Paint on the preview** and drag a stroke across part of the image: a red stroke appears, the blend applies only inside it and the background shows elsewhere; ⌘Z removes the stroke ("Undo Paint Mask"). Switch the brush to Erase and cross the stroke; **Invert** flips the region.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

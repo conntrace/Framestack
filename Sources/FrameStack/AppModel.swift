@@ -135,6 +135,41 @@ final class AppModel: ObservableObject {
     @Published var weighting: WeightCurve = .flat { didSet { if weighting != oldValue { settingsChanged() } } }
     /// Motion mask (M6c); undoable and saved.
     @Published var motionMask: MotionMaskSettings = .off { didSet { if motionMask != oldValue { settingsChanged() } } }
+    /// Painted mask (M6d); undoable (one step per stroke) and saved.
+    @Published var paintedMask: PaintedMaskSettings = .off { didSet { if paintedMask != oldValue { settingsChanged() } } }
+    /// Painting tool state (not saved): brush as a fraction of the canvas long edge, softness, erase.
+    @Published var brushRadius: Double = 0.04
+    @Published var brushSoftness: Double = 0.5
+    @Published var brushErases = false
+    /// Mouse drags on the preview paint instead of doing nothing.
+    @Published var isPainting = false
+    @Published var showPaintedMaskOverlay = true
+
+    /// Adds a finished stroke (canvas-normalised points) as one undo step.
+    func addStroke(points: [MaskStroke.Point]) {
+        guard !points.isEmpty else { return }
+        // One assignment → one undo step named after the stroke.
+        var mask = paintedMask
+        mask.strokes.append(MaskStroke(points: points, radius: brushRadius, softness: brushSoftness, erase: brushErases))
+        mask.enabled = true
+        paintedMask = mask
+    }
+
+    func clearStrokes() {
+        paintedMask.strokes = []
+    }
+
+    /// Converts a point on the displayed (cropped) composite, normalised to
+    /// its size, into canvas-normalised coordinates. Painting is only
+    /// offered when there is no straighten angle (the mapping is then a
+    /// plain crop offset).
+    func canvasPoint(fromDisplayed p: CGPoint) -> MaskStroke.Point? {
+        guard geometry.rotationDegrees == 0, let canvas = canvasSize else { return nil }
+        let crop = geometry.crop.clamped(in: canvas)
+        return MaskStroke.Point(x: crop.x + Double(p.x) * crop.width, y: crop.y + Double(p.y) * crop.height)
+    }
+
+    var canPaint: Bool { source != nil && geometry.rotationDegrees == 0 }
     /// Show the mask coverage (where motion contributed) instead of the composite.
     @Published var showMaskCoverage = false
 
@@ -278,7 +313,7 @@ final class AppModel: ObservableObject {
     var settings: CompositeSettings {
         CompositeSettings(rangeStart: rangeStart, rangeEnd: rangeEnd, samplingKind: samplingKind,
                           nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity, alignment: alignment,
-                          geometry: geometry, weighting: weighting, motionMask: motionMask)
+                          geometry: geometry, weighting: weighting, motionMask: motionMask, paintedMask: paintedMask)
     }
 
     var selectedTimes: [FrameTime] {
@@ -631,7 +666,9 @@ final class AppModel: ObservableObject {
         geometry = .identity
         weighting = .flat
         motionMask = .off
+        paintedMask = .off
         suppressChanges = false
+        isPainting = false
         // Export choices follow the user from clip to clip, but a project's
         // choices do not leak into an unrelated video opened afterwards.
         if projectURL != nil { exportSettings = ExportSettings() }
@@ -788,6 +825,7 @@ final class AppModel: ObservableObject {
                                     crop: s.geometry.crop.clamped(in: info.displaySize), edgeFill: s.geometry.edgeFill)
         weighting = s.weighting
         motionMask = s.motionMask
+        paintedMask = s.paintedMask
         exportSettings = project.export
         if let quality = project.ui.previewQuality.flatMap(PreviewQuality.init(rawValue:)) { previewQuality = quality }
         if let mode = project.ui.viewMode.flatMap(PreviewViewMode.init(rawValue:)) { viewMode = mode }
@@ -996,6 +1034,7 @@ final class AppModel: ObservableObject {
         geometry = s.geometry
         weighting = s.weighting
         motionMask = s.motionMask
+        paintedMask = s.paintedMask
         suppressChanges = false
         settingsChanged()
     }
@@ -1047,6 +1086,13 @@ final class AppModel: ObservableObject {
         if old.geometry.edgeFill != new.geometry.edgeFill { return "Change Edge Fill" }
         if old.weighting != new.weighting { return "Change Weighting" }
         if old.motionMask != new.motionMask { return "Change Motion Mask" }
+        if old.paintedMask != new.paintedMask {
+            if new.paintedMask.strokes.count == old.paintedMask.strokes.count + 1, let last = new.paintedMask.strokes.last {
+                return last.erase ? "Erase Mask" : "Paint Mask"
+            }
+            if new.paintedMask.strokes.isEmpty, !old.paintedMask.strokes.isEmpty { return "Clear Painted Mask" }
+            return "Change Painted Mask"
+        }
         return "Change Settings"
     }
 
@@ -1069,7 +1115,8 @@ final class AppModel: ObservableObject {
             maxLongEdge: previewQuality.maxLongEdge,
             alignment: alignment,
             weighting: weighting,
-            motionMask: motionMask
+            motionMask: motionMask,
+            paintedMask: paintedMask
         )
         let revision = settingsRevision
         renderActivity = .waiting
@@ -1175,7 +1222,8 @@ final class AppModel: ObservableObject {
             maxLongEdge: exportSettings.sizing.maxLongEdge(for: source.displaySize),
             alignment: alignment,
             weighting: weighting,
-            motionMask: motionMask
+            motionMask: motionMask,
+            paintedMask: paintedMask
         )
         let settings = exportSettings
         let geometry = geometry

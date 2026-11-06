@@ -63,8 +63,21 @@ struct ZoomableImageView: View {
     /// Rectangle in full-resolution pixels (origin top-left) outlined over
     /// the image — the alignment safe area.
     var safeArea: CGRect? = nil
+    /// Painting: when set, drags on the image are reported as normalised
+    /// (0…1 of the displayed image) points; `nil` disables painting.
+    var paint: PaintHandlers? = nil
 
     @State private var pinchBase: Double?
+    @State private var strokeInProgress: [CGPoint] = []
+
+    struct PaintHandlers {
+        /// Strokes already painted, in displayed-image-normalised coordinates, with radius as a fraction of the long edge.
+        let strokes: [(points: [CGPoint], radius: Double, erase: Bool)]
+        let brushRadius: Double
+        let erasing: Bool
+        let showOverlay: Bool
+        let onStrokeEnd: ([CGPoint]) -> Void
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -79,6 +92,29 @@ struct ZoomableImageView: View {
                     .interpolation(scale >= 2 ? .none : .high)
                     .frame(width: width, height: height)
                     .background(Checkerboard())
+                    .overlay {
+                        if let paint, paint.showOverlay || !strokeInProgress.isEmpty {
+                            PaintOverlay(strokes: paint.strokes, inProgress: strokeInProgress, inProgressRadius: paint.brushRadius,
+                                         inProgressErase: paint.erasing, size: CGSize(width: width, height: height))
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .overlay {
+                        if paint != nil {
+                            Color.clear.contentShape(Rectangle())
+                                .gesture(
+                                    DragGesture(minimumDistance: 0)
+                                        .onChanged { value in
+                                            let p = CGPoint(x: value.location.x / width, y: value.location.y / height)
+                                            strokeInProgress.append(CGPoint(x: min(max(p.x, 0), 1), y: min(max(p.y, 0), 1)))
+                                        }
+                                        .onEnded { _ in
+                                            paint?.onStrokeEnd(strokeInProgress)
+                                            strokeInProgress = []
+                                        }
+                                )
+                        }
+                    }
                     .overlay(alignment: .topLeading) {
                         if let safeArea, !safeArea.isNull {
                             Rectangle()
@@ -109,6 +145,36 @@ struct ZoomableImageView: View {
                     .accessibilityIdentifier("zoomCaption")
             }
         }
+    }
+}
+
+/// Painted strokes drawn over the image: existing strokes translucent, the
+/// stroke being drawn brighter; erase strokes in a different hue.
+struct PaintOverlay: View {
+    let strokes: [(points: [CGPoint], radius: Double, erase: Bool)]
+    let inProgress: [CGPoint]
+    let inProgressRadius: Double
+    let inProgressErase: Bool
+    let size: CGSize
+
+    var body: some View {
+        Canvas { context, _ in
+            let longEdge = max(size.width, size.height)
+            func draw(_ pts: [CGPoint], radius: Double, erase: Bool, opacity: Double) {
+                guard let first = pts.first else { return }
+                var path = Path()
+                let p0 = CGPoint(x: first.x * size.width, y: first.y * size.height)
+                path.move(to: p0)
+                if pts.count == 1 { path.addLine(to: p0) }
+                for p in pts.dropFirst() { path.addLine(to: CGPoint(x: p.x * size.width, y: p.y * size.height)) }
+                let color: Color = erase ? .blue : .red
+                context.stroke(path, with: .color(color.opacity(opacity)),
+                               style: StrokeStyle(lineWidth: max(1, radius * longEdge * 2), lineCap: .round, lineJoin: .round))
+            }
+            for s in strokes { draw(s.points, radius: s.radius, erase: s.erase, opacity: 0.35) }
+            draw(inProgress, radius: inProgressRadius, erase: inProgressErase, opacity: 0.6)
+        }
+        .accessibilityHidden(true)
     }
 }
 
