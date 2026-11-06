@@ -24,6 +24,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M6b (median, luminance):** **Median** is an exact per-pixel median of every selected frame, computed in horizontal bands within a memory budget (the clip is decoded once per band; the Blend section tells you how many passes the preview and the export will take and the bottom bar counts them) — moving subjects vanish, the static scene stays. **Max Luminance** / **Min Luminance** keep, per pixel, the whole colour of the brightest / darkest frame, unlike Lighten/Darken's per-channel extremes.
 
+**M6c (motion mask):** a **Motion Mask** section keeps only the pixels that differ from a background (the Median of the selection, or the playhead frame): threshold, feather, clean-up and invert, with a **mask coverage** view. The masked frames feed whichever blend you chose and the result is laid over the background — Normal + mask is chronophotography, Average + mask a ghost of the motion, Invert keeps only what stood still.
+
 | Keys | |
 |---|---|
 | ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
@@ -37,7 +39,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: masks, motion accumulation, colour adjustments, presets and batches (rest of M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
+Not yet: painted masks, colour adjustments, presets and batches (rest of M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -111,6 +113,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 16. (M5c) Open a folder of photos that mix portrait and landscape: the refusal names the files and offers **Fit** and **Fill**; Fit shows letterboxed stills, the Source section says how many were scaled, and the Canvas menu switches between the three policies.
 17. (M6a) In Weighting choose **Favor Late**: the curve rises, the ticks follow the selected frames, the caption reports the raw range and the effective frame count, and the preview re-renders favouring the end of the range. Choose **Custom** and drag a point: one undo step. Switch Blend to Lighten: the note says the curve is ignored.
 18. (M6b) Choose Blend → **Median** on a clip with a moving subject: the caption says how many passes the preview needs, the bar counts "pass p of P" on long clips, and the subject disappears from the result while the background stays sharp. **Max Luminance** keeps the brightest frame's whole colour per pixel.
+19. (M6c) Blend → **Normal**, then turn on **Keep only what moves**: the subject appears at every position over a clean background (chronophotography); the section reports the background used and the moving-pixel share. Tick **Show mask coverage**: white where motion was. Raise the threshold until noise disappears; **Invert** shows the still scene only; **Use Playhead Frame** swaps the background for a frame.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

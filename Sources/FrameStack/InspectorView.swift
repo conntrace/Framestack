@@ -24,6 +24,7 @@ struct InspectorView: View {
                         InspectorSection(title: "Blend", key: "blend") { BlendSection() }
                         InspectorSection(title: "Weighting", key: "weighting") { WeightingSection() }
                         InspectorSection(title: "Alignment", key: "alignment") { AlignmentSection() }
+                        InspectorSection(title: "Motion Mask", key: "motionMask") { MotionMaskSection() }
                         InspectorSection(title: "Crop & Straighten", key: "geometry") { GeometrySection() }
                         InspectorSection(title: "Export", key: "export") { ExportSection() }
                     }
@@ -689,6 +690,84 @@ private struct AlignmentSection: View {
             let index = resolved.flatMap { model.timeline?.nearestIndex(to: $0) }
             if resolved != time { return "frame at \(Format.seconds(time.seconds)) (not selected → middle)" }
             return "frame \(index.map(String.init) ?? "?") · \(Format.seconds(time.seconds))"
+        }
+    }
+}
+
+// MARK: Motion mask
+
+private struct MotionMaskSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Keep only what moves", isOn: $model.motionMask.enabled)
+                .font(.callout)
+            if model.motionMask.enabled {
+                HStack {
+                    Text("Background").foregroundStyle(.secondary)
+                    Spacer()
+                    Text(backgroundDescription).monospacedDigit()
+                }
+                .font(.callout)
+                HStack {
+                    Button("Use Playhead Frame") { model.useMaskBackgroundAtPlayhead() }
+                        .disabled(model.scrubIndex == nil)
+                    Button("Use Median") { model.useMedianMaskBackground() }
+                        .disabled(model.motionMask.background == .median)
+                }
+                .controlSize(.small)
+                HStack {
+                    Text("Threshold").font(.callout)
+                    Slider(value: $model.motionMask.threshold, in: 0.01...0.5) { editing in
+                        editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
+                    }
+                    Text(String(format: "%.2f", model.motionMask.threshold)).font(.callout).monospacedDigit().frame(width: 40, alignment: .trailing)
+                }
+                HStack {
+                    Text("Feather").font(.callout)
+                    Stepper(value: $model.motionMask.feather, in: 0...MotionMaskSettings.maximumRadius) {
+                        Text("\(model.motionMask.feather) px").font(.callout).monospacedDigit()
+                    }
+                    Spacer()
+                    Text("Clean up").font(.callout)
+                    Stepper(value: $model.motionMask.cleanup, in: 0...MotionMaskSettings.maximumRadius) {
+                        Text("\(model.motionMask.cleanup) px").font(.callout).monospacedDigit()
+                    }
+                }
+                Toggle("Invert (keep only what stays still)", isOn: $model.motionMask.invert).font(.callout)
+                Toggle("Show mask coverage instead of the composite", isOn: $model.showMaskCoverage).font(.callout)
+                if let report = model.preview?.motionMask, model.isPreviewCurrent {
+                    Text(report.summary).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Text(recipe)
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text("Each frame's linear-light RGB distance from the background is thresholded, cleaned (open/close), feathered and used as that frame's alpha before the blend; the composite is laid over the background. Moving shadows, lighting changes and camera motion count as motion — align first for handheld clips.")
+                    .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Off. Turn on to blend only the pixels that differ from a background — the median of the selection or a chosen frame — for chronophotography (use the Normal or Lighten blend) or ghosted motion (Average).")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var backgroundDescription: String {
+        switch model.motionMask.background {
+        case .median: return "median of the selection"
+        case let .frame(t):
+            if model.motionMask.background.frameTime(in: model.selectedTimes) == nil { return "frame at \(Format.seconds(t.seconds)) (not selected → median)" }
+            let index = model.timeline?.nearestIndex(to: t)
+            return "frame \(index.map(String.init) ?? "?") · \(Format.seconds(t.seconds))"
+        }
+    }
+
+    private var recipe: String {
+        switch model.blendMode {
+        case .normal: return "Normal + mask: each moving region is laid over the previous ones in time order — chronophotography."
+        case .lighten, .maxLuminance: return "\(model.blendMode.displayName) + mask: the brightest moving pixels win over the background."
+        case .average: return "Average + mask: a moving subject appears as a ghost proportional to how often it was there; background where it never was."
+        case .median: return "Median + mask: a pixel must have moved in more than half the frames to show at all."
+        default: return "\(model.blendMode.displayName) + mask: the masked frames feed the blend; uncovered pixels show the background."
         }
     }
 }

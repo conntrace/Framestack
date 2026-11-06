@@ -428,11 +428,15 @@ public final class ExtremumReducer: FrameReducer {
 ///
 ///     C' = C + opacity × (B(C, F) − C)
 ///
-/// where B is the mode's blend function on linear-light premultiplied values:
+/// where B is the mode's blend function on linear-light values:
 /// screen `C + F − C·F`, multiply `C·F`, difference `|C − F|`, normal `F`.
-/// With opacity 1 this is the plain blend; with opacity 0 nothing changes.
-/// Alpha always uses the normal rule (`A' = A + opacity × (F_A − A)`), so
-/// opaque input stays opaque. State is one Float32 RGBA image.
+/// Frames are premultiplied RGBA; a frame that only partly covers a pixel
+/// (alpha a_F < 1, e.g. a masked or aligned frame) blends only where it
+/// covers: `B' = (1 − a_F) × C + a_F × B(C, F ÷ a_F)` (the W3C compositing
+/// rule), so an uncovered pixel leaves the composite unchanged and Normal is
+/// exact source-over. For opaque frames this is the plain blend. Alpha uses
+/// source-over coverage (`A' = A + opacity × a_F × (1 − A)`). With opacity
+/// 0 nothing changes. State is one Float32 RGBA image.
 public final class SequentialReducer: FrameReducer {
     public enum Operation: Sendable { case screen, multiply, difference, normal }
 
@@ -475,22 +479,25 @@ public final class SequentialReducer: FrameReducer {
             }
             var i = 0
             while i < total {
-                // RGB
+                let fa = min(max(src[i + 3], 0), 1)
+                // RGB: blend only where the frame covers the pixel.
                 for k in i..<(i + 3) {
                     let cv = c[k]
                     let fv = src[k]
-                    let blended: Float
+                    let straight = fa > 0 ? fv / fa : 0
+                    let b: Float
                     switch operation {
-                    case .screen: blended = cv + fv - cv * fv
-                    case .multiply: blended = cv * fv
-                    case .difference: blended = abs(cv - fv)
-                    case .normal: blended = fv
+                    case .screen: b = cv + straight - cv * straight
+                    case .multiply: b = cv * straight
+                    case .difference: b = abs(cv - straight)
+                    case .normal: b = straight
                     }
+                    let blended = (1 - fa) * cv + fa * b
                     c[k] = cv + a * (blended - cv)
                 }
                 // Alpha: source-over coverage.
                 let ca = c[i + 3]
-                c[i + 3] = ca + a * (src[i + 3] - ca)
+                c[i + 3] = ca + a * fa * (1 - ca)
                 i += LinearImage.channelCount
             }
         }

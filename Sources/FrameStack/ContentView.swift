@@ -139,12 +139,14 @@ private struct PreviewArea: View {
     @ViewBuilder
     private var composite: some View {
         if let preview = model.preview {
+            let showingCoverage = model.showMaskCoverage && preview.coverageImage != nil
             ZoomableImageView(
-                image: preview.image,
+                image: showingCoverage ? preview.coverageImage! : preview.image,
                 fullSize: fullSize,
                 zoom: model.zoom,
                 onZoomChange: { model.zoom = $0 },
-                caption: "Composite · \(preview.framesComposited) frames" + (preview.alignment != nil ? " · aligned" : ""),
+                caption: (showingCoverage ? "Mask coverage" : "Composite") + " · \(preview.framesComposited) frames"
+                    + (preview.alignment != nil ? " · aligned" : "") + (preview.motionMask != nil && !showingCoverage ? " · masked" : ""),
                 safeArea: showSafeArea ? safeArea(of: preview) : nil
             )
             .opacity(model.isPreviewCurrent ? 1 : 0.55)

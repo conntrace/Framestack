@@ -906,3 +906,91 @@ final class MedianAppTests: XCTestCase {
         return rgb
     }
 }
+
+// MARK: - Motion mask (M6c)
+
+@MainActor
+final class MotionMaskAppTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("FrameStackMaskApp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var fixtures: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("FrameStackMediaTests/Fixtures")
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 30, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func waitReady(_ model: AppModel) async throws {
+        try await waitUntil { if case .ready = model.sourceState { return true } else { return false } }
+        try await waitUntil { model.isPreviewCurrent }
+    }
+
+    func testMaskToggleCoveragePlayheadBackgroundUndoAndProject() async throws {
+        let model = AppModel(defaults: UserDefaults(suiteName: "MaskApp-\(UUID().uuidString)")!)
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        model.open(fixtures.appendingPathComponent("moving_square_24f.mp4"))
+        try await waitReady(model)
+        XCTAssertNil(model.preview?.motionMask)
+        XCTAssertNil(model.preview?.coverageImage)
+
+        model.blendMode = .normal
+        model.motionMask.enabled = true
+        XCTAssertEqual(undo.undoActionName, "Change Motion Mask")
+        try await waitUntil { model.isPreviewCurrent }
+        let preview = try XCTUnwrap(model.preview)
+        XCTAssertEqual(preview.motionMask?.backgroundDescription, "the median of 24 frames")
+        let coverage = try XCTUnwrap(preview.coverageImage)
+        XCTAssertEqual(coverage.width, 480)
+        XCTAssertEqual(coverage.height, 272)
+
+        model.scrubIndex = 5
+        model.useMaskBackgroundAtPlayhead()
+        XCTAssertEqual(model.motionMask.background, .frame(model.timeline!.frames[5]))
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertTrue(model.preview?.motionMask?.backgroundDescription.hasPrefix("frame 5") ?? false)
+        undo.undo()
+        XCTAssertEqual(model.motionMask.background, .median)
+
+        // Threshold drag is one step; project round trip; export carries the over-composite (opaque).
+        model.beginInteractiveEdit()
+        model.motionMask.threshold = 0.2
+        model.motionMask.threshold = 0.3
+        model.endInteractiveEdit()
+        undo.undo()
+        XCTAssertEqual(model.motionMask.threshold, 0.08, accuracy: 1e-9)
+        try await waitUntil { model.isPreviewCurrent }
+        let projectURL = directory.appendingPathComponent("masked.framestack")
+        XCTAssertTrue(model.save(to: projectURL))
+        XCTAssertTrue(try String(contentsOf: projectURL, encoding: .utf8).contains("\"motionMask\" : {"))
+        let reopened = AppModel(defaults: UserDefaults(suiteName: "MaskApp-\(UUID().uuidString)")!)
+        reopened.open(projectURL)
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.motionMask, model.motionMask)
+        XCTAssertNotNil(reopened.preview?.motionMask)
+        reopened.exportSettings = ExportSettings(format: .png, bitDepth: .eight)
+        let out = directory.appendingPathComponent("chrono.png")
+        reopened.export(to: out)
+        try await waitUntil { !reopened.isExporting }
+        guard case let .finished(report, _, _) = reopened.exportActivity else { return XCTFail("\(reopened.exportActivity)") }
+        XCTAssertFalse(report.hasAlpha, "laid over the opaque background")
+        reopened.open(fixtures.appendingPathComponent("count_5s_30fps.mp4"))
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.motionMask, .off, "fresh source resets the mask")
+    }
+}

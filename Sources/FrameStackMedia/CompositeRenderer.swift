@@ -18,9 +18,11 @@ public struct CompositeRequest: Sendable {
     public var alignment: AlignmentSettings
     /// Temporal weighting over the selection's timestamps (M6a); flat by default.
     public var weighting: WeightCurve
+    /// Motion mask over a background (M6c); off by default.
+    public var motionMask: MotionMaskSettings
 
     public init(source: MediaSource, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
-                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat) {
+                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off) {
         self.source = source
         self.frames = frames
         self.blendMode = blendMode
@@ -28,12 +30,13 @@ public struct CompositeRequest: Sendable {
         self.maxLongEdge = maxLongEdge
         self.alignment = alignment
         self.weighting = weighting
+        self.motionMask = motionMask
     }
 
     public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
-                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat) {
+                alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off) {
         self.init(source: .video(source), frames: frames, blendMode: blendMode, opacity: opacity, maxLongEdge: maxLongEdge,
-                  alignment: alignment, weighting: weighting)
+                  alignment: alignment, weighting: weighting, motionMask: motionMask)
     }
 }
 
@@ -49,6 +52,23 @@ public struct CompositeProgress: Sendable, Equatable {
         self.framesTotal = framesTotal
         self.pass = pass
         self.passes = passes
+    }
+}
+
+/// What the motion mask did.
+public struct MotionMaskReport: Sendable, Equatable {
+    /// "the median of 24 frames" or "frame 12 at 0.400 s".
+    public let backgroundDescription: String
+    public let threshold: Double
+    /// Mean of the mask over all pixels and composited frames (0…1).
+    public let meanCoverage: Double
+    /// Pixels where no frame was ever masked in (they show the background only).
+    public let backgroundOnlyFraction: Double
+    public let inverted: Bool
+
+    public var summary: String {
+        String(format: "Background: %@ · threshold %.2f · moving pixels %.1f %% of frame·pixels · %.1f %% of the image is background only%@",
+               backgroundDescription, threshold, meanCoverage * 100, backgroundOnlyFraction * 100, inverted ? " · inverted" : "")
     }
 }
 
@@ -95,10 +115,16 @@ public struct CompositeResult: Sendable {
     public let weighting: WeightingReport?
     /// Present for the Median mode.
     public let median: MedianReport?
+    /// Present when a motion mask was applied.
+    public let motionMask: MotionMaskReport?
+    /// With a motion mask: per-pixel mean mask value over the composited
+    /// frames (0…1, output size) — where motion contributed.
+    public let coverage: [Float]?
 
     public init(image: LinearImage, framesComposited: Int, missingFrames: [FrameTime], decodeFailures: [DecodeFailure],
                 deliveredInPresentationOrder: Bool, elapsedSeconds: Double, alignment: AlignmentReport? = nil,
-                weighting: WeightingReport? = nil, median: MedianReport? = nil) {
+                weighting: WeightingReport? = nil, median: MedianReport? = nil, motionMask: MotionMaskReport? = nil,
+                coverage: [Float]? = nil) {
         self.image = image
         self.framesComposited = framesComposited
         self.missingFrames = missingFrames
@@ -108,6 +134,8 @@ public struct CompositeResult: Sendable {
         self.alignment = alignment
         self.weighting = weighting
         self.median = median
+        self.motionMask = motionMask
+        self.coverage = coverage
     }
 
     /// One-line explanation of why frames are missing, for the UI.
@@ -232,6 +260,7 @@ public final class CompositeRenderer: @unchecked Sendable {
         let band: Range<Int>?
         let passIndex: Int
         let passCount: Int
+        var masker: Masker?
 
         init(request: CompositeRequest, progress: (@Sendable (CompositeProgress) -> Void)?,
              band: Range<Int>? = nil, passIndex: Int = 0, passCount: Int = 1) {
@@ -257,6 +286,54 @@ public final class CompositeRenderer: @unchecked Sendable {
         func reportProgress() {
             progress?(CompositeProgress(framesComposited: seen.count, framesTotal: total, pass: passIndex + 1, passes: passCount))
         }
+    }
+
+    /// Per-render motion-mask state: the background at output size and the
+    /// running coverage sums (shared across band passes).
+    private final class Masker {
+        /// Settings with feather/clean-up radii scaled from native canvas
+        /// pixels to output pixels, so preview and export mask alike.
+        let settings: MotionMaskSettings
+        let background: LinearImage
+        let description: String
+        var coverageSums: [Float]
+        var framesMasked = 0
+
+        init(settings: MotionMaskSettings, background: LinearImage, description: String, scale: Double) {
+            var scaled = settings
+            scaled.feather = Int((Double(settings.feather) * scale).rounded())
+            scaled.cleanup = Int((Double(settings.cleanup) * scale).rounded())
+            self.settings = scaled
+            self.background = background
+            self.description = description
+            coverageSums = [Float](repeating: 0, count: background.width * background.height)
+        }
+    }
+
+    /// Renders the mask background at output size: the exact median of the
+    /// selection, or one selected frame.
+    private func makeMasker(for request: CompositeRequest) async throws -> Masker {
+        let settings = request.motionMask
+        var background: LinearImage
+        var description: String
+        if let t = settings.background.frameTime(in: request.frames) {
+            let single = CompositeRequest(source: request.source, frames: [t], blendMode: .normal, maxLongEdge: request.maxLongEdge,
+                                          alignment: request.alignment)
+            background = try await render(single).image
+            let index = request.frames.firstIndex(of: t) ?? 0
+            description = String(format: "frame %d at %.3f s", index, t.seconds)
+        } else {
+            let median = CompositeRequest(source: request.source, frames: request.frames, blendMode: .median, maxLongEdge: request.maxLongEdge,
+                                          alignment: request.alignment)
+            background = try await render(median).image
+            description = "the median of \(request.frames.count) frames"
+        }
+        // The background must be opaque for the final "over" to be opaque.
+        if ImageExporter.hasTransparency(background) {
+            background = GeometryProcessor.filled(background, with: SIMD3(0, 0, 0))
+        }
+        let scale = Double(background.size.longEdge) / Double(max(request.source.displaySize.longEdge, 1))
+        return Masker(settings: settings, background: background, description: description, scale: scale)
     }
 
     private func resetTallies(_ aligner: Aligner) {
@@ -310,11 +387,16 @@ public final class CompositeRenderer: @unchecked Sendable {
         if request.alignment.enabled, request.frames.count > 1 {
             aligner = try await makeAligner(for: request)
         }
+        var masker: Masker?
+        if request.motionMask.enabled {
+            masker = try await makeMasker(for: request)
+        }
         if request.blendMode.requiresFrameHistory {
-            return try await renderInBands(request, aligner: aligner, progress: progress, started: started)
+            return try await renderInBands(request, aligner: aligner, masker: masker, progress: progress, started: started)
         }
         let reduction = Reduction(request: request, progress: progress)
         reduction.aligner = aligner
+        reduction.masker = masker
         try await runPass(reduction)
         guard let reducer = reduction.reducer, reducer.count > 0 else {
             throw MediaError.noFramesDecoded
@@ -340,7 +422,7 @@ public final class CompositeRenderer: @unchecked Sendable {
     /// decoded once per band and each band's median is assembled into the
     /// final image. The alignment cache is shared across passes, so
     /// registration runs once.
-    private func renderInBands(_ request: CompositeRequest, aligner: Aligner?,
+    private func renderInBands(_ request: CompositeRequest, aligner: Aligner?, masker: Masker?,
                                progress: (@Sendable (CompositeProgress) -> Void)?, started: Date) async throws -> CompositeResult {
         let outputSize = request.source.displaySize.fitting(maxLongEdge: request.maxLongEdge)
         let plan = MedianPlan(outputSize: outputSize, frameCount: request.frames.count, memoryBudgetBytes: memoryBudgetBytes)
@@ -355,6 +437,7 @@ public final class CompositeRenderer: @unchecked Sendable {
             let reduction = Reduction(request: request, progress: progress, band: rows, passIndex: pass, passCount: plan.passes)
             if let aligner { resetTallies(aligner) }
             reduction.aligner = aligner
+            reduction.masker = masker
             try await runPass(reduction)
             guard let reducer = reduction.reducer, reducer.count > 0 else { throw MediaError.noFramesDecoded }
             guard reduction.outputSize == outputSize else {
@@ -416,8 +499,25 @@ public final class CompositeRenderer: @unchecked Sendable {
                 usedFlatFallback: selection.usedFlatFallback, effectiveFrameCount: effective, rawRange: selection.rawRange
             )
         }
+        var finalImage = image
+        var maskReport: MotionMaskReport?
+        var coverage: [Float]?
+        if let masker = reduction.masker, masker.background.size == image.size {
+            finalImage = MaskOps.over(image, background: masker.background)
+            let frames = max(masker.framesMasked / max(1, reduction.passCount), 1)
+            var mean = 0.0, backgroundOnly = 0
+            coverage = masker.coverageSums.map { $0 / Float(frames) }
+            for c in coverage! {
+                mean += Double(c)
+                if c <= 0 { backgroundOnly += 1 }
+            }
+            let pixels = Double(max(coverage!.count, 1))
+            maskReport = MotionMaskReport(backgroundDescription: masker.description, threshold: masker.settings.threshold,
+                                          meanCoverage: mean / pixels, backgroundOnlyFraction: Double(backgroundOnly) / pixels,
+                                          inverted: masker.settings.invert)
+        }
         return CompositeResult(
-            image: image,
+            image: finalImage,
             framesComposited: framesComposited,
             missingFrames: missing,
             decodeFailures: reduction.failures,
@@ -425,7 +525,9 @@ public final class CompositeRenderer: @unchecked Sendable {
             elapsedSeconds: Date().timeIntervalSince(started),
             alignment: report,
             weighting: weightingReport,
-            median: median
+            median: median,
+            motionMask: maskReport,
+            coverage: coverage
         )
     }
 
@@ -550,6 +652,26 @@ public final class CompositeRenderer: @unchecked Sendable {
             image = moved
         }
         renderFrame(image, sourceSize: size, outputSize: r.outputSize, band: r.band, into: &r.frameBuffer)
+        if let masker = r.masker {
+            // Mask against the background's rows for this band, multiply the
+            // frame by the mask, and accumulate coverage.
+            let rows = r.band ?? 0..<r.outputSize.height
+            let width = r.outputSize.width
+            let bandPixels = width * rows.count
+            let offset = rows.lowerBound * width * LinearImage.channelCount
+            let mask: [Float] = r.frameBuffer.withUnsafeBufferPointer { f in
+                masker.background.pixels.withUnsafeBufferPointer { b in
+                    let slice = UnsafeBufferPointer(rebasing: b[offset..<(offset + bandPixels * LinearImage.channelCount)])
+                    return MaskOps.mask(frame: f, background: slice, width: width, height: rows.count, settings: masker.settings)
+                }
+            }
+            r.frameBuffer.withUnsafeMutableBufferPointer { MaskOps.apply(mask, to: $0) }
+            let base = rows.lowerBound * width
+            masker.coverageSums.withUnsafeMutableBufferPointer { c in
+                for i in 0..<bandPixels { c[base + i] += mask[i] }
+            }
+            masker.framesMasked += 1
+        }
         if let weights = r.weights {
             // Average normalises Σw itself; Additive and the sequential modes
             // take the raw curve value; Lighten/Darken ignore it.

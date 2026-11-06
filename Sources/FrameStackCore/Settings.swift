@@ -34,10 +34,12 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
     public var geometry: GeometrySettings
     /// Temporal weighting (M6a). Absent = flat.
     public var weighting: WeightCurve
+    /// Motion mask (M6c). Absent = off.
+    public var motionMask: MotionMaskSettings
 
     public init(rangeStart: FrameTime, rangeEnd: FrameTime, samplingKind: SamplingKind, nth: Int, exactCount: Int,
                 blendMode: BlendMode, opacity: Double, alignment: AlignmentSettings = .off, geometry: GeometrySettings = .identity,
-                weighting: WeightCurve = .flat) {
+                weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off) {
         self.rangeStart = rangeStart
         self.rangeEnd = rangeEnd
         self.samplingKind = samplingKind
@@ -48,10 +50,11 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         self.alignment = alignment
         self.geometry = geometry
         self.weighting = weighting
+        self.motionMask = motionMask
     }
 
     private enum CodingKeys: String, CodingKey {
-        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment, geometry, weighting
+        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment, geometry, weighting, motionMask
     }
 
     public init(from decoder: Decoder) throws {
@@ -66,6 +69,7 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         alignment = try c.decodeIfPresent(AlignmentSettings.self, forKey: .alignment) ?? .off
         geometry = try c.decodeIfPresent(GeometrySettings.self, forKey: .geometry) ?? .identity
         weighting = try c.decodeIfPresent(WeightCurve.self, forKey: .weighting) ?? .flat
+        motionMask = try c.decodeIfPresent(MotionMaskSettings.self, forKey: .motionMask) ?? .off
     }
 
     public var samplingMode: SamplingMode {

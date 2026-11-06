@@ -38,6 +38,9 @@ struct PreviewSnapshot {
     let weighting: WeightingReport?
     /// How the Median was computed, for that mode.
     let median: MedianReport?
+    /// What the motion mask did, and where motion contributed (grayscale), when it was on.
+    let motionMask: MotionMaskReport?
+    let coverageImage: CGImage?
     /// Size of the rendered canvas before straighten/crop (`size` is after).
     let canvasSize: PixelSize
 }
@@ -130,6 +133,20 @@ final class AppModel: ObservableObject {
     @Published var geometry: GeometrySettings = .identity { didSet { if geometry != oldValue { settingsChanged() } } }
     /// Temporal weighting (M6a); undoable and saved.
     @Published var weighting: WeightCurve = .flat { didSet { if weighting != oldValue { settingsChanged() } } }
+    /// Motion mask (M6c); undoable and saved.
+    @Published var motionMask: MotionMaskSettings = .off { didSet { if motionMask != oldValue { settingsChanged() } } }
+    /// Show the mask coverage (where motion contributed) instead of the composite.
+    @Published var showMaskCoverage = false
+
+    /// Uses the frame under the playhead as the mask background.
+    func useMaskBackgroundAtPlayhead() {
+        guard let time = scrubTime else { return }
+        motionMask.background = .frame(time)
+    }
+
+    func useMedianMaskBackground() {
+        motionMask.background = .median
+    }
 
     /// The weights the current selection gets (for the curve preview).
     var currentWeights: WeightedSelection? {
@@ -261,7 +278,7 @@ final class AppModel: ObservableObject {
     var settings: CompositeSettings {
         CompositeSettings(rangeStart: rangeStart, rangeEnd: rangeEnd, samplingKind: samplingKind,
                           nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity, alignment: alignment,
-                          geometry: geometry, weighting: weighting)
+                          geometry: geometry, weighting: weighting, motionMask: motionMask)
     }
 
     var selectedTimes: [FrameTime] {
@@ -613,6 +630,7 @@ final class AppModel: ObservableObject {
         alignment = .off
         geometry = .identity
         weighting = .flat
+        motionMask = .off
         suppressChanges = false
         // Export choices follow the user from clip to clip, but a project's
         // choices do not leak into an unrelated video opened afterwards.
@@ -769,6 +787,7 @@ final class AppModel: ObservableObject {
         geometry = GeometrySettings(rotationDegrees: min(max(s.geometry.rotationDegrees, -GeometrySettings.maximumRotation), GeometrySettings.maximumRotation),
                                     crop: s.geometry.crop.clamped(in: info.displaySize), edgeFill: s.geometry.edgeFill)
         weighting = s.weighting
+        motionMask = s.motionMask
         exportSettings = project.export
         if let quality = project.ui.previewQuality.flatMap(PreviewQuality.init(rawValue:)) { previewQuality = quality }
         if let mode = project.ui.viewMode.flatMap(PreviewViewMode.init(rawValue:)) { viewMode = mode }
@@ -976,6 +995,7 @@ final class AppModel: ObservableObject {
         alignment = s.alignment
         geometry = s.geometry
         weighting = s.weighting
+        motionMask = s.motionMask
         suppressChanges = false
         settingsChanged()
     }
@@ -1026,6 +1046,7 @@ final class AppModel: ObservableObject {
         if old.geometry.crop != new.geometry.crop { return "Change Crop" }
         if old.geometry.edgeFill != new.geometry.edgeFill { return "Change Edge Fill" }
         if old.weighting != new.weighting { return "Change Weighting" }
+        if old.motionMask != new.motionMask { return "Change Motion Mask" }
         return "Change Settings"
     }
 
@@ -1047,7 +1068,8 @@ final class AppModel: ObservableObject {
             opacity: Float(opacity),
             maxLongEdge: previewQuality.maxLongEdge,
             alignment: alignment,
-            weighting: weighting
+            weighting: weighting,
+            motionMask: motionMask
         )
         let revision = settingsRevision
         renderActivity = .waiting
@@ -1064,9 +1086,18 @@ final class AppModel: ObservableObject {
                 let result = try await renderer.render(request) { [weak self] progress in
                     self?.reportPreviewProgress(progress, revision: revision)
                 }
-                let (image, finalSize) = try await Task.detached(priority: .userInitiated) {
+                let (image, finalSize, coverageImage) = try await Task.detached(priority: .userInitiated) {
                     let processed = try GeometryProcessor.apply(geometry, to: result.image)
-                    return (try ImageExporter.makeCGImage(processed, bitDepth: .eight, alpha: ImageExporter.hasTransparency(processed)), processed.size)
+                    var coverage: CGImage?
+                    if let c = result.coverage {
+                        // Grayscale: white where every frame moved, black where none did; same geometry as the composite.
+                        var pixels = [Float](repeating: 1, count: c.count * LinearImage.channelCount)
+                        for (p, v) in c.enumerated() { let o = p * 4; pixels[o] = v; pixels[o + 1] = v; pixels[o + 2] = v }
+                        let gray = try GeometryProcessor.apply(GeometrySettings(rotationDegrees: geometry.rotationDegrees, crop: geometry.crop, edgeFill: .black),
+                                                              to: LinearImage(width: result.image.width, height: result.image.height, pixels: pixels))
+                        coverage = try ImageExporter.makeCGImage(gray, bitDepth: .eight)
+                    }
+                    return (try ImageExporter.makeCGImage(processed, bitDepth: .eight, alpha: ImageExporter.hasTransparency(processed)), processed.size, coverage)
                 }.value
                 guard let self, !Task.isCancelled, revision == self.settingsRevision else { return }
                 self.preview = PreviewSnapshot(
@@ -1080,6 +1111,8 @@ final class AppModel: ObservableObject {
                     alignment: result.alignment,
                     weighting: result.weighting,
                     median: result.median,
+                    motionMask: result.motionMask,
+                    coverageImage: coverageImage,
                     canvasSize: result.image.size
                 )
                 self.renderActivity = .idle
@@ -1141,7 +1174,8 @@ final class AppModel: ObservableObject {
             opacity: Float(opacity),
             maxLongEdge: exportSettings.sizing.maxLongEdge(for: source.displaySize),
             alignment: alignment,
-            weighting: weighting
+            weighting: weighting,
+            motionMask: motionMask
         )
         let settings = exportSettings
         let geometry = geometry
