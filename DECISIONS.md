@@ -19,7 +19,7 @@ Format: date · decision · alternatives · reason · revisit when. PRD deviatio
 ### D-003 · 2026-11-06 · Deployment target macOS 14
 - **Decision:** `platforms: [.macOS(.v14)]`, Swift tools 5.9 (Swift 5 language mode).
 - **Alternatives:** macOS 13 (loses nothing essential yet, but 14 gives `NSApp.activate()`, newer SwiftUI); macOS 15 (unnecessarily excludes Sonoma).
-- **Reason:** The owner's Mac/Xcode version is **unknown** (PRD §0 says not to invent it). CI uses macOS 15 / Xcode 16. macOS 14 is a conservative modern floor that needs Xcode 15+.
+- **Reason:** The owner's Mac/Xcode version is **unknown** (PRD §0 says not to invent it). CI (macOS 15.8.2, Xcode 16.4, Swift 6.1.2, Apple Silicon) builds and tests it. macOS 14 is a conservative modern floor that needs Xcode 15+; building with Xcode 15 itself has not been tested.
 - **Revisit when:** The owner reports their macOS and Xcode versions.
 
 ### D-004 · 2026-11-06 · Working color space and Average math

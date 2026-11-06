@@ -5,10 +5,10 @@ Living checklist (AGENTS.md §2). Status keys: `[x]` done and verified · `[~]` 
 
 ## Current status (update every session)
 
-- **Milestone:** M1 — core vertical slice.
-- **State:** M0 + M1 code complete; verification is via GitHub Actions macOS CI (see Verification log).
-- **Next task:** Owner manual GUI check of M1 on their Mac (README "Manual verification"), then start M2 (blend reducers in `FrameStackCore/Compositing.swift`).
-- **Blockers / open questions for owner (non-blocking):** target Mac model + macOS + Xcode version (D-003); a couple of real source clips (phone + camera, ideally one portrait and one 10-bit/HDR) for photographic acceptance tests.
+- **Milestone:** M1 — core vertical slice. **Engine verified on macOS CI; GUI awaiting the owner's manual pass.**
+- **Last CI:** run 42248417651 on commit 8126110 — macOS 15.8.2, Xcode 16.4, Swift 6.1.2, Apple M1 (virtual): debug build OK, **56/56 tests passed**, release `.app` bundle built.
+- **Next task:** Owner runs the README "Manual verification" checklist on their Mac and reports issues → fix → mark M1 done. Then M2: generalize the reducer in `FrameStackCore/Compositing.swift` and add Lighten/Darken first (streaming, simplest), with 1×1 reference tests and fixture renders.
+- **Blockers / open questions for owner (non-blocking):** target Mac model + macOS + Xcode version (D-003); a few real clips (phone + camera; one portrait; one 10-bit/HDR) for photographic acceptance; whether to create a `main` branch so work can go through pull requests (the repo currently has only `claude/determined-planck-58a6hw`).
 
 ## Architecture (summary)
 
@@ -56,20 +56,27 @@ CI: `.github/workflows/ci.yml` runs build, tests, release app bundle; uploads te
 - [x] Deterministic fixtures + generator script — D-010
 - [x] CI on macOS runner (build, test, app bundle, artifacts)
 - [x] README, IMPLEMENTATION_PLAN.md, DECISIONS.md
-- [~] **Exit:** native app builds and tests execute → see Verification log
+- [x] **Exit:** native app builds and tests execute — CI run 42248417651
 
 ## M1 — Core vertical slice (P0)
-- [~] Import: open panel + drag & drop; metadata (pixels, orientation, duration, nominal fps, codec, color tags, HDR/PAR warnings); decode probe with clear unsupported-codec error
-- [~] Timestamp scan mapped through the edit list (decode fallback); scanned count replaces labeled estimate
-- [~] `[start, end)` numeric range (µs precision, exact rational), Full Clip reset
-- [~] Sampling All / Every Nth / Exact Count, clamping notice, live "N in range → K selected", timeline strip with range + sample ticks
-- [~] Decode selected frames by exact timestamp; missing frames reported
-- [~] Equal-weight Average in linear light, Float64 accumulation, bounded memory
-- [~] Preview: async, debounced, cancellable, revision-tagged, outdated indicator, progress, 1080/2160/Full
-- [~] Export: full-res PNG 8/16-bit sRGB, progress + cancel, atomic write, read-back verification, Show in Finder
-- [~] Tests: sampler (PRD list), time, average (fixed refs, precision, bit-exact identical frames), color (linear vs encoded), orientation, import/scan (5 s/30 fps = 150 exact timestamps), frame identity across B-frames, moving square, black/white linear test, portrait, preview≈export, cancellation, missing/corrupt files, PNG 8/16 round trip
+Engine (verified by automated tests on macOS CI):
+- [x] Import metadata (pixels, orientation, duration, nominal fps, codec, color tags, HDR/PAR warnings) + decode probe; missing/corrupt files fail with clear errors
+- [x] Timestamp scan mapped through the edit list (decode fallback); equals decoder timestamps on every fixture; 5 s/30 fps → exactly 150 timestamps i/30
+- [x] `[start, end)` exact rational ranges; All / Every Nth / Exact Count with clamping notice (PRD §11.1 sampler list)
+- [x] Selected frames decoded by exact timestamp (frame identity verified across B-frames and a trimming edit list); missing frames reported
+- [x] Equal-weight Average in linear light, Float64 accumulation, memory bounded by output size; fixed reference values on real decoded clips
+- [x] Reduced-resolution preview path matches full resolution within tolerance
+- [x] Cancellation mid-render; renderer reusable afterwards
+- [x] PNG export 8/16-bit sRGB: full resolution, atomic write, bit depth + profile verified by read-back, pixel values match
+- [x] Portrait (90° display matrix) renders upright
+
+App UI (compiles; not exercisable in CI — owner manual pass):
+- [~] Open panel + drag & drop; inspector source info; estimate → scanned count
+- [~] Range fields (µs precision) + Full Clip; sampling controls; "N in range → K selected"; timeline strip with sample ticks
+- [~] Debounced (250 ms) cancellable preview, "Preview outdated" indicator, progress + Cancel, 1080/2160/Full quality
+- [~] Export panel, progress + Cancel, verified result summary, Show in Finder
 - [ ] Owner manual GUI pass (README checklist)
-- **Exit:** real 5 s/30 fps clip + synthetic tests pass incl. actual file export → CI log below; GUI pass by owner.
+- **Exit:** real 5 s/30 fps clip + synthetic tests incl. actual file export — **met on CI**; GUI pass by owner pending.
 
 ## M2 — Essential creative blending (P1)
 - [ ] Generalize reducer protocol (`accumulate(frame)`, `finish()`), chronological-order guarantee (renderer already reports `deliveredInPresentationOrder`; enforce for order-dependent modes)
@@ -128,4 +135,5 @@ CI: `.github/workflows/ci.yml` runs build, tests, release app bundle; uploads te
 |---|---|---|---|
 | 2026-11-06 | Linux container | `python3 scripts/make_fixtures.py` + ffmpeg decode check | 150/150 frame-index codes decode correctly; moving-square linear avg → 81.5/255 (gamma avg 21.2); black/white linear avg → 187.5/255; portrait display matrix (0,1,−1,0) |
 | 2026-11-06 | GitHub Actions macos-15, run 42247670128 (commit e26f890) | `swift build`, `swift test` | Build OK. 54 tests ran; 4 tests failed (166 assertion failures), all from one bug: sample-table timestamps were in media time, decoder timestamps in presentation time (edit list ignored) → timestamp k decoded frame k+2 on the B-frame clip. Fixed in the next commit (D-006). |
-| 2026-11-06 | GitHub Actions macos-15 | `swift build`, `swift test`, `scripts/make_app_bundle.sh` | _pending — second run_ |
+| 2026-11-06 | GitHub Actions macos-15 (macOS 15.8.2, Xcode 16.4, Swift 6.1.2, Apple M1 virtual), run 42248417651 (commit 8126110) | `swift build`, `swift test`, `scripts/make_app_bundle.sh` | Build OK; **56 tests, 0 failures** (8.5 s); release app bundle built and Info.plist lints OK. Rendered PNGs uploaded as artifact `framestack-ci-2`. |
+| — | — | GUI | Not executed anywhere yet (no display in CI) — owner checklist in README. |
