@@ -451,3 +451,58 @@ final class AppModelTests: XCTestCase {
         XCTAssertNotNil(failure)
     }
 }
+
+@MainActor
+final class UndoNamingTests: XCTestCase {
+    /// The window's UndoManager groups by event: our interactive group is
+    /// nested inside the event's group, and the Edit menu shows the
+    /// top-level name. A slider drag must still read "Undo Straighten".
+    func testInteractiveEditNamesTheTopLevelGroup() async throws {
+        let model = AppModel(defaults: UserDefaults(suiteName: "UndoNaming-\(UUID().uuidString)")!)
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        let here = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("FrameStackMediaTests/Fixtures/handheld_8f.mp4")
+        model.open(here)
+        let deadline = Date().addingTimeInterval(20)
+        while !{ if case .ready = model.sourceState { return true } else { return false } }() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        // Simulate the event group the window opens around each mouse event.
+        undo.beginUndoGrouping()
+        model.beginInteractiveEdit()
+        model.geometry.rotationDegrees = 2
+        model.geometry.rotationDegrees = 3
+        model.endInteractiveEdit()
+        undo.endUndoGrouping()
+        XCTAssertEqual(undo.undoActionName, "Straighten")
+        undo.undo()
+        XCTAssertEqual(model.geometry.rotationDegrees, 0, "one step for the whole drag")
+        XCTAssertEqual(undo.redoActionName, "Straighten")
+    }
+}
+
+@MainActor
+final class UndoNamingEventGroupTests: XCTestCase {
+    /// Like the window: a manager that groups by event, with the run loop
+    /// closing the automatic group.
+    func testNamesSurviveTheAutomaticEventGroup() async throws {
+        let model = AppModel(defaults: UserDefaults(suiteName: "UndoNamingEvent-\(UUID().uuidString)")!)
+        let undo = UndoManager()   // groupsByEvent = true
+        model.undoManager = undo
+        let here = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("FrameStackMediaTests/Fixtures/handheld_8f.mp4")
+        model.open(here)
+        let deadline = Date().addingTimeInterval(20)
+        while !{ if case .ready = model.sourceState { return true } else { return false } }() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        model.alignment.enabled = true
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(undo.undoActionName, "Change Alignment")
+        XCTAssertEqual(undo.undoMenuItemTitle, "Undo Change Alignment")
+    }
+}

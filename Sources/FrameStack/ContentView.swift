@@ -102,6 +102,14 @@ private struct PreviewArea: View {
             VStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle").font(.largeTitle).foregroundStyle(.orange)
                 Text(message).multilineTextAlignment(.center).frame(maxWidth: 420)
+                if model.mixedSizeRetry != nil {
+                    HStack {
+                        Button("Fit All Into the First Image's Size") { model.setSequence(canvasPolicy: .fit) }
+                        Button("Fill (Crop Overflow)") { model.setSequence(canvasPolicy: .fill) }
+                    }
+                    Text("Both scale uniformly and centre each image; Fit leaves transparent bars, Fill crops. Nothing is stretched.")
+                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
+                }
                 Button("Open Another…") { model.presentOpenPanel() }
             }
             .padding()
@@ -123,7 +131,10 @@ private struct PreviewArea: View {
         }
     }
 
-    private var fullSize: PixelSize { model.source?.displaySize ?? PixelSize(width: 1, height: 1) }
+    /// Full-resolution size of the composite as shown (after crop).
+    private var fullSize: PixelSize { model.displayedFullSize }
+    /// Full-resolution size of the source frame (the Original view, uncropped).
+    private var sourceFullSize: PixelSize { model.source?.displaySize ?? PixelSize(width: 1, height: 1) }
 
     @ViewBuilder
     private var composite: some View {
@@ -155,10 +166,16 @@ private struct PreviewArea: View {
 
     /// The alignment valid area in full-resolution pixels.
     private func safeArea(of preview: PreviewSnapshot) -> CGRect? {
-        guard let area = preview.alignment?.validArea, !area.isNull, preview.size.width > 0, preview.size.height > 0 else { return nil }
+        guard let area = preview.alignment?.validArea, !area.isNull, preview.size.width > 0, preview.size.height > 0,
+              model.geometry.rotationDegrees == 0 else { return nil }   // a straightened canvas has no axis-aligned safe area to draw
+        // The preview may be cropped: move the area into the cropped image's space.
+        let cropOrigin = model.geometry.crop.pixelRect(in: preview.canvasSize).origin
+        let shifted = area.offsetBy(dx: -cropOrigin.x, dy: -cropOrigin.y)
+            .intersection(CGRect(x: 0, y: 0, width: preview.size.width, height: preview.size.height))
+        guard !shifted.isNull else { return nil }
         let sx = CGFloat(fullSize.width) / CGFloat(preview.size.width)
         let sy = CGFloat(fullSize.height) / CGFloat(preview.size.height)
-        return CGRect(x: area.minX * sx, y: area.minY * sy, width: area.width * sx, height: area.height * sy)
+        return CGRect(x: shifted.minX * sx, y: shifted.minY * sy, width: shifted.width * sx, height: shifted.height * sy)
     }
 
     @ViewBuilder
@@ -166,7 +183,7 @@ private struct PreviewArea: View {
         if let frame = model.sourceFrame {
             ZoomableImageView(
                 image: frame.image,
-                fullSize: fullSize,
+                fullSize: sourceFullSize,
                 zoom: model.zoom,
                 onZoomChange: { model.zoom = $0 },
                 caption: "Original · frame \(frame.index) · \(Format.seconds(frame.time.seconds))"

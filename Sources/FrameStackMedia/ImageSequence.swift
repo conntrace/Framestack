@@ -19,6 +19,28 @@ public struct ImageSequenceFile: Sendable, Equatable {
     public var fileName: String { url.lastPathComponent }
 }
 
+/// How stills whose size differs from the canvas (the first image's size)
+/// are placed. Never silent: `strict` refuses them, the others are the
+/// user's explicit choice and are reported in the Source section.
+public enum CanvasPolicy: String, Sendable, Codable, CaseIterable, Identifiable {
+    /// Every image must match the canvas (default).
+    case strict
+    /// Scale uniformly to fit inside the canvas, centred; the rest is transparent.
+    case fit
+    /// Scale uniformly to cover the canvas, centred; the overflow is cropped.
+    case fill
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .strict: return "Same size only"
+        case .fit: return "Fit"
+        case .fill: return "Fill"
+        }
+    }
+}
+
 /// A folder (or chosen set) of stills treated as frames on a synthetic
 /// time axis: frame *i* sits at `i / framesPerSecond` **sequence seconds**.
 /// These are not recorded timestamps (PRD §4.2) and the UI labels them so.
@@ -36,16 +58,22 @@ public struct ImageSequenceInfo: Sendable, Equatable {
     public let reversed: Bool
     /// Names in the folder that are not decodable images and were ignored.
     public let skippedFileNames: [String]
+    /// How images that are not the canvas size are placed.
+    public let canvasPolicy: CanvasPolicy
 
     public init(folderURL: URL, files: [ImageSequenceFile], displaySize: PixelSize, framesPerSecond: Double,
-                reversed: Bool, skippedFileNames: [String]) {
+                reversed: Bool, skippedFileNames: [String], canvasPolicy: CanvasPolicy = .strict) {
         self.folderURL = folderURL
         self.files = files
         self.displaySize = displaySize
         self.framesPerSecond = framesPerSecond
         self.reversed = reversed
         self.skippedFileNames = skippedFileNames
+        self.canvasPolicy = canvasPolicy
     }
+
+    /// Files whose oriented size differs from the canvas.
+    public var resizedFiles: [ImageSequenceFile] { files.filter { $0.pixelSize != displaySize } }
 
     public var fileName: String { folderURL.lastPathComponent }
     public var count: Int { files.count }
@@ -110,6 +138,11 @@ public struct ImageSequenceInfo: Sendable, Equatable {
         if hasAlpha {
             w.append("Some images have transparency: transparent pixels count as no light in the composite; PNG/TIFF exports keep the alpha channel, JPEG flattens onto black.")
         }
+        let resized = resizedFiles
+        if !resized.isEmpty {
+            let how = canvasPolicy == .fit ? "scaled to fit inside" : "scaled to fill"
+            w.append("\(resized.count) image\(resized.count == 1 ? " is" : "s are") not \(displaySize) and \(resized.count == 1 ? "is" : "are") \(how) the canvas (\(canvasPolicy == .fit ? "transparent bars where they do not reach" : "overflow cropped")). Nothing is stretched.")
+        }
         return w
     }
 
@@ -117,7 +150,18 @@ public struct ImageSequenceInfo: Sendable, Equatable {
     public func with(framesPerSecond: Double? = nil, reversed: Bool? = nil) -> ImageSequenceInfo {
         ImageSequenceInfo(folderURL: folderURL, files: files, displaySize: displaySize,
                           framesPerSecond: framesPerSecond ?? self.framesPerSecond,
-                          reversed: reversed ?? self.reversed, skippedFileNames: skippedFileNames)
+                          reversed: reversed ?? self.reversed, skippedFileNames: skippedFileNames, canvasPolicy: canvasPolicy)
+    }
+
+    /// Uniform scale and offset that place a `size` still on the canvas
+    /// under the policy (Core Image coordinates, origin bottom-left).
+    public func placement(for size: PixelSize) -> (scale: Double, offset: CGPoint) {
+        guard size != displaySize, canvasPolicy != .strict else { return (1, .zero) }
+        let sx = Double(displaySize.width) / Double(size.width)
+        let sy = Double(displaySize.height) / Double(size.height)
+        let scale = canvasPolicy == .fit ? min(sx, sy) : max(sx, sy)
+        let w = Double(size.width) * scale, h = Double(size.height) * scale
+        return (scale, CGPoint(x: (Double(displaySize.width) - w) / 2, y: (Double(displaySize.height) - h) / 2))
     }
 }
 
@@ -138,7 +182,7 @@ public enum ImageSequenceLoader {
     /// Loads a sequence from a folder, from one image (its whole folder) or
     /// from an explicit set of files. Reads only image headers.
     public static func load(_ urls: [URL], framesPerSecond: Double = ImageSequenceInfo.defaultFramesPerSecond,
-                            reversed: Bool = false) async throws -> ImageSequenceInfo {
+                            reversed: Bool = false, canvasPolicy: CanvasPolicy = .strict) async throws -> ImageSequenceInfo {
         guard let first = urls.first else { throw MediaError.noImagesFound(path: "") }
         let folder: URL
         var candidates: [URL]
@@ -152,13 +196,15 @@ public enum ImageSequenceLoader {
             folder = first.deletingLastPathComponent()
             candidates = urls
         }
-        return try await load(folder: folder, candidates: candidates, framesPerSecond: framesPerSecond, reversed: reversed)
+        return try await load(folder: folder, candidates: candidates, framesPerSecond: framesPerSecond, reversed: reversed,
+                              canvasPolicy: canvasPolicy)
     }
 
     /// Rebuilds a saved sequence: exactly these file names inside `folder`.
-    public static func load(folder: URL, fileNames: [String], framesPerSecond: Double, reversed: Bool) async throws -> ImageSequenceInfo {
+    public static func load(folder: URL, fileNames: [String], framesPerSecond: Double, reversed: Bool,
+                            canvasPolicy: CanvasPolicy = .strict) async throws -> ImageSequenceInfo {
         try await load(folder: folder, candidates: fileNames.map { folder.appendingPathComponent($0) },
-                       framesPerSecond: framesPerSecond, reversed: reversed)
+                       framesPerSecond: framesPerSecond, reversed: reversed, canvasPolicy: canvasPolicy)
     }
 
     static func contents(of folder: URL) throws -> [URL] {
@@ -170,7 +216,8 @@ public enum ImageSequenceLoader {
         }
     }
 
-    private static func load(folder: URL, candidates: [URL], framesPerSecond: Double, reversed: Bool) async throws -> ImageSequenceInfo {
+    private static func load(folder: URL, candidates: [URL], framesPerSecond: Double, reversed: Bool,
+                             canvasPolicy: CanvasPolicy) async throws -> ImageSequenceInfo {
         guard framesPerSecond > 0, framesPerSecond.isFinite else {
             throw MediaError.invalidSequenceRate(framesPerSecond)
         }
@@ -194,14 +241,14 @@ public enum ImageSequenceLoader {
             throw MediaError.noImagesFound(path: folder.path)
         }
         let mismatched = files.filter { $0.pixelSize != canvas }
-        if !mismatched.isEmpty {
+        if !mismatched.isEmpty, canvasPolicy == .strict {
             throw MediaError.mixedImageSizes(
                 canvas: canvas, canvasFile: files[0].fileName,
                 offenders: mismatched.prefix(5).map { "\($0.fileName) \($0.pixelSize)" }, count: mismatched.count
             )
         }
         return ImageSequenceInfo(folderURL: folder, files: files, displaySize: canvas, framesPerSecond: framesPerSecond,
-                                 reversed: reversed, skippedFileNames: skipped)
+                                 reversed: reversed, skippedFileNames: skipped, canvasPolicy: canvasPolicy)
     }
 
     /// Header-only description; nil when ImageIO cannot read the file.

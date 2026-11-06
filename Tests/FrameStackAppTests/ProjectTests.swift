@@ -1,4 +1,6 @@
+import CoreGraphics
 import FrameStackCore
+import ImageIO
 import FrameStackMedia
 @testable import FrameStack
 import XCTest
@@ -536,5 +538,177 @@ final class AlignmentAppTests: XCTestCase {
         """
         let settings = try JSONDecoder().decode(CompositeSettings.self, from: Data(json.utf8))
         XCTAssertEqual(settings.alignment, .off)
+    }
+}
+
+// MARK: - Crop, straighten, canvas policy (M5c)
+
+@MainActor
+final class GeometryAppTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("FrameStackGeoApp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var fixtures: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("FrameStackMediaTests/Fixtures")
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 20, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func waitReady(_ model: AppModel) async throws {
+        try await waitUntil { if case .ready = model.sourceState { return true } else { return false } }
+        try await waitUntil { model.isPreviewCurrent }
+    }
+
+    private func makeModel() -> AppModel {
+        AppModel(defaults: UserDefaults(suiteName: "GeometryAppTests-\(UUID().uuidString)")!)
+    }
+
+    func testCropStraightenSafeAreaUndoProjectAndExport() async throws {
+        let model = makeModel()
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        model.open(fixtures.appendingPathComponent("handheld_8f.mp4"))   // 320×180
+        try await waitReady(model)
+        XCTAssertEqual(model.preview?.size, PixelSize(width: 320, height: 180))
+        XCTAssertEqual(model.cropPixels, CGRect(x: 0, y: 0, width: 320, height: 180))
+        XCTAssertFalse(model.canCropToSafeArea, "nothing aligned, no angle")
+
+        // Crop by pixels: preview and export sizes follow; undo name.
+        model.setCropPixels(CGRect(x: 20, y: 10, width: 200, height: 100))
+        XCTAssertEqual(undo.undoActionName, "Change Crop")
+        XCTAssertEqual(model.exportOutputSize, PixelSize(width: 200, height: 100))
+        XCTAssertEqual(model.displayedFullSize, PixelSize(width: 200, height: 100))
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.preview?.size, PixelSize(width: 200, height: 100))
+        XCTAssertEqual(model.preview?.canvasSize, PixelSize(width: 320, height: 180))
+        model.setCropPixels(CGRect(x: 300, y: 0, width: 500, height: 50))
+        XCTAssertEqual(model.cropPixels, CGRect(x: 0, y: 0, width: 320, height: 50), "clamped into the canvas")
+        model.exportSettings.sizing = .percent(50)
+        XCTAssertEqual(model.exportOutputSize, PixelSize(width: 160, height: 25), "crop scales with the output size")
+        model.exportSettings.sizing = .native
+
+        // Straighten then crop to the largest valid rectangle: no transparency remains.
+        model.resetCrop()
+        model.geometry.rotationDegrees = 5
+        XCTAssertEqual(undo.undoActionName, "Straighten")
+        XCTAssertTrue(model.canCropToSafeArea)
+        try await waitUntil { model.isPreviewCurrent }
+        model.cropToSafeArea()
+        XCTAssertLessThan(model.cropPixels.width, 320)
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.suggestedExportName.hasSuffix("px.png"), true, model.suggestedExportName)
+
+        // With alignment on, the safe area comes from the report.
+        model.resetGeometry()
+        model.alignment.enabled = true
+        try await waitUntil { model.isPreviewCurrent }
+        let report = try XCTUnwrap(model.preview?.alignment)
+        model.cropToSafeArea()
+        XCTAssertEqual(model.cropPixels.minX, report.validArea.minX.rounded(), accuracy: 1)
+        XCTAssertEqual(model.cropPixels.width, report.validArea.width.rounded(), accuracy: 1)
+        try await waitUntil { model.isPreviewCurrent }
+        let preview = try XCTUnwrap(model.preview)
+        XCTAssertEqual(preview.size.width, Int(model.cropPixels.width))
+
+        // Edge fill white → the export has no alpha.
+        model.geometry.crop = .full
+        model.geometry.edgeFill = .white
+        XCTAssertEqual(undo.undoActionName, "Change Edge Fill")
+        try await waitUntil { model.isPreviewCurrent }
+        model.exportSettings = ExportSettings(format: .png, bitDepth: .eight)
+        let out = directory.appendingPathComponent("filled.png")
+        model.export(to: out)
+        try await waitUntil { !model.isExporting }
+        guard case let .finished(exported, _, _) = model.exportActivity else { return XCTFail("\(model.exportActivity)") }
+        XCTAssertFalse(exported.hasAlpha, "white fill made it opaque")
+        XCTAssertEqual(exported.width, 320)
+
+        // Saved and restored.
+        let projectURL = directory.appendingPathComponent("geo.framestack")
+        model.geometry.crop = NormalizedRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+        XCTAssertTrue(model.save(to: projectURL))
+        let text = try String(contentsOf: projectURL, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"geometry\" : {"), text)
+        XCTAssertTrue(text.contains("\"edgeFill\" : \"white\""), text)
+        let reopened = makeModel()
+        reopened.open(projectURL)
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.geometry, model.geometry)
+        XCTAssertEqual(reopened.preview?.size, PixelSize(width: 160, height: 90))
+
+        // Undo all the way back restores the identity geometry.
+        while undo.canUndo { undo.undo() }
+        XCTAssertEqual(model.geometry, .identity)
+    }
+
+    func testAlignmentAndGeometryResetWhenAnotherSourceOpens() async throws {
+        let model = makeModel()
+        model.open(fixtures.appendingPathComponent("handheld_8f.mp4"))
+        try await waitReady(model)
+        model.alignment.enabled = true
+        model.geometry.rotationDegrees = 3
+        model.blendMode = .lighten
+        try await waitUntil { model.isPreviewCurrent }
+        model.open(fixtures.appendingPathComponent("count_5s_30fps.mp4"))
+        try await waitReady(model)
+        XCTAssertEqual(model.alignment, .off)
+        XCTAssertEqual(model.geometry, .identity)
+        XCTAssertEqual(model.blendMode, .lighten, "blend carries over like a preference")
+        XCTAssertNil(model.preview?.alignment)
+    }
+
+    func testMixedSizeFolderOffersFitAndFill() async throws {
+        let folder = directory.appendingPathComponent("mixed")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let seq = fixtures.appendingPathComponent("sequence_png_12f")
+        try FileManager.default.copyItem(at: seq.appendingPathComponent("frame_0.png"), to: folder.appendingPathComponent("a_0.png"))
+        // A half-size copy, written through CoreGraphics.
+        let src = CGImageSourceCreateWithURL(seq.appendingPathComponent("frame_1.png") as CFURL, nil)!
+        let image = CGImageSourceCreateImageAtIndex(src, 0, nil)!
+        let ctx = CGContext(data: nil, width: 80, height: 45, bitsPerComponent: 8, bytesPerRow: 320,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: 80, height: 45))
+        let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("a_1.png") as CFURL, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(dest, ctx.makeImage()!, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+
+        let model = makeModel()
+        model.open(folder)
+        try await waitUntil { if case .failed = model.sourceState { return true } else { return false } }
+        XCTAssertNotNil(model.mixedSizeRetry, "the failed state offers Fit / Fill")
+        model.setSequence(canvasPolicy: .fit)
+        try await waitReady(model)
+        XCTAssertEqual(model.imageSequence?.canvasPolicy, .fit)
+        XCTAssertEqual(model.imageSequence?.count, 2)
+        XCTAssertNil(model.mixedSizeRetry)
+        XCTAssertTrue(model.source?.warnings.contains { $0.contains("scaled to fit") } ?? false)
+        XCTAssertEqual(model.preview?.size, PixelSize(width: 160, height: 90))
+
+        // Saved with the policy; switching to Fill reloads.
+        let projectURL = directory.appendingPathComponent("mixed.framestack")
+        XCTAssertTrue(model.save(to: projectURL))
+        XCTAssertTrue(try String(contentsOf: projectURL, encoding: .utf8).contains("\"canvasPolicy\" : \"fit\""))
+        model.setSequence(canvasPolicy: .fill)
+        try await waitReady(model)
+        XCTAssertEqual(model.imageSequence?.canvasPolicy, .fill)
+        let reopened = makeModel()
+        reopened.open(projectURL)
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.imageSequence?.canvasPolicy, .fit)
     }
 }

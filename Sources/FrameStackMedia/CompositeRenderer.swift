@@ -474,9 +474,22 @@ public final class CompositeRenderer: @unchecked Sendable {
                 // Apply the EXIF orientation the loader read from the header
                 // (the same value the inspector and the canvas size use).
                 let orientation = CGImagePropertyOrientation(rawValue: UInt32(file.orientation)) ?? .up
-                let image = orientation == .up ? decoded : decoded.oriented(orientation)
+                var image = orientation == .up ? decoded : decoded.oriented(orientation)
                 let origin = image.extent.origin
-                try consume(image.transformed(by: CGAffineTransform(translationX: -origin.x, y: -origin.y)), at: pts, into: r)
+                image = image.transformed(by: CGAffineTransform(translationX: -origin.x, y: -origin.y))
+                if file.pixelSize != sequence.displaySize, sequence.canvasPolicy != .strict {
+                    // Fit/Fill onto the canvas (uniform scale, centred); the
+                    // canvas extent is kept so coverage lands in alpha.
+                    let (scale, offset) = sequence.placement(for: file.pixelSize)
+                    let canvas = CGRect(x: 0, y: 0, width: sequence.displaySize.width, height: sequence.displaySize.height)
+                    image = image.clampedToExtent()
+                        .applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: scale, kCIInputAspectRatioKey: 1.0])
+                        .cropped(to: CGRect(x: 0, y: 0, width: Double(file.pixelSize.width) * scale, height: Double(file.pixelSize.height) * scale))
+                        .transformed(by: CGAffineTransform(translationX: offset.x, y: offset.y))
+                        .composited(over: CIImage(color: .clear).cropped(to: canvas))
+                        .cropped(to: canvas)
+                }
+                try consume(image, at: pts, into: r)
             }
         }
     }

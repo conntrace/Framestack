@@ -98,15 +98,29 @@ public struct SequenceReference: Sendable, Codable, Equatable {
     public var fileNames: [String]
     public var framesPerSecond: Double
     public var reversed: Bool
+    /// Absent in documents written before Fit/Fill existed = strict.
+    public var canvasPolicy: CanvasPolicy
 
-    public init(fileNames: [String], framesPerSecond: Double, reversed: Bool) {
+    public init(fileNames: [String], framesPerSecond: Double, reversed: Bool, canvasPolicy: CanvasPolicy = .strict) {
         self.fileNames = fileNames
         self.framesPerSecond = framesPerSecond
         self.reversed = reversed
+        self.canvasPolicy = canvasPolicy
     }
 
     public init(_ sequence: ImageSequenceInfo) {
-        self.init(fileNames: sequence.files.map(\.fileName), framesPerSecond: sequence.framesPerSecond, reversed: sequence.reversed)
+        self.init(fileNames: sequence.files.map(\.fileName), framesPerSecond: sequence.framesPerSecond, reversed: sequence.reversed,
+                  canvasPolicy: sequence.canvasPolicy)
+    }
+
+    private enum CodingKeys: String, CodingKey { case fileNames, framesPerSecond, reversed, canvasPolicy }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        fileNames = try c.decode([String].self, forKey: .fileNames)
+        framesPerSecond = try c.decode(Double.self, forKey: .framesPerSecond)
+        reversed = try c.decode(Bool.self, forKey: .reversed)
+        canvasPolicy = try c.decodeIfPresent(CanvasPolicy.self, forKey: .canvasPolicy) ?? .strict
     }
 }
 

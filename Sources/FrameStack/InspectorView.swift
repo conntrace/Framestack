@@ -23,6 +23,7 @@ struct InspectorView: View {
                         InspectorSection(title: "Sampling", key: "sampling") { SamplingSection() }
                         InspectorSection(title: "Blend", key: "blend") { BlendSection() }
                         InspectorSection(title: "Alignment", key: "alignment") { AlignmentSection() }
+                        InspectorSection(title: "Crop & Straighten", key: "geometry") { GeometrySection() }
                         InspectorSection(title: "Export", key: "export") { ExportSection() }
                     }
                 } else {
@@ -217,6 +218,18 @@ private struct SequenceSourceSection: View {
             .font(.callout)
             Toggle("Reverse order", isOn: reversedBinding)
                 .font(.callout)
+            HStack {
+                Text("Canvas").foregroundStyle(.secondary)
+                Spacer()
+                Picker("Canvas", selection: policyBinding) {
+                    ForEach(CanvasPolicy.allCases) { Text($0.displayName).tag($0) }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(width: 150)
+            }
+            .font(.callout)
+            .help("How stills that are not the first image's size are placed: refused, scaled to fit (transparent bars) or scaled to fill (overflow cropped).")
             Text("Stills have no recorded timestamps: times are **sequence time** (image index ÷ rate), \(Format.duration(sequence.duration.seconds)) for \(sequence.count) images.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -240,6 +253,10 @@ private struct SequenceSourceSection: View {
 
     private var reversedBinding: Binding<Bool> {
         Binding(get: { sequence.reversed }, set: { model.setSequence(reversed: $0) })
+    }
+
+    private var policyBinding: Binding<CanvasPolicy> {
+        Binding(get: { sequence.canvasPolicy }, set: { model.setSequence(canvasPolicy: $0) })
     }
 }
 
@@ -484,7 +501,7 @@ private struct AlignmentSection: View {
                         .foregroundStyle(report.failedFrames.isEmpty ? Color.secondary : Color.orange)
                         .fixedSize(horizontal: false, vertical: true)
                     if !report.validArea.isNull {
-                        Text("Safe area \(Int(report.validArea.width))×\(Int(report.validArea.height)) of \(model.preview?.size.description ?? "") preview px; outside it some frames are missing and the alpha channel records coverage.")
+                        Text("Safe area \(Int(report.validArea.width))×\(Int(report.validArea.height)) of the \(model.preview?.canvasSize.description ?? "") preview canvas; outside it some frames are missing and the alpha channel records coverage.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -515,6 +532,84 @@ private struct AlignmentSection: View {
             let index = resolved.flatMap { model.timeline?.nearestIndex(to: $0) }
             if resolved != time { return "frame at \(Format.seconds(time.seconds)) (not selected → middle)" }
             return "frame \(index.map(String.init) ?? "?") · \(Format.seconds(time.seconds))"
+        }
+    }
+}
+
+// MARK: Crop & straighten
+
+private struct GeometrySection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Straighten").font(.callout)
+                Slider(value: $model.geometry.rotationDegrees, in: -15...15, step: 0.1) { editing in
+                    editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
+                }
+                Text(String(format: "%.1f°", model.geometry.rotationDegrees))
+                    .font(.callout).monospacedDigit().frame(width: 48, alignment: .trailing)
+            }
+            Text("Rotates the finished composite about its centre (counter-clockwise is positive); the corners it uncovers are transparent until you crop.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("Crop (canvas pixels)").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                CropField(label: "Left", value: cropBinding(\.origin.x))
+                CropField(label: "Top", value: cropBinding(\.origin.y))
+                CropField(label: "Width", value: cropBinding(\.size.width))
+                CropField(label: "Height", value: cropBinding(\.size.height))
+            }
+            HStack {
+                Button("Crop to Safe Area") { model.cropToSafeArea() }
+                    .disabled(!model.canCropToSafeArea)
+                    .help("The largest rectangle every aligned frame covers, after the straighten angle")
+                Button("Reset") { model.resetGeometry() }
+                    .disabled(model.geometry.isIdentity)
+            }
+            .controlSize(.small)
+            Picker("Edges", selection: $model.geometry.edgeFill) {
+                ForEach(EdgeFill.allCases) { Text($0.displayName).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Text(edgeExplanation)
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let canvas = model.canvasSize {
+                Text("Output \(model.geometry.outputSize(for: canvas)) of the \(canvas) canvas" + (model.geometry.hasTransform ? "" : " (uncropped)"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var edgeExplanation: String {
+        switch model.geometry.edgeFill {
+        case .transparent: return "Uncovered pixels (moved frames, letterboxed stills, straighten corners) stay transparent: PNG/TIFF keep them, JPEG flattens onto black."
+        case .black: return "Uncovered pixels are filled with black before export, in every format."
+        case .white: return "Uncovered pixels are filled with white before export, in every format."
+        }
+    }
+
+    private func cropBinding(_ keyPath: WritableKeyPath<CGRect, CGFloat>) -> Binding<Int> {
+        Binding(
+            get: { Int(model.cropPixels[keyPath: keyPath].rounded()) },
+            set: { new in
+                var rect = model.cropPixels
+                rect[keyPath: keyPath] = CGFloat(new)
+                model.setCropPixels(rect)
+            }
+        )
+    }
+}
+
+private struct CropField: View {
+    let label: String
+    @Binding var value: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            TextField(label, value: $value, format: .number)
+                .textFieldStyle(.roundedBorder).monospacedDigit().labelsHidden()
         }
     }
 }

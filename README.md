@@ -18,6 +18,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M5b (alignment):** an **Alignment** section registers every frame to a reference (middle frame or the playhead frame) with Vision before blending — *Shift only* or guarded *Perspective* — so a drifting handheld camera does not blur the background. The inspector reports how many frames aligned, were left out because they could not be registered, or fell back to a plain shift, and the largest shift; a yellow dashed **safe area** on the preview shows where every frame still has pixels, and exports keep the uncovered edges transparent. Transforms are computed once at ≤ 2048 px, so preview and export align identically and an export reuses the preview's work.
 
+**M5c (crop, straighten, canvas):** a **Crop & Straighten** section with a straighten slider, a crop in canvas pixels, **Crop to Safe Area** (the largest rectangle every aligned frame covers after the angle) and an **Edges** choice (transparent / black / white) — all applied once to the finished composite, so preview and export match exactly. A folder of **mixed-size stills** can be opened with **Fit** (transparent bars) or **Fill** (overflow cropped) instead of being refused; the choice is saved with the project.
+
 | Keys | |
 |---|---|
 | ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
@@ -31,7 +33,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: crop/straighten and canvas Fit/Fill (M5c), weighting/masks/motion/color/batches/median (M6), RAW stills, HDR tone mapping. See the plan.
+Not yet: weighting/masks/motion/color/batches/median (M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -101,6 +103,8 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 12. (M4) In Export choose JPEG + Percent 50 and export; the inspector reports "Saved 540×960, 8-bit JPEG, sRGB IEC61966-2.1" and Finder agrees. Choose TIFF 16-bit + Display P3; the report says Display P3 and the image looks the same as the sRGB one in Preview (color-managed).
 13. (M5a) Drop a folder of same-size photos (or choose several in ⌘O). Source shows "N (JPEG ×N)", the pixel size after rotation, a Sequence rate field and Reverse order; the Time Range caption says "sequence time". Type 10 in the rate field, Return: End becomes N/10 s and the frames stay selected. Tick Reverse order: the filmstrip flips. Save as a project, quit, reopen: rate and order come back. A folder mixing portrait and landscape shots is refused with the file names.
 14. (M5b) Open a handheld clip, narrow the range to ~10 frames, turn on **Align frames before blending**: the preview re-renders sharper, the caption says "aligned", the Alignment section reports "N aligned to frame at … · max shift … px" and a yellow dashed safe area appears. Click the strip to move the playhead and **Use Playhead Frame**; ⌘Z restores the middle reference. Export: the inspector says "with alpha" because the moved edges are transparent.
+15. (M5c) With alignment on, drag **Straighten** a few degrees: the corners show the checkerboard. **Crop to Safe Area**: the preview shrinks to a clean rectangle and "Output W×H of the canvas" updates; type a Width in the crop fields, Return, and the preview follows; **Edges → Black** fills any remaining transparency (the export report no longer says "with alpha"). ⌘Z steps back through Change Crop / Straighten.
+16. (M5c) Open a folder of photos that mix portrait and landscape: the refusal names the files and offers **Fit** and **Fill**; Fit shows letterboxed stills, the Source section says how many were scaled, and the Canvas menu switches between the three policies.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

@@ -34,6 +34,8 @@ struct PreviewSnapshot {
     let elapsedSeconds: Double
     /// What alignment did, when it was on.
     let alignment: AlignmentReport?
+    /// Size of the rendered canvas before straighten/crop (`size` is after).
+    let canvasSize: PixelSize
 }
 
 enum SourceState {
@@ -120,6 +122,10 @@ final class AppModel: ObservableObject {
     }
     /// Pre-blend registration (M5b); undoable and saved.
     @Published var alignment: AlignmentSettings = .off { didSet { if alignment != oldValue { settingsChanged() } } }
+    /// Post-composite straighten / crop / edge fill (M5c); undoable and saved.
+    @Published var geometry: GeometrySettings = .identity { didSet { if geometry != oldValue { settingsChanged() } } }
+    /// A folder of mixed-size stills was refused; the user may reopen it with Fit or Fill.
+    @Published private(set) var mixedSizeRetry: [URL]?
     /// Alignment report of the last export.
     @Published private(set) var lastExportAlignment: AlignmentReport?
     /// Not part of `CompositeSettings`, so changing it re-renders (new
@@ -218,6 +224,9 @@ final class AppModel: ObservableObject {
     private var suppressChanges = false
     private var lastSettings: CompositeSettings?
     private var interactiveEditDepth = 0
+    /// Settings when the current interactive edit (drag, slider) began; the
+    /// whole edit registers as one undo step when it ends.
+    private var interactiveStart: CompositeSettings?
 
     static let thumbnailCount = 32
     static let thumbnailHeight = 44
@@ -236,7 +245,8 @@ final class AppModel: ObservableObject {
 
     var settings: CompositeSettings {
         CompositeSettings(rangeStart: rangeStart, rangeEnd: rangeEnd, samplingKind: samplingKind,
-                          nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity, alignment: alignment)
+                          nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity, alignment: alignment,
+                          geometry: geometry)
     }
 
     var selectedTimes: [FrameTime] {
@@ -270,7 +280,63 @@ final class AppModel: ObservableObject {
 
     /// Pixel size the next export will have.
     var exportOutputSize: PixelSize? {
-        source.map { exportSettings.sizing.outputSize(for: $0.displaySize) }
+        source.map { geometry.outputSize(for: exportSettings.sizing.outputSize(for: $0.displaySize)) }
+    }
+
+    /// The canvas size the crop refers to (before crop, at native resolution).
+    var canvasSize: PixelSize? { source?.displaySize }
+
+    /// Full-resolution size of what the preview shows (after crop).
+    var displayedFullSize: PixelSize {
+        geometry.outputSize(for: source?.displaySize ?? PixelSize(width: 1, height: 1))
+    }
+
+    // MARK: Geometry
+
+    /// Sets the crop to the largest rectangle that every aligned frame
+    /// covers (after the straighten angle), from the last preview's report.
+    func cropToSafeArea() {
+        guard let preview, let canvas = canvasSize, preview.canvasSize.width > 0, preview.canvasSize.height > 0 else { return }
+        var valid: CGRect?
+        if let area = preview.alignment?.validArea, !area.isNull {
+            let sx = Double(canvas.width) / Double(preview.canvasSize.width)
+            let sy = Double(canvas.height) / Double(preview.canvasSize.height)
+            valid = CGRect(x: area.minX * sx, y: area.minY * sy, width: area.width * sx, height: area.height * sy)
+        }
+        geometry.crop = geometry.largestValidCrop(valid: valid, canvas: canvas)
+    }
+
+    var canCropToSafeArea: Bool {
+        preview != nil && (preview?.alignment != nil || geometry.rotationDegrees != 0)
+    }
+
+    func resetCrop() {
+        geometry.crop = .full
+    }
+
+    func resetGeometry() {
+        geometry = .identity
+    }
+
+    /// Crop in canvas pixels (origin top-left), for the fields.
+    var cropPixels: CGRect {
+        guard let canvas = canvasSize else { return .zero }
+        return geometry.crop.pixelRect(in: canvas)
+    }
+
+    func setCropPixels(_ rect: CGRect) {
+        guard let canvas = canvasSize else { return }
+        geometry.crop = NormalizedRect.from(pixels: rect, in: canvas).clamped(in: canvas)
+    }
+
+    /// Reopens the current folder of stills with a different canvas policy.
+    func setSequence(canvasPolicy: CanvasPolicy) {
+        if let sequence = imageSequence {
+            guard sequence.canvasPolicy != canvasPolicy else { return }
+            load(.sequence(sequence.files.map(\.url), canvasPolicy), project: nil, projectURL: nil)
+        } else if let urls = mixedSizeRetry {
+            load(.sequence(urls, canvasPolicy), project: nil, projectURL: nil)
+        }
     }
 
     var canSaveProject: Bool {
@@ -519,6 +585,13 @@ final class AppModel: ObservableObject {
         projectActivity = .idle
         sourceNotice = nil
         sourceIdentity = nil
+        mixedSizeRetry = nil
+        // Alignment and geometry belong to a source (a project restores its
+        // own); blend, sampling and export choices carry over like preferences.
+        suppressChanges = true
+        alignment = .off
+        geometry = .identity
+        suppressChanges = false
         // Export choices follow the user from clip to clip, but a project's
         // choices do not leak into an unrelated video opened afterwards.
         if projectURL != nil { exportSettings = ExportSettings() }
@@ -535,13 +608,13 @@ final class AppModel: ObservableObject {
     /// sequence (exactly the saved file names inside a folder).
     enum MediaSpec {
         case video(URL)
-        case sequence([URL])
+        case sequence([URL], CanvasPolicy = .strict)
         case savedSequence(folder: URL, SequenceReference)
 
         var displayName: String {
             switch self {
             case let .video(url): return url.lastPathComponent
-            case let .sequence(urls):
+            case let .sequence(urls, _):
                 guard let first = urls.first else { return "" }
                 return (urls.count == 1 && ImageSequenceLoader.isDirectory(first)) ? first.lastPathComponent
                     : first.deletingLastPathComponent().lastPathComponent
@@ -552,7 +625,7 @@ final class AppModel: ObservableObject {
         var url: URL? {
             switch self {
             case let .video(url): return url
-            case let .sequence(urls): return urls.first
+            case let .sequence(urls, _): return urls.first
             case let .savedSequence(folder, _): return folder
             }
         }
@@ -589,14 +662,15 @@ final class AppModel: ObservableObject {
                     media = .video(info)
                     timeline = result.timeline
                     scan = result
-                case let .sequence(urls):
-                    let info = try await ImageSequenceLoader.load(urls)
+                case let .sequence(urls, policy):
+                    let info = try await ImageSequenceLoader.load(urls, canvasPolicy: policy)
                     media = .imageSequence(info)
                     timeline = info.timeline
                     identity = SourceIdentity.compute(forSequence: info)
                 case let .savedSequence(folder, saved):
                     let info = try await ImageSequenceLoader.load(folder: folder, fileNames: saved.fileNames,
-                                                                  framesPerSecond: saved.framesPerSecond, reversed: saved.reversed)
+                                                                  framesPerSecond: saved.framesPerSecond, reversed: saved.reversed,
+                                                                  canvasPolicy: saved.canvasPolicy)
                     media = .imageSequence(info)
                     timeline = info.timeline
                     identity = SourceIdentity.compute(forSequence: info)
@@ -633,6 +707,9 @@ final class AppModel: ObservableObject {
             } catch {
                 guard let self, !Task.isCancelled else { return }
                 self.source = nil
+                if case .mixedImageSizes = error as? MediaError, case let .sequence(urls, _) = spec {
+                    self.mixedSizeRetry = urls
+                }
                 self.sourceState = .failed(error.localizedDescription)
             }
         }
@@ -667,6 +744,8 @@ final class AppModel: ObservableObject {
         blendMode = s.blendMode
         opacity = min(max(s.opacity, 0), 1)
         alignment = s.alignment
+        geometry = GeometrySettings(rotationDegrees: min(max(s.geometry.rotationDegrees, -GeometrySettings.maximumRotation), GeometrySettings.maximumRotation),
+                                    crop: s.geometry.crop.clamped(in: info.displaySize), edgeFill: s.geometry.edgeFill)
         exportSettings = project.export
         if let quality = project.ui.previewQuality.flatMap(PreviewQuality.init(rawValue:)) { previewQuality = quality }
         if let mode = project.ui.viewMode.flatMap(PreviewViewMode.init(rawValue:)) { viewMode = mode }
@@ -823,16 +902,42 @@ final class AppModel: ObservableObject {
     }
 
     /// Call around a drag or slider gesture so every intermediate value
-    /// collapses into a single undo step.
+    /// collapses into a single undo step. No undo groups are opened (the
+    /// window's manager already groups by event and a nested group hid the
+    /// action name); instead the intermediate values register nothing and
+    /// one step from the start value to the end value is registered when
+    /// the edit ends.
     func beginInteractiveEdit() {
-        if interactiveEditDepth == 0 { undoManager?.beginUndoGrouping() }
+        if interactiveEditDepth == 0 { interactiveStart = settings }
         interactiveEditDepth += 1
     }
 
     func endInteractiveEdit() {
         guard interactiveEditDepth > 0 else { return }
         interactiveEditDepth -= 1
-        if interactiveEditDepth == 0 { undoManager?.endUndoGrouping() }
+        if interactiveEditDepth == 0, let start = interactiveStart {
+            interactiveStart = nil
+            registerUndo(from: start, to: settings)
+        }
+    }
+
+    private func registerUndo(from old: CompositeSettings, to new: CompositeSettings) {
+        guard old != new, let undoManager else { return }
+        // A manager that does not group by event needs an explicit group
+        // around every registration (the window's manager groups by event;
+        // tests use an explicit one).
+        let needsGroup = !undoManager.groupsByEvent && undoManager.groupingLevel == 0
+        if needsGroup { undoManager.beginUndoGrouping() }
+        undoManager.registerUndo(withTarget: self) { model in
+            // Called on the main thread by the undo manager; apply
+            // synchronously so the redo registration lands while
+            // `isUndoing` is still true.
+            MainActor.assumeIsolated { model.apply(old) }
+        }
+        if !undoManager.isUndoing, !undoManager.isRedoing {
+            undoManager.setActionName(Self.actionName(from: old, to: new))
+        }
+        if needsGroup { undoManager.endUndoGrouping() }
     }
 
     /// Restores a settings snapshot as one change (undo/redo).
@@ -846,6 +951,7 @@ final class AppModel: ObservableObject {
         blendMode = s.blendMode
         opacity = s.opacity
         alignment = s.alignment
+        geometry = s.geometry
         suppressChanges = false
         settingsChanged()
     }
@@ -869,22 +975,8 @@ final class AppModel: ObservableObject {
     private func settingsChanged(debounce: Bool = true) {
         guard !suppressChanges else { return }
         let new = settings
-        if let old = lastSettings, old != new, let undoManager {
-            // A manager that does not group by event needs an explicit
-            // group around every registration (the window's manager groups
-            // by event; tests use an explicit one).
-            let needsGroup = !undoManager.groupsByEvent && undoManager.groupingLevel == 0
-            if needsGroup { undoManager.beginUndoGrouping() }
-            undoManager.registerUndo(withTarget: self) { model in
-                // Called on the main thread by the undo manager; apply
-                // synchronously so the redo registration lands while
-                // `isUndoing` is still true.
-                MainActor.assumeIsolated { model.apply(old) }
-            }
-            if !undoManager.isUndoing, !undoManager.isRedoing {
-                undoManager.setActionName(Self.actionName(from: old, to: new))
-            }
-            if needsGroup { undoManager.endUndoGrouping() }
+        if interactiveEditDepth == 0, let old = lastSettings {
+            registerUndo(from: old, to: new)
         }
         lastSettings = new
         settingsRevision += 1
@@ -906,6 +998,9 @@ final class AppModel: ObservableObject {
         if old.blendMode != new.blendMode { return "Change Blend Mode" }
         if old.opacity != new.opacity { return "Change Opacity" }
         if old.alignment != new.alignment { return "Change Alignment" }
+        if old.geometry.rotationDegrees != new.geometry.rotationDegrees { return "Straighten" }
+        if old.geometry.crop != new.geometry.crop { return "Change Crop" }
+        if old.geometry.edgeFill != new.geometry.edgeFill { return "Change Edge Fill" }
         return "Change Settings"
     }
 
@@ -931,6 +1026,7 @@ final class AppModel: ObservableObject {
         let revision = settingsRevision
         renderActivity = .waiting
         let renderer = renderer
+        let geometry = geometry
 
         previewTask = Task { [weak self] in
             if debounce {
@@ -942,19 +1038,21 @@ final class AppModel: ObservableObject {
                 let result = try await renderer.render(request) { [weak self] progress in
                     self?.reportPreviewProgress(progress, revision: revision)
                 }
-                let image = try await Task.detached(priority: .userInitiated) {
-                    try ImageExporter.makeCGImage(result.image, bitDepth: .eight, alpha: ImageExporter.hasTransparency(result.image))
+                let (image, finalSize) = try await Task.detached(priority: .userInitiated) {
+                    let processed = try GeometryProcessor.apply(geometry, to: result.image)
+                    return (try ImageExporter.makeCGImage(processed, bitDepth: .eight, alpha: ImageExporter.hasTransparency(processed)), processed.size)
                 }.value
                 guard let self, !Task.isCancelled, revision == self.settingsRevision else { return }
                 self.preview = PreviewSnapshot(
                     image: image,
                     revision: revision,
-                    size: result.image.size,
+                    size: finalSize,
                     framesComposited: result.framesComposited,
                     missingFrames: result.missingFrames.count,
                     decodeFailure: result.decodeFailureSummary,
                     elapsedSeconds: result.elapsedSeconds,
-                    alignment: result.alignment
+                    alignment: result.alignment,
+                    canvasSize: result.image.size
                 )
                 self.renderActivity = .idle
             } catch is CancellationError {
@@ -985,7 +1083,7 @@ final class AppModel: ObservableObject {
         let count = (try? selection?.get().selectedCount) ?? 0
         let mode = blendMode == .normal ? "Normal" : blendMode.displayName
         let opacityPart = blendMode.usesOpacity && opacity < 1 ? " \(Int((opacity * 100).rounded()))%" : ""
-        let sizePart = exportSettings.sizing == .native ? "" : " \(exportOutputSize?.longEdge ?? 0)px"
+        let sizePart = exportSettings.sizing == .native && !geometry.hasTransform ? "" : " \(exportOutputSize?.longEdge ?? 0)px"
         return "\(base) \(mode)\(opacityPart) \(count)f\(sizePart).\(ext)"
     }
 
@@ -1017,6 +1115,7 @@ final class AppModel: ObservableObject {
             alignment: alignment
         )
         let settings = exportSettings
+        let geometry = geometry
         let renderer = renderer
         // Keep resource use bounded: one full-resolution render at a time.
         previewTask?.cancel()
@@ -1031,7 +1130,7 @@ final class AppModel: ObservableObject {
                 self?.lastExportAlignment = composite.alignment
                 self?.exportActivity = .writing
                 let report = try await Task.detached(priority: .userInitiated) {
-                    try ImageExporter.write(composite.image, to: url, settings: settings)
+                    try ImageExporter.write(try GeometryProcessor.apply(geometry, to: composite.image), to: url, settings: settings)
                 }.value
                 self?.exportActivity = .finished(
                     report, missingFrames: composite.missingFrames.count, decodeFailure: composite.decodeFailureSummary

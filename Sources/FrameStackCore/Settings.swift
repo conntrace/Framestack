@@ -30,9 +30,11 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
     public var opacity: Double
     /// Pre-blend registration (M5b). Absent in older documents = off.
     public var alignment: AlignmentSettings
+    /// Post-composite straighten/crop/edge fill (M5c). Absent = identity.
+    public var geometry: GeometrySettings
 
     public init(rangeStart: FrameTime, rangeEnd: FrameTime, samplingKind: SamplingKind, nth: Int, exactCount: Int,
-                blendMode: BlendMode, opacity: Double, alignment: AlignmentSettings = .off) {
+                blendMode: BlendMode, opacity: Double, alignment: AlignmentSettings = .off, geometry: GeometrySettings = .identity) {
         self.rangeStart = rangeStart
         self.rangeEnd = rangeEnd
         self.samplingKind = samplingKind
@@ -41,10 +43,11 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         self.blendMode = blendMode
         self.opacity = opacity
         self.alignment = alignment
+        self.geometry = geometry
     }
 
     private enum CodingKeys: String, CodingKey {
-        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment
+        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment, geometry
     }
 
     public init(from decoder: Decoder) throws {
@@ -57,6 +60,7 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         blendMode = try c.decode(BlendMode.self, forKey: .blendMode)
         opacity = try c.decode(Double.self, forKey: .opacity)
         alignment = try c.decodeIfPresent(AlignmentSettings.self, forKey: .alignment) ?? .off
+        geometry = try c.decodeIfPresent(GeometrySettings.self, forKey: .geometry) ?? .identity
     }
 
     public var samplingMode: SamplingMode {
@@ -278,4 +282,146 @@ public struct AlignmentSettings: Sendable, Codable, Equatable {
     }
 
     public static let off = AlignmentSettings()
+}
+
+// MARK: - Geometry (M5c)
+
+/// A crop in canvas-normalised units (0…1 of the canvas width/height, origin
+/// top-left), so it survives any output size.
+public struct NormalizedRect: Sendable, Codable, Equatable {
+    public var x: Double
+    public var y: Double
+    public var width: Double
+    public var height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+
+    public static let full = NormalizedRect(x: 0, y: 0, width: 1, height: 1)
+
+    /// Clamped to the canvas and at least one pixel of a `reference` canvas.
+    public func clamped(minimumPixels: Double = 1, in canvas: PixelSize) -> NormalizedRect {
+        let minW = minimumPixels / Double(max(canvas.width, 1))
+        let minH = minimumPixels / Double(max(canvas.height, 1))
+        var r = self
+        r.width = min(max(r.width, minW), 1)
+        r.height = min(max(r.height, minH), 1)
+        r.x = min(max(r.x, 0), 1 - r.width)
+        r.y = min(max(r.y, 0), 1 - r.height)
+        return r
+    }
+
+    /// Pixel rectangle for a canvas of `size` (origin top-left), rounded to
+    /// whole pixels, never empty.
+    public func pixelRect(in size: PixelSize) -> CGRect {
+        let x0 = (x * Double(size.width)).rounded()
+        let y0 = (y * Double(size.height)).rounded()
+        let x1 = ((x + width) * Double(size.width)).rounded()
+        let y1 = ((y + height) * Double(size.height)).rounded()
+        return CGRect(x: x0, y: y0, width: max(1, x1 - x0), height: max(1, y1 - y0))
+    }
+
+    public static func from(pixels rect: CGRect, in size: PixelSize) -> NormalizedRect {
+        NormalizedRect(x: rect.minX / Double(size.width), y: rect.minY / Double(size.height),
+                       width: rect.width / Double(size.width), height: rect.height / Double(size.height))
+    }
+
+    public var isFull: Bool { self == .full }
+}
+
+/// What to put where the composite has no coverage (aligned frames that
+/// moved away, letterboxed stills): keep the transparency or fill a colour.
+public enum EdgeFill: String, Sendable, Codable, CaseIterable, Identifiable {
+    case transparent
+    case black
+    case white
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .transparent: return "Transparent"
+        case .black: return "Black"
+        case .white: return "White"
+        }
+    }
+
+    /// Linear fill colour, nil for transparent.
+    public var linearColor: SIMD3<Float>? {
+        switch self {
+        case .transparent: return nil
+        case .black: return SIMD3(0, 0, 0)
+        case .white: return SIMD3(1, 1, 1)
+        }
+    }
+}
+
+/// Post-composite geometry (PRD §6.2): straighten, crop, edge fill. Applied
+/// once to the finished composite, so the per-frame math is untouched and
+/// preview equals export by construction.
+public struct GeometrySettings: Sendable, Codable, Equatable {
+    /// Counter-clockwise straighten angle in degrees, −45…45.
+    public var rotationDegrees: Double
+    public var crop: NormalizedRect
+    public var edgeFill: EdgeFill
+
+    public init(rotationDegrees: Double = 0, crop: NormalizedRect = .full, edgeFill: EdgeFill = .transparent) {
+        self.rotationDegrees = rotationDegrees
+        self.crop = crop
+        self.edgeFill = edgeFill
+    }
+
+    public static let identity = GeometrySettings()
+    public static let maximumRotation = 45.0
+
+    public var isIdentity: Bool { self == .identity }
+    public var hasTransform: Bool { rotationDegrees != 0 || !crop.isFull }
+
+    /// Output size after crop, for a canvas rendered at `size`.
+    public func outputSize(for size: PixelSize) -> PixelSize {
+        let r = crop.clamped(in: size).pixelRect(in: size)
+        return PixelSize(width: Int(r.width), height: Int(r.height))
+    }
+
+    /// Largest axis-aligned rectangle (canvas-normalised) that lies inside
+    /// `valid` after the canvas is rotated by `rotationDegrees` about its
+    /// centre — what "Crop to safe area" sets. `valid` is in canvas pixels
+    /// (origin top-left); nil means the whole canvas.
+    public func largestValidCrop(valid: CGRect?, canvas: PixelSize) -> NormalizedRect {
+        let full = CGRect(x: 0, y: 0, width: canvas.width, height: canvas.height)
+        let area = (valid ?? full).intersection(full)
+        guard !area.isNull, area.width > 0, area.height > 0 else { return .full }
+        let theta = rotationDegrees * .pi / 180
+        let (w, h) = Self.largestInscribedSize(width: area.width, height: area.height, angle: theta)
+        // The valid area's centre moves with the rotation about the canvas centre.
+        let c = CGPoint(x: full.midX, y: full.midY)
+        let v = CGPoint(x: area.midX - c.x, y: area.midY - c.y)
+        // Screen coordinates have y down: a counter-clockwise rotation on
+        // screen is a clockwise one in these coordinates.
+        let rotated = CGPoint(x: v.x * cos(theta) + v.y * sin(theta), y: -v.x * sin(theta) + v.y * cos(theta))
+        var rect = CGRect(x: c.x + rotated.x - w / 2, y: c.y + rotated.y - h / 2, width: w, height: h).intersection(full)
+        if rect.isNull || rect.width < 1 || rect.height < 1 { rect = full }
+        return NormalizedRect.from(pixels: rect, in: canvas).clamped(in: canvas)
+    }
+
+    /// Largest axis-aligned rectangle inscribed in a `width`×`height`
+    /// rectangle rotated by `angle` (the classic closed form; centred).
+    public static func largestInscribedSize(width: Double, height: Double, angle: Double) -> (Double, Double) {
+        guard width > 0, height > 0 else { return (0, 0) }
+        let sinA = abs(sin(angle)), cosA = abs(cos(angle))
+        let widthIsLonger = width >= height
+        let long = widthIsLonger ? width : height
+        let short = widthIsLonger ? height : width
+        if short <= 2 * sinA * cosA * long || abs(sinA - cosA) < 1e-10 {
+            // Half-constrained: the rectangle touches the short side only.
+            let x = 0.5 * short
+            return widthIsLonger ? (x / sinA, x / cosA) : (x / cosA, x / sinA)
+        }
+        let cos2A = cosA * cosA - sinA * sinA
+        return ((width * cosA - height * sinA) / cos2A, (height * cosA - width * sinA) / cos2A)
+    }
 }
