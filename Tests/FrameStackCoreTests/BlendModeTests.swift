@@ -186,6 +186,19 @@ final class BlendModeTests: XCTestCase {
                         c += a * (b - c)
                     }
                     reference = c
+                case .median:
+                    let sorted = values.sorted()
+                    reference = n % 2 == 1 ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2
+                case .maxLuminance, .minLuminance:
+                    // Whole pixel of the frame with the extreme luminance (ties → earliest).
+                    let p = i / 4
+                    let lum = frames.map { f -> Double in
+                        let o = p * 4
+                        return 0.2126 * Double(f.pixels[o]) + 0.7152 * Double(f.pixels[o + 1]) + 0.0722 * Double(f.pixels[o + 2])
+                    }
+                    var best = 0
+                    for k in 1..<n where mode == .maxLuminance ? lum[k] > lum[best] : lum[k] < lum[best] { best = k }
+                    reference = Double(frames[best].pixels[i])
                 }
                 XCTAssertEqual(Double(out.pixels[i]), reference, accuracy: 1e-5, "\(mode) sample \(i)")
             }
@@ -202,7 +215,7 @@ final class BlendModeTests: XCTestCase {
             XCTAssertFalse(mode.explanation.isEmpty)
             XCTAssertFalse(mode.displayName.isEmpty)
         }
-        XCTAssertEqual(BlendMode.allCases.count, 8)
+        XCTAssertEqual(BlendMode.allCases.count, 11)
         XCTAssertEqual(Set(BlendMode.allCases.filter(\.usesOpacity)), [.screen, .multiply, .additive, .difference, .normal])
     }
 }

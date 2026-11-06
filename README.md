@@ -22,6 +22,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M6a (temporal weighting):** a **Weighting** section — Flat, Favor Early, Favor Late, Favor Middle or a Custom curve with draggable points — weights every selected frame by its real timestamp inside the selection. Average becomes a normalised weighted mean, Additive an exposure accumulation, the sequential modes scale opacity per frame; Lighten/Darken say they have no weights. The curve is drawn with one tick per selected frame and the "effective frame count" the weighting is worth.
 
+**M6b (median, luminance):** **Median** is an exact per-pixel median of every selected frame, computed in horizontal bands within a memory budget (the clip is decoded once per band; the Blend section tells you how many passes the preview and the export will take and the bottom bar counts them) — moving subjects vanish, the static scene stays. **Max Luminance** / **Min Luminance** keep, per pixel, the whole colour of the brightest / darkest frame, unlike Lighten/Darken's per-channel extremes.
+
 | Keys | |
 |---|---|
 | ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
@@ -35,7 +37,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: median and max/min-luminance modes, masks, motion accumulation, colour adjustments, presets and batches (rest of M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
+Not yet: masks, motion accumulation, colour adjustments, presets and batches (rest of M6), crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -108,6 +110,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 15. (M5c) With alignment on, drag **Straighten** a few degrees: the corners show the checkerboard. **Crop to Safe Area**: the preview shrinks to a clean rectangle and "Output W×H of the canvas" updates; type a Width in the crop fields, Return, and the preview follows; **Edges → Black** fills any remaining transparency (the export report no longer says "with alpha"). ⌘Z steps back through Change Crop / Straighten.
 16. (M5c) Open a folder of photos that mix portrait and landscape: the refusal names the files and offers **Fit** and **Fill**; Fit shows letterboxed stills, the Source section says how many were scaled, and the Canvas menu switches between the three policies.
 17. (M6a) In Weighting choose **Favor Late**: the curve rises, the ticks follow the selected frames, the caption reports the raw range and the effective frame count, and the preview re-renders favouring the end of the range. Choose **Custom** and drag a point: one undo step. Switch Blend to Lighten: the note says the curve is ignored.
+18. (M6b) Choose Blend → **Median** on a clip with a moving subject: the caption says how many passes the preview needs, the bar counts "pass p of P" on long clips, and the subject disappears from the result while the background stays sharp. **Max Luminance** keeps the brightest frame's whole colour per pixel.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 
@@ -116,7 +119,7 @@ Please report anything off — especially colors versus QuickTime Player, and an
 - Frames are identified by exact presentation timestamps (rational, like `CMTime`); ranges are start-inclusive/end-exclusive.
 - Each frame is converted by Core Image from its own color tags to **linear light** (extended sRGB primaries, 32-bit float), oriented upright, then added to **64-bit accumulators**. Average = sum ÷ count. Memory depends on output size, not frame count.
 - Export clamps to [0, 1], applies the sRGB curve once, rounds, and writes an sRGB-tagged file (PNG/JPEG/TIFF), then re-reads the file to verify it. Display P3 output first converts the linear values with the sRGB→P3 primaries matrix. Downscaled exports resample each frame with Lanczos in linear light before accumulation — the same path the preview uses.
-- Other modes use the same frames: Lighten/Darken are per-channel max/min; Additive is the plain sum (× opacity, kept above 1 until export); Screen, Multiply, Difference and Normal run oldest-to-newest from the first selected frame with `C' = C + opacity × (blend(C, F) − C)`. Normal at 100 % is exactly the last selected frame.
+- Other modes use the same frames: Lighten/Darken are per-channel max/min; Additive is the plain sum (× opacity, kept above 1 until export); Screen, Multiply, Difference and Normal run oldest-to-newest from the first selected frame with `C' = C + opacity × (blend(C, F) − C)`. Normal at 100 % is exactly the last selected frame. Median is the exact per-channel median (mean of the two middle values for an even count), computed band by band so memory stays bounded; Max/Min Luminance pick the whole pixel of the frame with the extreme linear luminance.
 
 Details and trade-offs: `DECISIONS.md` D-004 to D-009 and D-013 to D-021.
 

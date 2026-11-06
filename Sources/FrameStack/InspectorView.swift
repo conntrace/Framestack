@@ -457,7 +457,24 @@ private struct BlendSection: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if model.blendMode == .median {
+                if let plan = model.medianPlan(for: model.source?.displaySize.fitting(maxLongEdge: model.previewQuality.maxLongEdge)),
+                   let exportPlan = model.medianPlan(for: model.exportOutputSize) {
+                    Label(medianEstimate(preview: plan, export: exportPlan), systemImage: "clock")
+                        .font(.caption)
+                        .foregroundStyle(plan.passes > 8 || exportPlan.passes > 8 ? Color.orange : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let report = model.preview?.median, model.isPreviewCurrent {
+                    Text(report.summary).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
+    }
+
+    private func medianEstimate(preview: MedianPlan, export: MedianPlan) -> String {
+        let budget = ByteCountFormatter.string(fromByteCount: Int64(preview.memoryBudgetBytes), countStyle: .memory)
+        return "Exact median needs the whole frame history: this preview decodes the clip \(preview.passes) time\(preview.passes == 1 ? "" : "s"), the export \(export.passes) time\(export.passes == 1 ? "" : "s") (bands within \(budget)). Fewer frames or a smaller output mean fewer passes."
     }
 }
 

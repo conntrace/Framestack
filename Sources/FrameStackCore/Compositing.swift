@@ -19,6 +19,9 @@ public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
     case additive
     case difference
     case normal
+    case median
+    case maxLuminance
+    case minLuminance
 
     public var id: String { rawValue }
 
@@ -32,6 +35,9 @@ public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
         case .additive: return "Additive"
         case .difference: return "Difference"
         case .normal: return "Normal (opacity stack)"
+        case .median: return "Median"
+        case .maxLuminance: return "Max Luminance"
+        case .minLuminance: return "Min Luminance"
         }
     }
 
@@ -71,13 +77,31 @@ public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
             return "Chronological source-over: each frame is laid over the composite at the "
                 + "chosen opacity. At 100 % only the last selected frame is visible; lower "
                 + "opacity fades earlier frames away geometrically. Not an equal-weight average."
+        case .median:
+            return "Exact per-channel median of every selected frame at each pixel (the mean of the "
+                + "two middle values for an even count), in linear light. Removes anything present in "
+                + "fewer than half the frames — a moving subject vanishes, the static scene stays. "
+                + "Needs the whole frame history: computed in horizontal bands within a memory "
+                + "budget, decoding the clip once per band. Order and weights do not matter."
+        case .maxLuminance:
+            return "At each pixel the complete colour of the single frame with the greatest "
+                + "linear luminance (0.2126 R + 0.7152 G + 0.0722 B). Unlike Lighten the result is "
+                + "always a colour some frame really had there. Ties keep the earlier frame."
+        case .minLuminance:
+            return "At each pixel the complete colour of the single frame with the least linear "
+                + "luminance. Unlike Darken the result is always a colour some frame really had "
+                + "there. Ties keep the earlier frame."
         }
     }
+
+    /// The exact median cannot stream: the renderer computes it band by band
+    /// (see `MedianPlan`), decoding the source once per band.
+    public var requiresFrameHistory: Bool { self == .median }
 
     /// The result depends on the chronological order of the frames.
     public var isOrderDependent: Bool {
         switch self {
-        case .average, .lighten, .darken, .additive: return false
+        case .average, .lighten, .darken, .additive, .median, .maxLuminance, .minLuminance: return false
         case .screen, .multiply, .difference, .normal: return true
         }
     }
@@ -85,7 +109,7 @@ public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
     /// The opacity parameter changes the result.
     public var usesOpacity: Bool {
         switch self {
-        case .average, .lighten, .darken: return false
+        case .average, .lighten, .darken, .median, .maxLuminance, .minLuminance: return false
         case .screen, .multiply, .additive, .difference, .normal: return true
         }
     }
@@ -102,6 +126,12 @@ public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
         case .multiply: return SequentialReducer(width: width, height: height, operation: .multiply, opacity: opacity)
         case .difference: return SequentialReducer(width: width, height: height, operation: .difference, opacity: opacity)
         case .normal: return SequentialReducer(width: width, height: height, operation: .normal, opacity: opacity)
+        case .maxLuminance: return LuminanceExtremumReducer(width: width, height: height, kind: .maximum)
+        case .minLuminance: return LuminanceExtremumReducer(width: width, height: height, kind: .minimum)
+        case .median:
+            // Only meaningful for a band whose whole history fits; the
+            // renderer sizes bands with `MedianPlan`. Used directly by tests.
+            return MedianBandAccumulator(width: width, height: height, frameCapacity: 4096)
         }
     }
 }
@@ -110,6 +140,7 @@ public enum CompositingError: Error, Equatable, LocalizedError {
     case dimensionMismatch(expected: Int, actual: Int)
     case noFrames
     case zeroTotalWeight
+    case historyFull(capacity: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -119,6 +150,8 @@ public enum CompositingError: Error, Equatable, LocalizedError {
             return "No frames were composited."
         case .zeroTotalWeight:
             return "Every frame had zero weight; nothing could be averaged."
+        case let .historyFull(capacity):
+            return "More frames than the median band can hold (\(capacity))."
         }
     }
 }

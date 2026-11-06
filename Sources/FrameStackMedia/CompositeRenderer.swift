@@ -40,6 +40,30 @@ public struct CompositeRequest: Sendable {
 public struct CompositeProgress: Sendable, Equatable {
     public let framesComposited: Int
     public let framesTotal: Int
+    /// Multi-pass modes (Median) decode the source once per band.
+    public let pass: Int
+    public let passes: Int
+
+    public init(framesComposited: Int, framesTotal: Int, pass: Int = 1, passes: Int = 1) {
+        self.framesComposited = framesComposited
+        self.framesTotal = framesTotal
+        self.pass = pass
+        self.passes = passes
+    }
+}
+
+/// How an exact Median was computed.
+public struct MedianReport: Sendable, Equatable {
+    public let passes: Int
+    public let bandRows: Int
+    public let memoryBudgetBytes: Int
+    public let frameCount: Int
+
+    public var summary: String {
+        passes == 1
+            ? "Exact median of \(frameCount) frames in one pass."
+            : "Exact median of \(frameCount) frames in \(passes) passes of \(bandRows) rows (the clip was decoded \(passes) times to stay within \(ByteCountFormatter.string(fromByteCount: Int64(memoryBudgetBytes), countStyle: .memory)) of frame history)."
+    }
 }
 
 /// A point where the decoder gave up (corrupt or unsupported data) and the
@@ -69,10 +93,12 @@ public struct CompositeResult: Sendable {
     public let alignment: AlignmentReport?
     /// Present when the request's weighting was not flat.
     public let weighting: WeightingReport?
+    /// Present for the Median mode.
+    public let median: MedianReport?
 
     public init(image: LinearImage, framesComposited: Int, missingFrames: [FrameTime], decodeFailures: [DecodeFailure],
                 deliveredInPresentationOrder: Bool, elapsedSeconds: Double, alignment: AlignmentReport? = nil,
-                weighting: WeightingReport? = nil) {
+                weighting: WeightingReport? = nil, median: MedianReport? = nil) {
         self.image = image
         self.framesComposited = framesComposited
         self.missingFrames = missingFrames
@@ -81,6 +107,7 @@ public struct CompositeResult: Sendable {
         self.elapsedSeconds = elapsedSeconds
         self.alignment = alignment
         self.weighting = weighting
+        self.median = median
     }
 
     /// One-line explanation of why frames are missing, for the UI.
@@ -169,14 +196,17 @@ public final class CompositeRenderer: @unchecked Sendable {
 
     private let context: CIContext
     private let registration = RegistrationEngine()
+    /// Frame-history budget for the Median's bands (`MedianPlan`).
+    public let memoryBudgetBytes: Int
 
-    public init(useSoftwareRenderer: Bool = false) {
+    public init(useSoftwareRenderer: Bool = false, memoryBudgetBytes: Int = MedianPlan.defaultMemoryBudgetBytes) {
         context = CIContext(options: [
             .workingColorSpace: Self.workingColorSpace,
             .workingFormat: CIFormat.RGBAf,
             .cacheIntermediates: false,
             .useSoftwareRenderer: useSoftwareRenderer,
         ])
+        self.memoryBudgetBytes = memoryBudgetBytes
     }
 
     /// Everything the per-frame step needs; shared by the video and the
@@ -198,12 +228,20 @@ public final class CompositeRenderer: @unchecked Sendable {
         /// Raw curve weight per selected frame (nil when flat).
         let weights: [FrameTime: Double]?
         let weightSelection: WeightedSelection?
+        /// Output rows this pass reduces (nil = the whole frame).
+        let band: Range<Int>?
+        let passIndex: Int
+        let passCount: Int
 
-        init(request: CompositeRequest, progress: (@Sendable (CompositeProgress) -> Void)?) {
+        init(request: CompositeRequest, progress: (@Sendable (CompositeProgress) -> Void)?,
+             band: Range<Int>? = nil, passIndex: Int = 0, passCount: Int = 1) {
             self.request = request
             self.wanted = Set(request.frames)
             self.total = wanted.count
             self.progress = progress
+            self.band = band
+            self.passIndex = passIndex
+            self.passCount = passCount
             if request.weighting.isFlat {
                 weights = nil
                 weightSelection = nil
@@ -215,6 +253,18 @@ public final class CompositeRenderer: @unchecked Sendable {
         }
 
         var isComplete: Bool { seen.count == total }
+
+        func reportProgress() {
+            progress?(CompositeProgress(framesComposited: seen.count, framesTotal: total, pass: passIndex + 1, passes: passCount))
+        }
+    }
+
+    private func resetTallies(_ aligner: Aligner) {
+        aligner.failed = []
+        aligner.fellBack = []
+        aligner.aligned = 0
+        aligner.maxShift = 0
+        aligner.validArea = nil
     }
 
     /// Per-render alignment state: the reference at analysis size, the
@@ -256,25 +306,86 @@ public final class CompositeRenderer: @unchecked Sendable {
             throw MediaError.noFramesSelected
         }
         try Task.checkCancellation()
-        let reduction = Reduction(request: request, progress: progress)
+        var aligner: Aligner?
         if request.alignment.enabled, request.frames.count > 1 {
-            reduction.aligner = try await makeAligner(for: request)
+            aligner = try await makeAligner(for: request)
         }
+        if request.blendMode.requiresFrameHistory {
+            return try await renderInBands(request, aligner: aligner, progress: progress, started: started)
+        }
+        let reduction = Reduction(request: request, progress: progress)
+        reduction.aligner = aligner
+        try await runPass(reduction)
+        guard let reducer = reduction.reducer, reducer.count > 0 else {
+            throw MediaError.noFramesDecoded
+        }
+        let image = try reducer.result()
+        return finish(reduction, image: image, framesComposited: reducer.count, usesWeights: reducer.usesWeights,
+                      missing: request.frames.filter { !reduction.seen.contains($0) }, started: started, median: nil)
+    }
 
-        switch request.source {
+    /// Decodes the selection once into `reduction`'s reducer.
+    private func runPass(_ reduction: Reduction) async throws {
+        switch reduction.request.source {
         case let .video(video):
             try await decodeVideo(video, into: reduction)
         case let .imageSequence(sequence):
             try decodeSequence(sequence, into: reduction)
         }
         try Task.checkCancellation()
+    }
 
-        guard let reducer = reduction.reducer, reducer.count > 0 else {
-            throw MediaError.noFramesDecoded
+    /// Exact Median: the output is split into horizontal bands whose whole
+    /// frame history fits the memory budget (`MedianPlan`); the source is
+    /// decoded once per band and each band's median is assembled into the
+    /// final image. The alignment cache is shared across passes, so
+    /// registration runs once.
+    private func renderInBands(_ request: CompositeRequest, aligner: Aligner?,
+                               progress: (@Sendable (CompositeProgress) -> Void)?, started: Date) async throws -> CompositeResult {
+        let outputSize = request.source.displaySize.fitting(maxLongEdge: request.maxLongEdge)
+        let plan = MedianPlan(outputSize: outputSize, frameCount: request.frames.count, memoryBudgetBytes: memoryBudgetBytes)
+        var pixels = [Float](repeating: 0, count: outputSize.pixelCount * LinearImage.channelCount)
+        var missing = Set<FrameTime>()
+        var framesComposited = Int.max
+        var last: Reduction?
+        var usesWeights = true
+        for pass in 0..<plan.passes {
+            try Task.checkCancellation()
+            let rows = plan.rows(ofPass: pass)
+            let reduction = Reduction(request: request, progress: progress, band: rows, passIndex: pass, passCount: plan.passes)
+            if let aligner { resetTallies(aligner) }
+            reduction.aligner = aligner
+            try await runPass(reduction)
+            guard let reducer = reduction.reducer, reducer.count > 0 else { throw MediaError.noFramesDecoded }
+            guard reduction.outputSize == outputSize else {
+                throw MediaError.frameSizeChanged(expected: outputSize, actual: reduction.outputSize)
+            }
+            let band = try reducer.result()
+            let rowSamples = outputSize.width * LinearImage.channelCount
+            band.pixels.withUnsafeBufferPointer { src in
+                pixels.withUnsafeMutableBufferPointer { dst in
+                    (dst.baseAddress! + rows.lowerBound * rowSamples).update(from: src.baseAddress!, count: rows.count * rowSamples)
+                }
+            }
+            for f in request.frames where !reduction.seen.contains(f) { missing.insert(f) }
+            framesComposited = min(framesComposited, reducer.count)
+            usesWeights = reducer.usesWeights
+            last = reduction
         }
-        let image = try reducer.result()
+        guard let reduction = last else { throw MediaError.noFramesDecoded }
+        let image = LinearImage(width: outputSize.width, height: outputSize.height, pixels: pixels)
+        let report = MedianReport(passes: plan.passes, bandRows: plan.bandRows, memoryBudgetBytes: plan.memoryBudgetBytes,
+                                  frameCount: request.frames.count)
+        return finish(reduction, image: image, framesComposited: framesComposited, usesWeights: usesWeights,
+                      missing: request.frames.filter { missing.contains($0) }, started: started, median: report)
+    }
+
+    /// Assembles the result and its reports from the (last) pass.
+    private func finish(_ reduction: Reduction, image: LinearImage, framesComposited: Int, usesWeights: Bool,
+                        missing: [FrameTime], started: Date, median: MedianReport?) -> CompositeResult {
+        let request = reduction.request
         let alignmentFailures = Set(reduction.aligner?.failed ?? [])
-        let missing = request.frames.filter { !reduction.seen.contains($0) && !alignmentFailures.contains($0) }
+        let missing = missing.filter { !alignmentFailures.contains($0) }
         var report: AlignmentReport?
         if let aligner = reduction.aligner, let sourceSize = reduction.sourceSize {
             registration.store(aligner.outcomes, for: aligner.key)
@@ -301,19 +412,20 @@ public final class CompositeRenderer: @unchecked Sendable {
             let sum = used.reduce(0, +)
             let effective = sum > 0 ? 1 / used.map { ($0 / sum) * ($0 / sum) }.reduce(0, +) : 0
             weightingReport = WeightingReport(
-                preset: request.weighting.preset, ignoredByMode: !reducer.usesWeights,
+                preset: request.weighting.preset, ignoredByMode: !usesWeights,
                 usedFlatFallback: selection.usedFlatFallback, effectiveFrameCount: effective, rawRange: selection.rawRange
             )
         }
         return CompositeResult(
             image: image,
-            framesComposited: reducer.count,
+            framesComposited: framesComposited,
             missingFrames: missing,
             decodeFailures: reduction.failures,
             deliveredInPresentationOrder: reduction.inOrder,
             elapsedSeconds: Date().timeIntervalSince(started),
             alignment: report,
-            weighting: weightingReport
+            weighting: weightingReport,
+            median: median
         )
     }
 
@@ -420,21 +532,24 @@ public final class CompositeRenderer: @unchecked Sendable {
         } else {
             r.sourceSize = size
             r.outputSize = size.fitting(maxLongEdge: r.request.maxLongEdge)
-            r.reducer = r.request.blendMode.makeReducer(
-                width: r.outputSize.width, height: r.outputSize.height, opacity: r.request.opacity
-            )
-            r.frameBuffer = [Float](repeating: 0, count: r.outputSize.pixelCount * LinearImage.channelCount)
+            let rows = r.band?.count ?? r.outputSize.height
+            if r.request.blendMode.requiresFrameHistory {
+                r.reducer = MedianBandAccumulator(width: r.outputSize.width, height: rows, frameCapacity: r.total)
+            } else {
+                r.reducer = r.request.blendMode.makeReducer(width: r.outputSize.width, height: rows, opacity: r.request.opacity)
+            }
+            r.frameBuffer = [Float](repeating: 0, count: r.outputSize.width * rows * LinearImage.channelCount)
         }
         var image = image
         if let aligner = r.aligner {
             guard let moved = aligned(image, at: pts, sourceSize: size, aligner: aligner) else {
                 // Could not be registered: left out, reported, never stacked misaligned.
-                r.progress?(CompositeProgress(framesComposited: r.seen.count, framesTotal: r.total))
+                r.reportProgress()
                 return
             }
             image = moved
         }
-        renderFrame(image, sourceSize: size, outputSize: r.outputSize, into: &r.frameBuffer)
+        renderFrame(image, sourceSize: size, outputSize: r.outputSize, band: r.band, into: &r.frameBuffer)
         if let weights = r.weights {
             // Average normalises Σw itself; Additive and the sequential modes
             // take the raw curve value; Lighten/Darken ignore it.
@@ -446,7 +561,7 @@ public final class CompositeRenderer: @unchecked Sendable {
         r.seen.insert(pts)
         if let previous = r.previous, !(previous < pts) { r.inOrder = false }
         r.previous = pts
-        r.progress?(CompositeProgress(framesComposited: r.seen.count, framesTotal: r.total))
+        r.reportProgress()
     }
 
     // MARK: Video
@@ -579,16 +694,19 @@ public final class CompositeRenderer: @unchecked Sendable {
     /// Renders an upright frame into `buffer` (Float32 RGBA, linear, row 0 at
     /// the top), resampling with Lanczos in linear light if the output size
     /// differs from the source size.
-    private func renderFrame(_ image: CIImage, sourceSize: PixelSize, outputSize: PixelSize, into buffer: inout [Float]) {
+    private func renderFrame(_ image: CIImage, sourceSize: PixelSize, outputSize: PixelSize, band: Range<Int>? = nil,
+                             into buffer: inout [Float]) {
         var image = image
-        let bounds = CGRect(x: 0, y: 0, width: outputSize.width, height: outputSize.height)
+        let full = CGRect(x: 0, y: 0, width: outputSize.width, height: outputSize.height)
+        // A band is a row range from the top; Core Image's y axis points up.
+        let bounds = band.map { CGRect(x: 0, y: outputSize.height - $0.upperBound, width: outputSize.width, height: $0.count) } ?? full
         if outputSize != sourceSize {
             let scaleY = CGFloat(outputSize.height) / CGFloat(sourceSize.height)
             let scaleX = CGFloat(outputSize.width) / CGFloat(sourceSize.width)
             // Clamp so Lanczos has neighbours at the frame's own edges, then
             // crop back to the (scaled) frame so an aligned frame stays
             // transparent where it does not cover the canvas.
-            let covered = image.extent.applying(CGAffineTransform(scaleX: scaleX, y: scaleY)).intersection(bounds)
+            let covered = image.extent.applying(CGAffineTransform(scaleX: scaleX, y: scaleY)).intersection(full)
             image = image
                 .clampedToExtent()
                 .applyingFilter("CILanczosScaleTransform", parameters: [

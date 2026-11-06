@@ -36,6 +36,8 @@ struct PreviewSnapshot {
     let alignment: AlignmentReport?
     /// What temporal weighting did, when it was not flat.
     let weighting: WeightingReport?
+    /// How the Median was computed, for that mode.
+    let median: MedianReport?
     /// Size of the rendered canvas before straighten/crop (`size` is after).
     let canvasSize: PixelSize
 }
@@ -192,6 +194,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var settingsRevision = 0
     @Published private(set) var preview: PreviewSnapshot?
     @Published private(set) var renderActivity: RenderActivity = .idle
+    /// "pass 2 of 7" while a multi-pass mode (Median) renders; nil otherwise.
+    @Published private(set) var renderPass: String?
     @Published private(set) var exportActivity: ExportActivity = .idle
 
     /// The window's undo manager, handed in by the view. Settings changes
@@ -287,6 +291,12 @@ final class AppModel: ObservableObject {
     var canExport: Bool {
         if case .success? = selection, source != nil, !isExporting { return true }
         return false
+    }
+
+    /// How many decode passes a Median render needs at a given output size.
+    func medianPlan(for size: PixelSize?) -> MedianPlan? {
+        guard blendMode == .median, let size, let count = try? selection?.get().selectedCount, count > 0 else { return nil }
+        return MedianPlan(outputSize: size, frameCount: count)
     }
 
     /// Pixel size the next export will have.
@@ -1069,6 +1079,7 @@ final class AppModel: ObservableObject {
                     elapsedSeconds: result.elapsedSeconds,
                     alignment: result.alignment,
                     weighting: result.weighting,
+                    median: result.median,
                     canvasSize: result.image.size
                 )
                 self.renderActivity = .idle
@@ -1175,6 +1186,7 @@ final class AppModel: ObservableObject {
             guard let self, self.settingsRevision == revision, !self.isPreviewCurrent else { return }
             if case .rendering = self.renderActivity {
                 self.renderActivity = .rendering(done: progress.framesComposited, total: progress.framesTotal)
+                self.renderPass = progress.passes > 1 ? "pass \(progress.pass) of \(progress.passes)" : nil
             }
         }
     }
@@ -1183,6 +1195,7 @@ final class AppModel: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self, case .rendering = self.exportActivity else { return }
             self.exportActivity = .rendering(done: progress.framesComposited, total: progress.framesTotal)
+            self.renderPass = progress.passes > 1 ? "pass \(progress.pass) of \(progress.passes)" : nil
         }
     }
 

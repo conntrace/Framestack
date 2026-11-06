@@ -818,3 +818,91 @@ final class WeightingAppTests: XCTestCase {
         return rgb
     }
 }
+
+// MARK: - Median and luminance modes (M6b)
+
+@MainActor
+final class MedianAppTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("FrameStackMedianApp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var fixtures: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("FrameStackMediaTests/Fixtures")
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 30, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func waitReady(_ model: AppModel) async throws {
+        try await waitUntil { if case .ready = model.sourceState { return true } else { return false } }
+        try await waitUntil { model.isPreviewCurrent }
+    }
+
+    func testMedianPreviewExportAndModeMetadata() async throws {
+        let model = AppModel(defaults: UserDefaults(suiteName: "MedianApp-\(UUID().uuidString)")!)
+        model.open(fixtures.appendingPathComponent("moving_square_24f.mp4"))
+        try await waitReady(model)
+        XCTAssertNil(model.medianPlan(for: model.source?.displaySize))
+        model.blendMode = .median
+        let plan = try XCTUnwrap(model.medianPlan(for: model.source?.displaySize))
+        XCTAssertEqual(plan.passes, 1)
+        XCTAssertEqual(plan.frameCount, 24)
+        try await waitUntil { model.isPreviewCurrent }
+        let preview = try XCTUnwrap(model.preview)
+        XCTAssertEqual(preview.median?.passes, 1)
+        XCTAssertNil(model.renderPass, "single pass shows no pass counter")
+        XCTAssertEqual(preview.framesComposited, 24)
+        XCTAssertEqual(model.suggestedExportName, "moving_square_24f Median 24f.png")
+
+        model.exportSettings = ExportSettings(format: .png, bitDepth: .eight)
+        let out = directory.appendingPathComponent("median.png")
+        model.export(to: out)
+        try await waitUntil { !model.isExporting }
+        guard case let .finished(report, missing, _) = model.exportActivity else { return XCTFail("\(model.exportActivity)") }
+        XCTAssertEqual(report.width, 480)
+        XCTAssertEqual(missing, 0)
+        // The trail is gone in the file: the pixel at the square's path is black.
+        let data = try readRGB8(out)
+        XCTAssertLessThan(data[(96 * 480 + 200) * 3], 3)
+
+        model.blendMode = .maxLuminance
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertNil(model.preview?.median)
+        XCTAssertEqual(model.suggestedExportName, "moving_square_24f Max Luminance 24f.png")
+
+        // Opacity is hidden for the new modes; weighting reports "ignored".
+        XCTAssertFalse(BlendMode.minLuminance.usesOpacity)
+        model.weighting.preset = .late
+        model.blendMode = .minLuminance
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertTrue(model.preview?.weighting?.ignoredByMode ?? false)
+    }
+
+    private func readRGB8(_ url: URL) throws -> [UInt8] {
+        let source = CGImageSourceCreateWithURL(url as CFURL, nil)!
+        let image = CGImageSourceCreateImageAtIndex(source, 0, nil)!
+        let w = image.width, h = image.height
+        var buffer = [UInt8](repeating: 0, count: w * h * 4)
+        buffer.withUnsafeMutableBytes { raw in
+            let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for p in 0..<(w * h) { for c in 0..<3 { rgb[p * 3 + c] = buffer[p * 4 + c] } }
+        return rgb
+    }
+}

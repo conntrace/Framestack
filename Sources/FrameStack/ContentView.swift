@@ -296,7 +296,7 @@ private struct BottomBar: View {
         case let .rendering(done, total):
             ProgressView(value: Double(done), total: Double(max(total, 1)))
                 .frame(width: 160)
-            Text("Exporting \(done)/\(total)").monospacedDigit()
+            Text("Exporting \(done)/\(total)" + (model.renderPass.map { " · \($0)" } ?? "")).monospacedDigit()
             Button("Cancel") { model.cancelRendering() }
         case .writing:
             ProgressView().controlSize(.small)
@@ -327,7 +327,7 @@ private struct BottomBar: View {
         case let .rendering(done, total):
             ProgressView(value: Double(done), total: Double(max(total, 1)))
                 .frame(width: 160)
-            Text("Rendering \(done)/\(total)").monospacedDigit()
+            Text("Rendering \(done)/\(total)" + (model.renderPass.map { " · \($0)" } ?? "")).monospacedDigit()
             Button("Cancel") { model.cancelRendering() }
         case let .failed(message):
             Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).lineLimit(2)
