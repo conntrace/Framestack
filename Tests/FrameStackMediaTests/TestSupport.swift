@@ -14,6 +14,27 @@ enum Fixture: String {
     case blackWhite = "black_white_30f"
     /// 10 frames encoded 320×180 with a 90° clockwise display matrix.
     case portrait = "portrait_rot90cw"
+    /// Stream-copied cut of `count`: stores frames 30…106, edit list
+    /// presents frames 45…106 (62 frames) starting at t = 0.
+    case trimmed = "trimmed_editlist"
+    /// The count clip with the NAL length of frame 75 (pts 2.5 s) overwritten
+    /// with 0xFFFFFFFF, so the decoder fails on that sample.
+    case corrupt = "corrupt_frame_75"
+    /// 10 frames, 320×180, HEVC Main10 (lossless): a horizontal luma ramp
+    /// from 10-bit code 64 to 940, one code step every ~0.37 px.
+    case tenBit = "tenbit_ramp_10f"
+    /// 8 frames, 320×180, one static block-noise scene cut at the known
+    /// offsets in scripts/make_fixtures.py `HANDHELD_OFFSETS` (H.264 crf 12).
+    case handheld = "handheld_8f"
+    /// 24 frames, 320×180, black; a white 8×8 point at x = 16 + 8·i, y = 88:
+    /// every column in [16, 208) is lit by exactly one frame.
+    case brightPoint = "bright_point_24f"
+    /// 24 frames, 320×180, wall sRGB 200; a dark (sRGB 16) 24×96 shape at
+    /// x = 16 + 8·i, y in [40, 136): columns [32, 208) are covered by
+    /// exactly three consecutive frames.
+    case silhouette = "silhouette_24f"
+    /// 8 frames, 160×96 mid gray whose transfer tag says logarithmic 100:1.
+    case logTagged = "log_tagged_8f"
 
     var url: URL {
         guard let url = Bundle.module.url(forResource: rawValue, withExtension: "mp4", subdirectory: "Fixtures") else {
@@ -42,12 +63,15 @@ let sharedRenderer = CompositeRenderer(
 func render(
     _ fixture: LoadedFixture,
     indices: [Int],
+    mode: BlendMode = .average,
+    opacity: Float = 1,
     maxLongEdge: Int? = nil
 ) async throws -> CompositeResult {
     let request = CompositeRequest(
         source: fixture.info,
         frames: indices.map { fixture.timeline.frames[$0] },
-        blendMode: .average,
+        blendMode: mode,
+        opacity: opacity,
         maxLongEdge: maxLongEdge
     )
     return try await sharedRenderer.render(request)

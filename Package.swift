@@ -44,5 +44,12 @@ let package = Package(
             dependencies: ["FrameStackCore", "FrameStackMedia"],
             resources: [.copy("Fixtures")]
         ),
+        // Drives AppModel (the window's state) through the README checklist
+        // without a window. SwiftPM supports @testable import of executable
+        // targets on macOS.
+        .testTarget(
+            name: "FrameStackAppTests",
+            dependencies: ["FrameStack", "FrameStackCore", "FrameStackMedia"]
+        ),
     ]
 )

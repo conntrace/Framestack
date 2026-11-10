@@ -36,6 +36,37 @@ final class ImportAndScanTests: XCTestCase {
         XCTAssertEqual(try FrameSampler.select(from: fixture.timeline, range: twoToFive, mode: .everyNth(3)).selectedCount, 30)
     }
 
+    /// The fast sample-table scan must yield exactly the timestamps the
+    /// decoder delivers, for every fixture (B-frame delay edit list,
+    /// trimming edit list, no edit list, rotation).
+    func testSampleTableScanAgreesWithDecodeScan() async throws {
+        for fixture in [Fixture.count, .trimmed, .movingSquare, .blackWhite, .portrait] {
+            let info = try await VideoSourceLoader.load(url: fixture.url)
+            let fast = try await FrameScanner.scan(info, preference: .automatic)
+            let decoded = try await FrameScanner.scan(info, preference: .decodeOnly)
+            XCTAssertEqual(decoded.method, .decode)
+            XCTAssertEqual(fast.timeline, decoded.timeline,
+                           "\(fixture.rawValue): method \(fast.method) \(fast.fallbackReason ?? "")")
+            if fixture == .count {
+                XCTAssertEqual(fast.method, .sampleTable, fast.fallbackReason ?? "")
+            }
+        }
+    }
+
+    func testTrimmedEditListPresentsOnlyEditedFrames() async throws {
+        let clip = try await loadFixture(.trimmed)
+        XCTAssertEqual(clip.timeline.count, 62)
+        XCTAssertEqual(clip.timeline.frames.first, .zero)
+        XCTAssertEqual(clip.timeline.frames.last, FrameTime(value: 61, timescale: 30))
+        let first = try await render(clip, indices: [0])
+        XCTAssertEqual(decodeFrameIndex(first.image), 45)
+        let last = try await render(clip, indices: [61])
+        XCTAssertEqual(decodeFrameIndex(last.image), 106)
+        let all = try await render(clip, indices: Array(0..<62), maxLongEdge: 64)
+        XCTAssertEqual(all.framesComposited, 62)
+        XCTAssertEqual(all.missingFrames, [])
+    }
+
     func testPortraitOrientationFromDisplayMatrix() async throws {
         let info = try await VideoSourceLoader.load(url: Fixture.portrait.url)
         XCTAssertEqual(info.encodedSize, PixelSize(width: 320, height: 180))

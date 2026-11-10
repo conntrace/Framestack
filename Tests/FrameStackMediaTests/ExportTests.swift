@@ -69,11 +69,22 @@ final class ExportTests: XCTestCase {
         XCTAssertEqual(try readBackPixels(url, bitDepth: .eight).rgb.first, 1)
     }
 
-    func testTransparentCompositeIsRejectedNotSilentlyFlattened() {
-        let url = directory.appendingPathComponent("alpha.png")
-        XCTAssertThrowsError(try ImageExporter.writePNG(LinearImage(width: 2, height: 2, fill: SIMD4(0.25, 0.25, 0.25, 0.5)), to: url, bitDepth: .eight)) {
-            XCTAssertEqual($0 as? MediaError, .transparencyNotSupported)
-        }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    func testTransparencyIsKeptByPNGAndFlattenedByJPEG() throws {
+        // Premultiplied (0.25, 0.25, 0.25, 0.5) = straight gray 0.5 at half coverage.
+        let image = LinearImage(width: 2, height: 2, fill: SIMD4(0.25, 0.25, 0.25, 0.5))
+        let png = directory.appendingPathComponent("alpha.png")
+        let report = try ImageExporter.writePNG(image, to: png, bitDepth: .sixteen)
+        XCTAssertTrue(report.hasAlpha)
+        XCTAssertFalse(report.alphaFlattened)
+        XCTAssertEqual(report.bitDepth, 16)
+        let jpeg = directory.appendingPathComponent("alpha.jpg")
+        let flat = try ImageExporter.write(image, to: jpeg, settings: ExportSettings(format: .jpeg))
+        XCTAssertFalse(flat.hasAlpha)
+        XCTAssertTrue(flat.alphaFlattened)
+        // Over black: premultiplied 0.25 linear → sRGB 137.
+        XCTAssertEqual(try readBackPixels(jpeg, bitDepth: .eight).rgb[0] * 255, 137, accuracy: 3)
+        // Opaque images never get an alpha channel.
+        let opaque = try ImageExporter.writePNG(LinearImage(width: 2, height: 2, fill: SIMD4(0.25, 0.25, 0.25, 1)), to: directory.appendingPathComponent("opaque.png"), bitDepth: .eight)
+        XCTAssertFalse(opaque.hasAlpha)
     }
 }

@@ -1,14 +1,66 @@
 # FrameStack
 
-A native, local-first macOS app that turns time into a still image: import a video, choose exactly which frames to use, and combine them into one photograph — starting with a true equal-weight, linear-light **Average** (a "long exposure" from video).
+A native, local-first macOS app that turns time into a still image: import a video or a folder of stills, choose exactly which frames to use, and combine them into one photograph — starting with a true equal-weight, linear-light **Average** (a "long exposure" from video).
 
 Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent rules: [`AGENTS.md`](AGENTS.md) · plan & status: [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) · decisions: [`DECISIONS.md`](DECISIONS.md).
 
 ## Status
 
-**M1 (first useful slice):** open a MOV/MP4 (drag & drop or ⌘O) → see metadata and the scanned frame count → pick a `[start, end)` range and **All / Every Nth / Exact Count** → live preview of the **Average** → export a **full-resolution 8- or 16-bit sRGB PNG**. Rendering runs off the main thread with progress and cancel.
+**M1 (first useful slice) — verified on the owner's Mac (macOS 27, Apple M4 Pro, Xcode 27):** open a MOV/MP4 (drag & drop, ⌘O, Finder "Open With", drop on the Dock icon, or `open -a FrameStack clip.mov`) → see metadata and the scanned frame count → pick a `[start, end)` range and **All / Every Nth / Exact Count** → live preview of the **Average** → export a **full-resolution 8- or 16-bit sRGB PNG**. Rendering runs off the main thread with progress and cancel. Damaged frames are skipped and reported (never replaced by a neighbour); iCloud files that are not downloaded are refused with a clear message.
 
-Not yet: other blend modes (M2), filmstrip scrubbing/zoom/compare (M3), project files and JPEG/TIFF (M4), image sequences and alignment (M5), weighting/masks/motion/color/batches (M6). See the plan.
+**M2 (creative blending):** a **Blend** menu with **Average, Lighten, Darken, Screen, Multiply, Additive, Difference, Normal (opacity stack)** and an opacity slider for the modes that use it; each mode's exact formula is shown under the menu. All modes share the linear-light pipeline, preview matches export, and every mode has fixed-value reference tests and fixture renders (`DECISIONS.md` D-017).
+
+**M3 (artist workflow):** a filmstrip with draggable in/out handles and a playhead; frame-accurate First/Last frame fields; **Original / Composite / Side by Side** views of the exact source frame under the playhead; zoom to fit, 100 %, zoom in/out, pinch and pan; undo/redo of every setting; collapsible inspector sections; File › Open Recent.
+
+**M4 (robust output and state):** **`.framestack` projects** (⌘S / ⇧⌘S) — one JSON file holding a reference to the video (bookmark + path + size/fingerprint), the time range, sampling, blend, export settings and the playhead; reopening rescans the clip and restores everything. A moved or renamed video is found again; a missing or changed video stops at a **relink** screen (Locate… / Use This File Anyway / Cancel) and is never swapped in silently. **Export** as PNG (8/16-bit), JPEG (quality) or TIFF (8/16-bit), at native size, a long-edge cap or a percentage, in sRGB or Display P3 — every file is read back and its size, depth and profile verified. 10-bit (HEVC Main10 / HDR) clips are decoded to half-float so their precision reaches the composite.
+
+**M5a (image sequences):** open a **folder of JPEG/PNG/TIFF/HEIF stills** (or several chosen files, or one image for its folder) — natural name order, a **sequence rate** field and **Reverse order** toggle, times labelled as *sequence time* because stills have no recorded timestamps; EXIF orientation and embedded profiles (Display P3 phone JPEGs) are honoured; transparent PNGs keep their alpha in PNG/TIFF exports. Mixed sizes are refused with the offending files named; sequences save into projects and relink like videos.
+
+**M5b (alignment):** an **Alignment** section registers every frame to a reference (middle frame or the playhead frame) with Vision before blending — *Shift only* or guarded *Perspective* — so a drifting handheld camera does not blur the background. The inspector reports how many frames aligned, were left out because they could not be registered, or fell back to a plain shift, and the largest shift; a yellow dashed **safe area** on the preview shows where every frame still has pixels, and exports keep the uncovered edges transparent. Transforms are computed once at ≤ 2048 px, so preview and export align identically and an export reuses the preview's work.
+
+**M5c (crop, straighten, canvas):** a **Crop & Straighten** section with a straighten slider, a crop in canvas pixels, **Crop to Safe Area** (the largest rectangle every aligned frame covers after the angle) and an **Edges** choice (transparent / black / white) — all applied once to the finished composite, so preview and export match exactly. A folder of **mixed-size stills** can be opened with **Fit** (transparent bars) or **Fill** (overflow cropped) instead of being refused; the choice is saved with the project.
+
+**M6a (temporal weighting):** a **Weighting** section — Flat, Favor Early, Favor Late, Favor Middle or a Custom curve with draggable points — weights every selected frame by its real timestamp inside the selection. Average becomes a normalised weighted mean, Additive an exposure accumulation, the sequential modes scale opacity per frame; Lighten/Darken say they have no weights. The curve is drawn with one tick per selected frame and the "effective frame count" the weighting is worth.
+
+**M6b (median, luminance):** **Median** is an exact per-pixel median of every selected frame, computed in horizontal bands within a memory budget (the clip is decoded once per band; the Blend section tells you how many passes the preview and the export will take and the bottom bar counts them) — moving subjects vanish, the static scene stays. **Max Luminance** / **Min Luminance** keep, per pixel, the whole colour of the brightest / darkest frame, unlike Lighten/Darken's per-channel extremes.
+
+**M6c (motion mask):** a **Motion Mask** section keeps only the pixels that differ from a background (the Median of the selection, or the playhead frame): threshold, feather, clean-up and invert, with a **mask coverage** view. The masked frames feed whichever blend you chose and the result is laid over the background — Normal + mask is chronophotography, Average + mask a ghost of the motion, Invert keeps only what stood still.
+
+**M6d (painted mask):** a **Painted Mask** section — paint on the preview with a sized, soft brush (or erase), invert, clear — limits the blend to the painted region; everything else shows the background. Strokes are stored as resolution-independent vectors in the project and each stroke is one undo step.
+
+**M6e (colour):** a **Color** section with exposure, contrast, saturation, temperature and tint, applied to the finished composite before crop and straighten. Colour and geometry changes re-process the cached composite instead of decoding the clip again, so they are instant; exports apply exactly the same maths.
+
+**M6g (tone curve):** the Color section ends with a **Tone Curve**: five points dragged up or down over a dotted "no change" diagonal, or a Shape (Soft Contrast, Strong Contrast, Lift Shadows, Fade, Matte). It is a monotone curve on sRGB-encoded tones, applied last in the colour chain, and like the other colour controls it never decodes a frame.
+
+**M6h (which frames, in which order):** Sampling has a fourth choice, **Pattern** — take N frames in a row, skip M, repeat from the start of the range. Under it, **Frame under the playhead** lets you **Exclude** one frame (a bird, a bump, a flash) or **Include** one the sampling skipped; nothing replaces an excluded frame, the timeline marks excluded frames with a red cross and forced ones with a white dot, and **X** on the focused timeline toggles Exclude. Overrides belong to the document: they are saved in the project, never in a preset. For the modes where order matters (Screen, Multiply, Difference, Normal) the Blend section offers **Reverse stacking order**, so the first frame ends on top instead of the last; a video is decoded back to front in chunks that stay inside the memory budget, and the section says how many.
+
+**M6i (starters, split the range):** the Presets menu opens with six built-in **starters** — Long Exposure, Light Trails, Dark Trails, Empty Scene, Action Sequence, Fading Echo. A starter changes only which frames are used, how they blend, how they are weighted and whether only the moving parts are kept; alignment, crop, colour, the painted mask, the time range and the export settings stay as they are, so trying one never undoes work (one undo step). In **Batch Export…**, starters can be ticked like blend modes, and **Split the range** writes every chosen version once per part: N equal parts by frame count (2 to 99), each sampled, weighted and masked on its own, named "… part 03 of 12 30f.png" so the files sort in time order; **Also export the whole range** adds the unsplit versions.
+
+**M6f (presets, batch):** a **Presets** section saves the creative choices — sampling, blend, weighting, alignment mode, mask parameters, straighten angle and edge fill, colour, export settings — as a named `.framestackpreset` file in `~/Library/Application Support/FrameStack/Presets`, never the clip, its time range, crop or painted strokes, so a preset applies to any clip (one undo step; the section says what was kept from the open document). **Batch Export…** (⇧⌘E) writes several variants of the same frames — the current settings, other blend modes, saved presets — into one folder with deterministic, collision-safe names; variants that share a composite are rendered once, each row reports its status, and the batch can be cancelled without leaving partial files.
+
+| Keys | |
+|---|---|
+| ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
+| ⌘S · ⇧⌘S | save the project · save as |
+| ⌘E | export an image (format, size and color space in the Export section) |
+| ⌘Z / ⇧⌘Z | undo / redo settings |
+| ⌥← ⌥→ (⌥⇧ ×10) | step the playhead; with the timeline focused, plain ← → ⇧ Home End also work |
+| ⌥I / ⌥O | set in / out point at the playhead (I / O when the timeline is focused) |
+| X (timeline focused) | exclude the playhead frame from the composite, or put it back |
+| ⌥⌘← ⌥⌘→ · ⌥⌘F | playhead to range start / end · full clip |
+| ⌥⌘1 / 2 / 3 | Composite / Original / Side by Side |
+| ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
+| ⌘R · ⌘. | render preview now · cancel |
+
+**M6j (crop on the preview):** in Crop & Straighten, **Edit Crop on Preview** (also View ▸ Crop on Preview, ⌘K) shows the whole straightened canvas with the crop drawn over it. Drag a corner or an edge to resize, drag inside to move, drag outside the crop to draw a new one; **Done** on the preview returns to the cropped picture. Each drag is one undo step and does not re-process the picture. **Shape** locks the crop to Original or to 1:1, 5:4, 4:3, 3:2, 16:9 or 2:1 (**Flip Shape** for portrait); the lock also holds for the number fields and for Crop to Safe Area, and is not saved with the project. Exports always use the crop, whether or not you are editing it (D-034).
+
+**M6k (camera RAW, low memory, log notice):** a folder of camera RAW files opens as a still sequence (tried here with Sony ARW and with DNG; which other cameras work depends on this macOS). Each frame is developed with **Apple's default rendering**, the one macOS's own image reader gives the file (measured equal within 0.001); there are no RAW development controls, and the source notice says so. Previews develop a reduced picture (about half a second a frame from a 60-megapixel camera here); full-size export develops every pixel (a second or two a frame, and several gigabytes of memory while it runs). A shot that is in the folder twice, as RAW and as JPEG, is counted twice and the notice tells you. If macOS reports that memory is **critically low**, the running preview, export or batch stops with a message instead of pushing on, and nothing restarts by itself. A clip **tagged as log** footage gets a notice that FrameStack has no log conversion; log footage without such a tag cannot be recognised (D-035, D-036).
+
+**M6 exit review (speed, measured):** on this Mac (M4 Pro) a 1200-frame 4K clip previews at 1080 px in about 11 s with Average, Lighten, weighting or Max Luminance (about 110 frames a second), 16 s with reverse stacking, 35 s with alignment, 45 s with Median, and just under a minute with a motion mask or a painted mask over a median background (the median is 45 s of that; choosing a single background frame avoids it). At full 4K, 300 frames take 3 to 6 s in the streaming modes, 40 s with Median and 54 s with the motion mask, which was 167 s before its clean-up and feather were made to run on all cores with identical results. Memory peaked at 4.3 GB over the whole run. The full table, how it was measured and what was not measured are in D-038.
+
+**iCloud files are never downloaded by FrameStack:** a video that is only in iCloud is refused with a message; in a folder of stills the images that are not on this Mac are left out and named in the source notice, and the rest open; a project whose source has moved to iCloud opens the "source has changed" sheet saying so. Download the files in Finder, then open again (D-037).
+
+Not yet: HDR tone mapping, RAW development controls, log conversion, and the optional items listed in D-038 (a gamma-space creative mode, separate blend modes for foreground and background, a two-mode compare view, auto-save, manual drag reordering of stills). See the plan.
 
 ## Requirements
 
@@ -40,7 +92,21 @@ swift test
 FRAMESTACK_ARTIFACTS_DIR=/tmp/framestack-renders swift test
 ```
 
-The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures` (regenerate with `python3 scripts/make_fixtures.py`, needs numpy + ffmpeg):
+To run the engine on your own footage and get frame counts, timings, memory use and a color cross-check against Apple's decoder:
+
+```bash
+FRAMESTACK_REAL_CLIPS="/path/a.mov:/path/b.mp4" FRAMESTACK_ARTIFACTS_DIR=/tmp/framestack-renders swift test --filter RealClipTests
+```
+
+To time the expensive features on a long clip of your own (release build; prints a table, asserts only the frame counts):
+
+```bash
+FRAMESTACK_PERF_CLIP=/path/long.mp4 FRAMESTACK_PERF_FRAMES=1200 FRAMESTACK_PERF_FULL_FRAMES=300 swift test -c release -Xswiftc -enable-testing --filter PerformanceProbe
+```
+
+`FrameStackAppTests` drives the app's model through the manual checklist below, so the checklist is covered by `swift test` too.
+
+The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures` (regenerate with `python3 scripts/make_fixtures.py`, needs numpy + ffmpeg with libx264 and libx265):
 
 | Fixture | What it proves |
 |---|---|
@@ -48,8 +114,16 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 | `moving_square_24f.mp4` — white square moving over black, static gray bar | Average is computed in linear light (trail = 2/24 → 82/255, not 21/255); static content is reproduced; preview ≈ full-res export |
 | `black_white_30f.mp4` — alternating black/white frames | Linear 0.5 → 188/255; every-2nd = only black frames |
 | `portrait_rot90cw.mp4` — 90° display matrix | Portrait clips render upright with correct dimensions |
+| `trimmed_editlist.mp4` — stream-copied cut with an MP4 edit list | Only frames inside the edit are counted/used (45…106); fast scan = decoder timestamps |
+| `corrupt_frame_75.mp4` — count clip with one damaged NAL unit | The decoder failure is skipped; the damaged GOP is reported missing, every other frame is composited and keeps its identity |
+| `tenbit_ramp_10f.mp4` — HEVC Main10 (lossless), a 10-bit luma ramp | 10-bit sources are identified and decoded to half-float: 320 distinct ramp values survive (8-bit decode: 205) and a 16-bit PNG keeps them |
+| `sequence_png_12f/` — 12 PNG stills `frame_0…11.png` (+ a stray text file), index in binary blocks, gray bar | Natural sort (frame_10 after frame_9), non-images skipped, sequence time i/rate, every still decodes to itself, Average matches fixed values, reverse order, EXIF orientation and alpha (variants written by the tests) |
+| `handheld_png_8f/` and `handheld_8f.mp4` — one static block-noise scene cut at 8 known offsets (a drifting camera) | Alignment recovers every shift (0.5 px lossless, 1 px H.264), the aligned Average equals the reference inside the safe area while the unaligned one blurs, preview and export share transforms, implausible warps fall back to the shift |
+| `bright_point_24f.mp4` — a white 8×8 point crossing black, 8 px a frame | The light-trail subject: Lighten, Max Luminance and Screen keep the whole trail at full brightness, Average dims it to 1/24, Darken, Median, Min Luminance and Multiply lose it |
+| `silhouette_24f.mp4` — a dark shape crossing a light wall, each column covered by exactly 3 frames | The dark-trail subject: Darken smears the shape into a band, Lighten, Median and Max Luminance give the empty wall, Average is the linear mix (3 dark + 21 light) ÷ 24 |
+| `log_tagged_8f.mp4` — mid gray tagged with the logarithmic 100:1 transfer | Log-tagged clips are identified and get the "no log conversion" notice; they still stack |
 
-## Manual verification (GUI — please run once on your Mac)
+## Manual verification (GUI — all 7 steps passed on the owner's Mac on 2026-11-06)
 
 1. Launch, drop any phone clip on the window. Inspector shows file name, pixels (and rotation for portrait clips), duration, nominal fps, codec, color tags; "Frames" first shows `≈ … (estimate)` then the scanned count.
 2. Preview appears within a moment; bottom bar shows `N frames in range → N selected` and the timeline strip shows ticks.
@@ -58,6 +132,29 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 5. While a preview renders on a long clip, click **Cancel** (or ⌘.) — the app stays responsive.
 6. **Export PNG…** (⌘E), 16-bit. When finished the inspector shows the verified size/bit depth/profile; **Show in Finder**; open the file in Preview and compare with the on-screen preview.
 7. Change settings and export again without re-importing.
+8. (M3) Drag the right handle of the filmstrip to the middle; "Last frame" and the count follow, the film outside dims. Click the strip to place the playhead, press → a few times, then I: "First frame" jumps to the playhead. ⌘Z twice restores the range; ⇧⌘Z redoes.
+9. (M3) Switch the toolbar to **Original**, then **Side by Side**; ⌘1 shows 100 %, ⌘= zooms in, scroll pans, ⌘0 fits. Collapse the Source section; it stays collapsed after a relaunch. File › Open Recent lists the clips you opened.
+10. (M4) Change a few settings, ⇧⌘S, save `demo.framestack` next to the clip. The title becomes "demo – clip.mov"; the Project section says Saved. Change the blend: the subtitle shows "Edited"; ⌘Q asks Save / Don't Save / Cancel. Quit with Save, double-click the project in Finder (or ⌘O it): the same settings, selection and preview come back.
+11. (M4) Rename the clip in Finder and open the project: it opens anyway (Project shows "Unsaved changes" for the new location). Move the clip to another disk or delete it and open the project: "Source not found" with Locate…; pick the clip. Put a *different* video under the old name: "Source has changed" lists size/fingerprint differences; Use This File Anyway loads it with an orange notice describing what differs.
+12. (M4) In Export choose JPEG + Percent 50 and export; the inspector reports "Saved 540×960, 8-bit JPEG, sRGB IEC61966-2.1" and Finder agrees. Choose TIFF 16-bit + Display P3; the report says Display P3 and the image looks the same as the sRGB one in Preview (color-managed).
+13. (M5a) Drop a folder of same-size photos (or choose several in ⌘O). Source shows "N (JPEG ×N)", the pixel size after rotation, a Sequence rate field and Reverse order; the Time Range caption says "sequence time". Type 10 in the rate field, Return: End becomes N/10 s and the frames stay selected. Tick Reverse order: the filmstrip flips. Save as a project, quit, reopen: rate and order come back. A folder mixing portrait and landscape shots is refused with the file names.
+14. (M5b) Open a handheld clip, narrow the range to ~10 frames, turn on **Align frames before blending**: the preview re-renders sharper, the caption says "aligned", the Alignment section reports "N aligned to frame at … · max shift … px" and a yellow dashed safe area appears. Click the strip to move the playhead and **Use Playhead Frame**; ⌘Z restores the middle reference. Export: the inspector says "with alpha" because the moved edges are transparent.
+15. (M5c) With alignment on, drag **Straighten** a few degrees: the corners show the checkerboard. **Crop to Safe Area**: the preview shrinks to a clean rectangle and "Output W×H of the canvas" updates; type a Width in the crop fields, Return, and the preview follows; **Edges → Black** fills any remaining transparency (the export report no longer says "with alpha"). ⌘Z steps back through Change Crop / Straighten.
+16. (M5c) Open a folder of photos that mix portrait and landscape: the refusal names the files and offers **Fit** and **Fill**; Fit shows letterboxed stills, the Source section says how many were scaled, and the Canvas menu switches between the three policies.
+17. (M6a) In Weighting choose **Favor Late**: the curve rises, the ticks follow the selected frames, the caption reports the raw range and the effective frame count, and the preview re-renders favouring the end of the range. Choose **Custom** and drag a point: one undo step. Switch Blend to Lighten: the note says the curve is ignored.
+18. (M6b) Choose Blend → **Median** on a clip with a moving subject: the caption says how many passes the preview needs, the bar counts "pass p of P" on long clips, and the subject disappears from the result while the background stays sharp. **Max Luminance** keeps the brightest frame's whole colour per pixel.
+19. (M6c) Blend → **Normal**, then turn on **Keep only what moves**: the subject appears at every position over a clean background (chronophotography); the section reports the background used and the moving-pixel share. Tick **Show mask coverage**: white where motion was. Raise the threshold until noise disappears; **Invert** shows the still scene only; **Use Playhead Frame** swaps the background for a frame.
+20. (M6d) In Painted Mask turn on **Paint on the preview** and drag a stroke across part of the image: a red stroke appears, the blend applies only inside it and the background shows elsewhere; ⌘Z removes the stroke ("Undo Paint Mask"). Switch the brush to Erase and cross the stroke; **Invert** flips the region.
+21. (M6e) Drag **Exposure** to +1: the preview updates without a render pass (no "Rendering" in the bar) and ⌘Z reads "Undo Change Exposure"; Saturation −100 % gives a neutral image; Reset returns everything. Export and compare with the preview.
+22. (M6f) In Presets click **Save…**, name the current look and Save: the menu button shows the name. Change the blend mode, then pick the preset from the menu: the blend returns, the section says what was kept from this clip (time range, crop, strokes), and ⌘Z reads "Undo Apply Preset". Open another clip: the preset is still there and applies to it.
+23. (M6f) **Batch Export…** (⇧⌘E, or the button under Export): tick two more blend modes and the preset, read "N outputs, M render passes", choose a folder and **Export Here**: each row goes Waiting → Rendering → Writing → size/depth/profile; variants that only differ in colour or crop share a render pass; a file that already exists is kept and the new one gets " 2". **Cancel Batch** mid-way leaves the finished files only; **Show in Finder** selects them.
+24. (M6g) At the bottom of Color, drag the middle point of the **Tone Curve** up: the preview brightens without a render pass and ⌘Z reads "Undo Change Tone Curve". Pick Shape → **Soft Contrast**: the curve becomes an S. Shape → Linear puts the diagonal back.
+25. (M6h) Sampling → **Pattern**, Take 2, Skip 3: the bottom bar reads "N frames in range → M selected" with M = two in every five. Click a selected frame on the timeline and choose **Exclude** (or press X): a red cross appears there, the count drops by one and reads "(1 excluded)". Click a skipped frame and choose **Include**: a white dot, "(1 excluded, 1 added)". **Clear Overrides** removes both. Blend → **Normal**, opacity 100 %: the last frame shows; tick **Reverse stacking order**: the first frame shows and the caption says how the clip was decoded back to front. Switch Blend to Average: the toggle disappears (order cannot matter).
+26. (M6i) In Presets open the menu: **Starters** lists six looks above your saved presets. Pick **Light Trails**: the blend becomes Lighten, the section says "Applied “Light Trails”" and that everything else was kept; ⌘Z ("Undo Apply Preset") brings the previous look back, and the export settings never change. Open **Batch Export…**, tick **Split the range**, set 4 parts: the caption reads "4 parts of N frames (… each), in time order" and the summary shows versions × 4 outputs. **Export Here**: the folder holds "… part 1 of 4 …" to "… part 4 of 4 …" for every ticked version, each made only of its own quarter of the range.
+27. (M6j) Open **Crop & Straighten** and click **Edit Crop on Preview** (or press ⌘K): the preview shows the whole canvas with a margin, a grid and handles, and a bar at the top reads the crop size with a **Done** button. Drag the bottom-right corner inward: the outside dims, the Width and Height fields and "Output W×H of the canvas" follow, and one **Undo** ("Undo Change Crop") restores the crop. Drag inside the crop to move it; drag from outside it to draw a new one. Choose **Shape → 16 : 9**: the crop reshapes about its centre, the read-out adds "· 16 : 9", and corner drags keep the shape; **Flip Shape** makes it 9 : 16. Click **Done**: the preview shows only the crop, and an export has exactly the Output size.
+28. (M6k) Open a folder of camera RAW files that are **downloaded to this Mac** (in Finder, a cloud icon next to a file means it is not): the filmstrip fills at once from the cameras' own previews, the source notice says the files are developed with Apple's default rendering and that there are no RAW controls, and the preview appears after about half a second a frame for 60-megapixel files. Export at **Original size** and compare a single-frame export with the same RAW in Preview: the colours should match. If the folder also holds a JPEG of each shot, the notice says how many shots are counted twice. Open a clip your camera recorded in a log profile: if the file is tagged as log, a notice says there is no log conversion; if there is no notice, the file does not carry the tag and FrameStack cannot tell.
+29. (D-037) Open a folder in iCloud Drive (or on a Desktop kept in iCloud) where some photos show a cloud icon in Finder: the folder opens with the photos that are on this Mac, the source notice says how many are stored in iCloud and names the first few, and the cloud icons in Finder are unchanged afterwards (nothing was downloaded). Right-click a photo in Finder, **Download Now**, open the folder again: it is included.
+30. (D-039) Turn VoiceOver on (⌘F5) and move through the inspector with ⌃⌥→: every slider says its name and a value in words ("Straighten, 0.0 degrees", "Brush size, 4 percent", "Exposure, +0.00 EV"), the toolbar menu says "Preview resolution" and the field under the timeline says "Frame under the playhead". ⌘F5 turns VoiceOver off again.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 
@@ -65,16 +162,18 @@ Please report anything off — especially colors versus QuickTime Player, and an
 
 - Frames are identified by exact presentation timestamps (rational, like `CMTime`); ranges are start-inclusive/end-exclusive.
 - Each frame is converted by Core Image from its own color tags to **linear light** (extended sRGB primaries, 32-bit float), oriented upright, then added to **64-bit accumulators**. Average = sum ÷ count. Memory depends on output size, not frame count.
-- Export clamps to [0, 1], applies the sRGB curve once, rounds, and writes an sRGB-tagged PNG, then re-reads the file to verify it.
+- Colour adjustments run on the finished composite: exposure, white balance and saturation in linear light, contrast around mid-gray and then the tone curve in sRGB-encoded values; then straighten/crop/edge fill.
+- Export clamps to [0, 1], applies the sRGB curve once, rounds, and writes an sRGB-tagged file (PNG/JPEG/TIFF), then re-reads the file to verify it. Display P3 output first converts the linear values with the sRGB→P3 primaries matrix. Downscaled exports resample each frame with Lanczos in linear light before accumulation — the same path the preview uses.
+- Other modes use the same frames: Lighten/Darken are per-channel max/min; Additive is the plain sum (× opacity, kept above 1 until export); Screen, Multiply, Difference and Normal run oldest-to-newest from the first selected frame with `C' = C + opacity × (blend(C, F) − C)`. Normal at 100 % is exactly the last selected frame. Median is the exact per-channel median (mean of the two middle values for an even count), computed band by band so memory stays bounded; Max/Min Luminance pick the whole pixel of the frame with the extreme linear luminance.
 
-Details and trade-offs: `DECISIONS.md` D-004 to D-009.
+Details and trade-offs: `DECISIONS.md` D-004 to D-009 and D-013 to D-021.
 
 ## Layout
 
 ```
 Package.swift
 Sources/FrameStackCore/    time model, sampler, accumulator, color math, orientation (pure Swift)
-Sources/FrameStackMedia/   AVFoundation scan/decode, Core Image conversion, PNG export
+Sources/FrameStackMedia/   AVFoundation scan/decode, Core Image conversion, image export, project file
 Sources/FrameStack/        SwiftUI app
 Tests/FrameStackCoreTests/ unit tests
 Tests/FrameStackMediaTests/ end-to-end tests + fixtures

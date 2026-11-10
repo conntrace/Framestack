@@ -4,6 +4,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.undoManager) private var undoManager
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,22 +19,31 @@ struct ContentView: View {
             BottomBar()
         }
         .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            model.open(url)
+            guard !urls.isEmpty else { return false }
+            model.open(urls)
             return true
         }
         .toolbar {
+            ToolbarItemGroup(placement: .principal) {
+                Picker("View", selection: $model.viewMode) {
+                    ForEach(PreviewViewMode.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .disabled(model.timeline == nil)
+                .help("Composite, the original frame under the playhead, or both")
+            }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
                     model.presentOpenPanel()
                 } label: {
                     Label("Open", systemImage: "folder")
                 }
-                .help("Open a video (⌘O)")
+                .help("Open a video, a folder of images or a project (⌘O)")
                 Picker("Preview", selection: $model.previewQuality) {
                     ForEach(PreviewQuality.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .pickerStyle(.menu)
+                .accessibilityLabel("Preview resolution")
                 .help("Preview resolution. Export is always full resolution.")
                 Button {
                     model.presentExportPanel()
@@ -41,10 +51,16 @@ struct ContentView: View {
                     Label("Export…", systemImage: "square.and.arrow.up")
                 }
                 .disabled(!model.canExport)
-                .help("Export the composite as a full-resolution PNG (⌘E)")
+                .help("Export the composite as an image (⌘E)")
             }
         }
-        .navigationTitle(model.source?.fileName ?? "FrameStack")
+        .sheet(isPresented: $model.isBatchSheetPresented) {
+            BatchSheetView().environmentObject(model)
+        }
+        .navigationTitle(model.windowTitle)
+        .navigationSubtitle(model.windowSubtitle)
+        .onAppear { model.undoManager = undoManager }
+        .onChange(of: undoManager) { _, new in model.undoManager = new }
     }
 }
 
@@ -52,12 +68,20 @@ struct ContentView: View {
 
 private struct PreviewArea: View {
     @EnvironmentObject private var model: AppModel
+    @AppStorage("preview.showSafeArea") private var showSafeArea = true
 
     var body: some View {
         ZStack {
             Color(nsColor: .underPageBackgroundColor)
             content
         }
+        .background(
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { AppDelegate.previewViewport = geometry.size }
+                    .onChange(of: geometry.size) { _, size in AppDelegate.previewViewport = size }
+            }
+        )
     }
 
     @ViewBuilder
@@ -73,37 +97,197 @@ private struct PreviewArea: View {
                 if model.scanned > 0 {
                     Text("\(model.scanned) frames found").monospacedDigit().foregroundStyle(.secondary)
                 }
+                Button("Cancel") { model.cancelLoading() }
+                    .keyboardShortcut(.cancelAction)
+                    .controlSize(.small)
+                    .padding(.top, 4)
             }
         case let .failed(message):
             VStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle").font(.largeTitle).foregroundStyle(.orange)
                 Text(message).multilineTextAlignment(.center).frame(maxWidth: 420)
-                Button("Open Another Video…") { model.presentOpenPanel() }
+                if model.mixedSizeRetry != nil {
+                    HStack {
+                        Button("Fit All Into the First Image's Size") { model.setSequence(canvasPolicy: .fit) }
+                        Button("Fill (Crop Overflow)") { model.setSequence(canvasPolicy: .fill) }
+                    }
+                    Text("Both scale uniformly and center each image; Fit leaves transparent bars, Fill crops. Nothing is stretched.")
+                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
+                }
+                Button("Open Another…") { model.presentOpenPanel() }
             }
             .padding()
+        case let .relink(request):
+            RelinkView(request: request)
         case .ready:
-            if let preview = model.preview {
-                Image(decorative: preview.image, scale: 1)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .padding(16)
-                    .opacity(model.isPreviewCurrent ? 1 : 0.55)
-                    .overlay(alignment: .topLeading) {
-                        if !model.isPreviewCurrent {
-                            Label("Preview outdated", systemImage: "clock.arrow.circlepath")
-                                .font(.caption)
-                                .padding(6)
-                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
-                                .padding(24)
-                        }
-                    }
-            } else if case let .failed(message) = model.renderActivity {
-                Text(message).foregroundStyle(.secondary).padding()
-            } else {
-                ProgressView("Rendering preview…")
+            switch model.viewMode {
+            case .composite:
+                composite
+            case .original:
+                original
+            case .sideBySide:
+                HStack(spacing: 1) {
+                    original
+                    Divider()
+                    composite
+                }
             }
         }
+    }
+
+    /// Full-resolution size of the composite as shown (after crop).
+    private var fullSize: PixelSize { model.displayedFullSize }
+    /// Full-resolution size of the source frame (the Original view, uncropped).
+    private var sourceFullSize: PixelSize { model.source?.displaySize ?? PixelSize(width: 1, height: 1) }
+
+    @ViewBuilder
+    private var composite: some View {
+        if let preview = model.preview {
+            let showingCoverage = model.showMaskCoverage && preview.coverageImage != nil
+            ZoomableImageView(
+                image: showingCoverage ? preview.coverageImage! : preview.image,
+                fullSize: fullSize,
+                zoom: model.zoom,
+                onZoomChange: { model.zoom = $0 },
+                caption: (showingCoverage ? "Mask coverage" : "Composite") + " · \(preview.framesComposited) frames"
+                    + (preview.alignment != nil ? " · aligned" : "") + (preview.motionMask != nil && !showingCoverage ? " · masked" : ""),
+                safeArea: showSafeArea ? safeArea(of: preview) : nil,
+                paint: paintHandlers(for: preview),
+                crop: cropHandlers
+            )
+            .opacity(model.isPreviewCurrent ? 1 : 0.55)
+            .overlay(alignment: .top) {
+                if model.isEditingCrop {
+                    HStack(spacing: 10) {
+                        Image(systemName: "crop")
+                        Text(model.cropSummary).monospacedDigit()
+                            .accessibilityIdentifier("cropSummary")
+                        Button("Done") { model.isEditingCrop = false }
+                            .controlSize(.small)
+                            .help("Leave crop editing and show the cropped result (⌘K)")
+                    }
+                    .font(.callout)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(10)
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if !model.isPreviewCurrent {
+                    Label("Preview outdated", systemImage: "clock.arrow.circlepath")
+                        .font(.caption)
+                        .padding(6)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                        .padding(12)
+                }
+            }
+        } else if case let .failed(message) = model.renderActivity {
+            Text(message).foregroundStyle(.secondary).padding().frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ProgressView("Rendering preview…").frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// Crop handles over the whole straightened canvas while the crop is edited.
+    private var cropHandlers: ZoomableImageView.CropHandlers? {
+        guard model.isEditingCrop, let canvas = model.canvasSize else { return nil }
+        return ZoomableImageView.CropHandlers(
+            rect: model.cropPixels,
+            canvas: canvas,
+            onDrag: { start, handle, translation in model.dragCrop(from: start, handle: handle, by: translation) },
+            onDraw: { anchor, point in model.drawCrop(from: anchor, to: point) },
+            onEnd: { model.endCropDrag() }
+        )
+    }
+
+    /// Painting on the displayed (cropped, unrotated) composite.
+    private func paintHandlers(for preview: PreviewSnapshot) -> ZoomableImageView.PaintHandlers? {
+        guard model.isPainting, model.canPaint, let canvas = model.canvasSize else { return nil }
+        let crop = model.geometry.crop.clamped(in: canvas)
+        // Canvas-normalised → displayed-normalised.
+        let strokes = model.paintedMask.enabled ? model.paintedMask.strokes.map { s in
+            (points: s.points.map { CGPoint(x: ($0.x - crop.x) / crop.width, y: ($0.y - crop.y) / crop.height) },
+             radius: s.radius / max(crop.width, crop.height), erase: s.erase)
+        } : []
+        return ZoomableImageView.PaintHandlers(
+            strokes: strokes,
+            brushRadius: model.brushRadius / max(crop.width, crop.height),
+            erasing: model.brushErases,
+            showOverlay: model.showPaintedMaskOverlay,
+            onStrokeEnd: { points in
+                let mapped = points.compactMap { model.canvasPoint(fromDisplayed: $0) }
+                model.addStroke(points: mapped)
+            }
+        )
+    }
+
+    /// The alignment valid area in full-resolution pixels.
+    private func safeArea(of preview: PreviewSnapshot) -> CGRect? {
+        guard let area = preview.alignment?.validArea, !area.isNull, preview.size.width > 0, preview.size.height > 0,
+              model.geometry.rotationDegrees == 0 else { return nil }   // a straightened canvas has no axis-aligned safe area to draw
+        // The preview may be cropped: move the area into the cropped image's space.
+        let cropOrigin = model.displayGeometry.crop.pixelRect(in: preview.canvasSize).origin
+        let shifted = area.offsetBy(dx: -cropOrigin.x, dy: -cropOrigin.y)
+            .intersection(CGRect(x: 0, y: 0, width: preview.size.width, height: preview.size.height))
+        guard !shifted.isNull else { return nil }
+        let sx = CGFloat(fullSize.width) / CGFloat(preview.size.width)
+        let sy = CGFloat(fullSize.height) / CGFloat(preview.size.height)
+        return CGRect(x: shifted.minX * sx, y: shifted.minY * sy, width: shifted.width * sx, height: shifted.height * sy)
+    }
+
+    @ViewBuilder
+    private var original: some View {
+        if let frame = model.sourceFrame {
+            ZoomableImageView(
+                image: frame.image,
+                fullSize: sourceFullSize,
+                zoom: model.zoom,
+                onZoomChange: { model.zoom = $0 },
+                caption: "Original · frame \(frame.index) · \(Format.seconds(frame.time.seconds))"
+            )
+            .opacity(frame.index == model.scrubIndex ? 1 : 0.55)
+        } else if let message = model.sourceFrameError {
+            Text(message).foregroundStyle(.secondary).padding().frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.scrubIndex == nil {
+            Text("Click the timeline or press ⌥→ to choose a frame.")
+                .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ProgressView("Decoding frame…").frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+}
+
+/// Shown when a project's media is missing or is not the saved file. The
+/// user must locate the media, explicitly accept a changed file, or cancel.
+private struct RelinkView: View {
+    @EnvironmentObject private var model: AppModel
+    let request: RelinkRequest
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: request.candidate == nil ? "questionmark.folder" : "exclamationmark.triangle")
+                .font(.system(size: 40, weight: .light))
+                .foregroundStyle(.orange)
+            Text(request.candidate == nil ? "Source not found" : "Source has changed").font(.title2)
+            Text("Project “\(request.projectURL.deletingPathExtension().lastPathComponent)” was saved with “\(request.savedFileName)” (\(request.project.source.frameCount) frames, \(request.project.source.displaySize)).")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Text(request.message)
+                .multilineTextAlignment(.center)
+                .textSelection(.enabled)
+            HStack {
+                Button("Cancel") { model.cancelRelink() }
+                    .keyboardShortcut(.cancelAction)
+                if request.candidate != nil {
+                    Button("Use This File Anyway") { model.useRelinkCandidateAnyway() }
+                }
+                Button("Locate…") { model.presentRelinkPanel() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: 480)
+        .padding()
     }
 }
 
@@ -115,9 +299,9 @@ private struct DropHint: View {
             Image(systemName: "square.stack.3d.down.right")
                 .font(.system(size: 48, weight: .light))
                 .foregroundStyle(.secondary)
-            Text("Drop a video here").font(.title2)
-            Text("MOV or MP4 — anything this Mac can decode").foregroundStyle(.secondary)
-            Button("Open Video…") { model.presentOpenPanel() }
+            Text("Drop a video or a folder of images here").font(.title2)
+            Text("MOV or MP4 — anything this Mac can decode; JPEG, PNG, TIFF, HEIF or camera RAW stills").foregroundStyle(.secondary)
+            Button("Open…") { model.presentOpenPanel() }
                 .keyboardShortcut(.defaultAction)
         }
     }
@@ -130,17 +314,15 @@ private struct BottomBar: View {
 
     var body: some View {
         VStack(spacing: 6) {
-            if let source = model.source, model.timeline != nil {
-                TimelineStrip(
-                    duration: source.duration.seconds,
-                    rangeStart: model.rangeStart.seconds,
-                    rangeEnd: model.rangeEnd.seconds,
-                    selected: model.selectedTimes.map(\.seconds)
-                )
-                .frame(height: 28)
+            if model.source != nil, model.timeline != nil {
+                TimelineStrip()
             }
             HStack(spacing: 12) {
                 selectionSummary
+                if model.timeline != nil {
+                    Divider().frame(height: 14)
+                    PlayheadControls()
+                }
                 Spacer()
                 activity
             }
@@ -155,7 +337,7 @@ private struct BottomBar: View {
     private var selectionSummary: some View {
         switch model.selection {
         case let .success(result)?:
-            Text("\(result.eligibleCount) frames in range → \(result.selectedCount) selected")
+            Text(result.summaryText)
                 .monospacedDigit()
         case let .failure(error)?:
             Label(error.localizedDescription, systemImage: "exclamationmark.circle")
@@ -171,11 +353,11 @@ private struct BottomBar: View {
         case let .rendering(done, total):
             ProgressView(value: Double(done), total: Double(max(total, 1)))
                 .frame(width: 160)
-            Text("Exporting \(done)/\(total)").monospacedDigit()
+            Text("Exporting \(done)/\(total)" + (model.renderPass.map { " · \($0)" } ?? "")).monospacedDigit()
             Button("Cancel") { model.cancelRendering() }
         case .writing:
             ProgressView().controlSize(.small)
-            Text("Writing PNG…")
+            Text("Writing \(model.exportSettings.format.displayName)…")
         default:
             previewActivity
         }
@@ -190,8 +372,11 @@ private struct BottomBar: View {
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                 if preview.missingFrames > 0 {
-                    Label("\(preview.missingFrames) selected frames could not be decoded", systemImage: "exclamationmark.triangle")
+                    Label("\(preview.missingFrames) selected frames could not be decoded" + (preview.decodeFailure.map { ": \($0)" } ?? ""),
+                          systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
+                        .lineLimit(1)
+                        .help("The composite uses the \(preview.framesComposited) frames that did decode; no frame was substituted.")
                 }
             }
         case .waiting:
@@ -199,7 +384,7 @@ private struct BottomBar: View {
         case let .rendering(done, total):
             ProgressView(value: Double(done), total: Double(max(total, 1)))
                 .frame(width: 160)
-            Text("Rendering \(done)/\(total)").monospacedDigit()
+            Text("Rendering \(done)/\(total)" + (model.renderPass.map { " · \($0)" } ?? "")).monospacedDigit()
             Button("Cancel") { model.cancelRendering() }
         case let .failed(message):
             Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).lineLimit(2)
@@ -208,32 +393,15 @@ private struct BottomBar: View {
     }
 }
 
-/// Source duration with the selected range highlighted and a tick for every
-/// selected frame (at its real timestamp).
-struct TimelineStrip: View {
-    let duration: Double
-    let rangeStart: Double
-    let rangeEnd: Double
-    let selected: [Double]
 
-    var body: some View {
-        Canvas { context, size in
-            let track = Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 4)
-            context.fill(track, with: .color(.secondary.opacity(0.15)))
-            guard duration > 0 else { return }
-            func x(_ t: Double) -> CGFloat { CGFloat(min(max(t / duration, 0), 1)) * size.width }
-
-            let rangeRect = CGRect(x: x(rangeStart), y: 0, width: max(1, x(rangeEnd) - x(rangeStart)), height: size.height)
-            context.fill(Path(roundedRect: rangeRect, cornerRadius: 4), with: .color(.accentColor.opacity(0.25)))
-
-            var ticks = Path()
-            for t in selected {
-                let px = x(t)
-                ticks.move(to: CGPoint(x: px, y: 4))
-                ticks.addLine(to: CGPoint(x: px, y: size.height - 4))
-            }
-            context.stroke(ticks, with: .color(.accentColor), lineWidth: selected.count > Int(size.width / 2) ? 0.5 : 1)
-        }
-        .accessibilityLabel("Timeline: \(selected.count) frames selected between \(Format.seconds(rangeStart)) and \(Format.seconds(rangeEnd))")
+extension SamplingResult {
+    /// "N frames in range → M selected", with the overrides' effect when any.
+    var summaryText: String {
+        var text = "\(eligibleCount) frames in range → \(selectedCount) selected"
+        var parts: [String] = []
+        if removedByOverride > 0 { parts.append("\(removedByOverride) excluded") }
+        if addedByOverride > 0 { parts.append("\(addedByOverride) added") }
+        if !parts.isEmpty { text += " (" + parts.joined(separator: ", ") + ")" }
+        return text
     }
 }

@@ -187,6 +187,58 @@ final class RenderTests: XCTestCase {
         }
     }
 
+    // MARK: Damaged files (PRD §4.3 corrupt frames, §10.2 file read errors)
+
+    func testCorruptFrameIsReportedMissingAndTheRestAreComposited() async throws {
+        let clip = try await loadFixture(.corrupt)
+        XCTAssertEqual(clip.timeline.count, 150, "the sample table still lists every frame")
+        let corrupt = clip.timeline.frames[75]
+
+        let all = try await render(clip, indices: Array(0..<150))
+        saveArtifact(all.image, name: "corrupt_frame_75_average")
+        XCTAssertTrue(all.missingFrames.contains(corrupt), "the damaged frame must be reported missing")
+        XCTAssertEqual(all.framesComposited + all.missingFrames.count, 150, "every selected frame is either composited or reported")
+        XCTAssertFalse(all.decodeFailures.isEmpty)
+        XCTAssertNotNil(all.decodeFailureSummary)
+        XCTAssertTrue(all.deliveredInPresentationOrder)
+        // Observed on macOS 27 / Apple M4 Pro: frames 73…91 are lost — the two
+        // B-frames shown before frame 75 reference it, and the decoder cannot
+        // recover until the next keyframe (90) plus the reorder delay. The
+        // guarantee tested here is weaker and decoder-independent: the loss is
+        // confined to the damaged GOP and its neighbour (keyframes every 30
+        // frames), and everything else decodes.
+        XCTAssertLessThanOrEqual(all.missingFrames.count, 32, "lost more than one GOP: \(all.missingFrames)")
+        for missing in all.missingFrames {
+            let index = clip.timeline.frames.firstIndex(of: missing)!
+            XCTAssertTrue((60..<120).contains(index), "frame \(index) outside the damaged GOP region was lost")
+        }
+
+        // Frames after the damage are the right frames (no substitution,
+        // no drift), including the last one.
+        for k in [100, 149] {
+            let one = try await render(clip, indices: [k])
+            XCTAssertEqual(one.framesComposited, 1)
+            XCTAssertEqual(one.missingFrames, [])
+            XCTAssertEqual(decodeFrameIndex(one.image), k)
+        }
+        // A selection that is entirely undecodable is an error, not an empty image.
+        do {
+            _ = try await render(clip, indices: [75])
+            XCTFail("expected an error")
+        } catch let error as MediaError {
+            if case .readerFailed = error {} else if case .noFramesDecoded = error {} else {
+                XCTFail("unexpected error \(error)")
+            }
+        }
+    }
+
+    func testHealthyClipsReportNoDecodeFailures() async throws {
+        let clip = try await loadFixture(.count)
+        let result = try await render(clip, indices: Array(0..<150))
+        XCTAssertEqual(result.decodeFailures, [])
+        XCTAssertNil(result.decodeFailureSummary)
+    }
+
     func testTimestampsNotInTheStreamAreReportedMissing() async throws {
         let clip = try await loadFixture(.count)
         let bogus = FrameTime(value: 1, timescale: 7) // between real frames

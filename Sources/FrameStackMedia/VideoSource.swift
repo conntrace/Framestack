@@ -3,8 +3,27 @@ import CoreMedia
 import Foundation
 import FrameStackCore
 
+/// iCloud placeholders: files whose name and size are on this Mac while
+/// their contents are not. Reading one makes macOS download it, so every
+/// path that would open a source file asks here first (D-016, D-037).
+public enum CloudFiles {
+    /// Asked of the file system only (`lstat` and a resource value); the
+    /// file is not opened, so nothing downloads.
+    public static func isNotDownloaded(_ url: URL) -> Bool {
+        var info = stat()
+        if lstat(url.path, &info) == 0, info.st_flags & UInt32(SF_DATALESS) != 0 { return true }
+        if let values = try? url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]),
+           values.ubiquitousItemDownloadingStatus == .notDownloaded { return true }
+        return false
+    }
+}
+
 public enum MediaError: Error, LocalizedError, Equatable {
     case fileNotFound(path: String)
+    /// The file is an iCloud placeholder whose contents are not on this Mac.
+    case notDownloaded(path: String)
+    /// Every image in the folder is an iCloud placeholder.
+    case imagesNotDownloaded(path: String, count: Int)
     case unreadable(path: String, reason: String)
     case noVideoTrack(path: String)
     case unsupportedTransform(String)
@@ -16,11 +35,19 @@ public enum MediaError: Error, LocalizedError, Equatable {
     case transparencyNotSupported
     case exportFailed(String)
     case exportVerificationFailed(String)
+    case noImagesFound(path: String)
+    case mixedImageSizes(canvas: PixelSize, canvasFile: String, offenders: [String], count: Int)
+    case invalidSequenceRate(Double)
+    case imageUndecodable(path: String, reason: String)
 
     public var errorDescription: String? {
         switch self {
         case let .fileNotFound(path):
             return "The file “\((path as NSString).lastPathComponent)” could not be found."
+        case let .notDownloaded(path):
+            return "“\((path as NSString).lastPathComponent)” is stored in iCloud and has not been downloaded to this Mac. Download it in Finder first, then open it again."
+        case let .imagesNotDownloaded(path, count):
+            return "The \(count == 1 ? "image" : "\(count) images") in “\((path as NSString).lastPathComponent)” \(count == 1 ? "is" : "are") stored in iCloud and \(count == 1 ? "has" : "have") not been downloaded to this Mac. Download \(count == 1 ? "it" : "them") in Finder first, then open the folder again."
         case let .unreadable(path, reason):
             return "“\((path as NSString).lastPathComponent)” is not a readable movie. \(reason)"
         case let .noVideoTrack(path):
@@ -43,6 +70,14 @@ public enum MediaError: Error, LocalizedError, Equatable {
             return "Export failed: \(reason)"
         case let .exportVerificationFailed(reason):
             return "The exported file did not verify: \(reason)"
+        case let .noImagesFound(path):
+            return path.isEmpty ? "No images were chosen." : "“\((path as NSString).lastPathComponent)” contains no readable JPEG, PNG, TIFF or HEIF images."
+        case let .mixedImageSizes(canvas, canvasFile, offenders, count):
+            return "The images are not all the same size: “\(canvasFile)” is \(canvas) but \(count == 1 ? "1 other differs" : "\(count) others differ") (\(offenders.joined(separator: ", "))\(count > offenders.count ? ", …" : "")). FrameStack does not stretch or pad images silently; make them the same size first."
+        case let .invalidSequenceRate(rate):
+            return "The sequence rate must be a positive number of frames per second (got \(rate))."
+        case let .imageUndecodable(path, reason):
+            return "“\((path as NSString).lastPathComponent)” could not be decoded: \(reason)"
         }
     }
 }
@@ -78,14 +113,46 @@ public struct VideoSourceInfo: Sendable, Equatable {
     public let isHDR: Bool
     /// Non-square pixel aspect ratio (h-spacing / v-spacing) if signalled.
     public let pixelAspectRatio: Double?
+    /// Bits per component of the encoded video (8 for most clips, 10 for
+    /// HEVC Main10 / HDR); nil when the container does not say.
+    public let bitsPerComponent: Int?
 
     public var fileName: String { url.lastPathComponent }
+
+    /// Sources with more than 8 bits are decoded to half-float RGBA so the
+    /// extra precision reaches the compositor (DECISIONS.md D-009/D-020).
+    public var wantsHighPrecisionDecode: Bool { (bitsPerComponent ?? 8) > 8 || isHDR }
 
     /// `duration × nominal fps`, clearly an estimate (PRD §4.1). Shown only
     /// until the timestamp scan has produced the actual count.
     public var estimatedFrameCount: Int? {
         guard let fps = nominalFrameRate, fps > 0 else { return nil }
         return Int((duration.seconds * fps).rounded())
+    }
+
+    /// What the transfer-function tag says about the footage (M6k). Log
+    /// footage that is untagged or tagged Rec. 709 — the usual case for
+    /// camera log profiles — cannot be told apart from ordinary video.
+    public enum TransferKind: Equatable, Sendable {
+        /// No tag: read as Rec. 709 (D-005).
+        case untagged
+        /// Rec. 709, sRGB, Rec. 2020 SDR, SMPTE 240M, linear, or a plain gamma.
+        case standard
+        /// PQ or HLG.
+        case hdr
+        /// H.273 logarithmic curves (100:1 and 316:1), or a tag naming "log".
+        case logarithmic
+        case unrecognised(String)
+    }
+
+    public var transferKind: TransferKind {
+        guard let tag = transferFunction else { return .untagged }
+        let standard: Set<String> = ["ITU_R_709_2", "IEC_sRGB", "ITU_R_2020", "SMPTE_240M_1995", "Linear", "UseGamma", "SMPTE_ST_428_1"]
+        if standard.contains(tag) { return .standard }
+        if tag == "SMPTE_ST_2084_PQ" || tag == "ITU_R_2100_HLG" { return .hdr }
+        // AVFoundation has no names for H.273 values 9 and 10 and reports them by number.
+        if tag == "TransferFunction#9" || tag == "TransferFunction#10" || tag.localizedCaseInsensitiveContains("log") { return .logarithmic }
+        return .unrecognised(tag)
     }
 
     /// Human-readable color tag summary.
@@ -102,7 +169,15 @@ public struct VideoSourceInfo: Sendable, Equatable {
     public var warnings: [String] {
         var w: [String] = []
         if isHDR {
-            w.append("HDR video: M1 composites in SDR (extended linear sRGB) and clips highlights above SDR white on export.")
+            w.append("HDR video: frames are decoded at full precision and composited in linear light relative to SDR white; highlights above white are clipped on export (no tone mapping yet).")
+        }
+        switch transferKind {
+        case .logarithmic:
+            w.append("This clip is tagged as logarithmic (log) footage. FrameStack has no log conversion: the frames are stacked as they are stored, so the result looks flat and its tones are not in linear light. Convert the clip to Rec. 709 first for a faithful stack.")
+        case let .unrecognised(tag):
+            w.append("This clip's transfer function (\(tag)) is not one FrameStack knows. It is read the way macOS interprets it, which may not match the camera's intent; check the colors against the original.")
+        case .standard, .hdr, .untagged:
+            break
         }
         if let par = pixelAspectRatio, abs(par - 1) > 0.001 {
             w.append(String(format: "Non-square pixels (%.3f:1) are not corrected yet; output keeps the encoded pixel grid.", par))
@@ -122,6 +197,12 @@ public enum VideoSourceLoader {
         let path = url.path
         guard FileManager.default.fileExists(atPath: path) else {
             throw MediaError.fileNotFound(path: path)
+        }
+        // An iCloud placeholder (Desktop & Documents sync, iCloud Drive) looks
+        // like a normal file but AVFoundation would block on the download —
+        // possibly forever. Say so instead.
+        if CloudFiles.isNotDownloaded(url) {
+            throw MediaError.notDownloaded(path: path)
         }
         let asset = makeAsset(url)
 
@@ -162,6 +243,7 @@ public enum VideoSourceLoader {
         var transfer: String?
         var matrix: String?
         var par: Double?
+        var bits: Int?
         if let format = formats.first {
             codec = fourCCString(CMFormatDescriptionGetMediaSubType(format))
             let ext = (CMFormatDescriptionGetExtensions(format) as? [String: Any]) ?? [:]
@@ -174,6 +256,7 @@ public enum VideoSourceLoader {
                v > 0 {
                 par = h / v
             }
+            bits = (ext[kCMFormatDescriptionExtension_BitsPerComponent as String] as? NSNumber)?.intValue
         }
 
         let trackEnd = CMTimeRangeGetEnd(timeRange)
@@ -196,24 +279,23 @@ public enum VideoSourceLoader {
             transferFunction: transfer,
             yCbCrMatrix: matrix,
             isHDR: characteristics.contains(.containsHDRVideo),
-            pixelAspectRatio: par
+            pixelAspectRatio: par,
+            bitsPerComponent: bits
         )
 
-        try probeDecode(asset: asset, track: track, codec: codec)
+        try probeDecode(asset: asset, track: track, codec: codec, highPrecision: info.wantsHighPrecisionDecode)
         return info
     }
 
     /// Decodes the first frame; throws `.cannotDecode` if that is impossible.
-    static func probeDecode(asset: AVAsset, track: AVAssetTrack, codec: String) throws {
+    static func probeDecode(asset: AVAsset, track: AVAssetTrack, codec: String, highPrecision: Bool) throws {
         let reader: AVAssetReader
         do {
             reader = try AVAssetReader(asset: asset)
         } catch {
             throw MediaError.cannotDecode(codec: codec, reason: error.localizedDescription)
         }
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: CompositeRenderer.decodeSettings)
-        output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else {
+        guard let output = CompositeRenderer.makeOutput(track: track, highPrecision: highPrecision, reader: reader) else {
             throw MediaError.cannotDecode(codec: codec, reason: "No decoder output is available for this track.")
         }
         reader.add(output)

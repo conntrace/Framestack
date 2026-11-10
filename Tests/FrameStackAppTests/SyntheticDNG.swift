@@ -1,0 +1,1 @@
+../FrameStackMediaTests/SyntheticDNG.swift
