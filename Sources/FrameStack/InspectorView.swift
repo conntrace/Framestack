@@ -138,17 +138,25 @@ private struct PresetsSection: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Menu {
-                    if model.presets.isEmpty {
-                        Text("No presets saved")
+                    Section("Starters") {
+                        ForEach(model.starterPresets) { starter in
+                            Button(starter.name) { model.applyStarterPreset(starter) }
+                                .help(starter.summary)
+                        }
                     }
-                    ForEach(model.presets) { stored in
-                        Button(stored.preset.name) { model.applyPreset(stored) }
+                    Section("Saved") {
+                        if model.presets.isEmpty {
+                            Text("No presets saved")
+                        }
+                        ForEach(model.presets) { stored in
+                            Button(stored.preset.name) { model.applyPreset(stored) }
+                        }
                     }
                 } label: {
-                    Label(model.matchingPreset?.preset.name ?? "Apply Preset", systemImage: "slider.horizontal.3")
+                    Label(model.matchingPresetName ?? "Apply Preset", systemImage: "slider.horizontal.3")
                         .lineLimit(1)
                 }
-                .help(model.presets.isEmpty ? "Save the current settings as a preset first" : "Replace the creative settings with a saved preset; the time range, crop and painted strokes stay")
+                .help("A starter sets sampling, blend, weighting and the motion mask only. A saved preset replaces all creative settings; the time range, crop and painted strokes stay.")
                 Button("Save…") {
                     name = model.matchingPreset?.preset.name ?? ""
                     isNaming = true
@@ -169,7 +177,8 @@ private struct PresetsSection: View {
                 .help("Delete presets or open their folder")
             }
             .controlSize(.small)
-            Text("A preset holds the creative choices, not the file or its time range, so it applies to any clip.")
+            Text(model.matchingPreset == nil ? (model.matchingStarter?.summary ?? "A preset holds the creative choices, not the file or its time range, so it applies to any clip.")
+                 : "A preset holds the creative choices, not the file or its time range, so it applies to any clip.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             switch model.presetActivity {
             case let .saved(name):
@@ -626,7 +635,10 @@ private struct BlendSection: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Opacity")
             }
-            Text(model.blendMode.explanation)
+            // With a weighting curve Average is no longer equal-weight; say so instead of contradicting the Weighting section.
+            Text(model.blendMode == .average && !model.weighting.isFlat
+                 ? "Weighted mean: each frame counts by the Weighting curve below rather than equally (Σw·frame ÷ Σw), per channel in linear light."
+                 : model.blendMode.explanation)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -17,6 +17,19 @@ extension AppModel {
         presets.first { $0.preset.matches(settings, export: exportSettings) }
     }
 
+    /// Built-in starting points (never files; they cannot be deleted).
+    var starterPresets: [StarterPreset] { StarterPreset.all }
+
+    /// The starter the current settings equal, when no saved preset matches first.
+    var matchingStarter: StarterPreset? {
+        starterPresets.first { $0.matches(settings) }
+    }
+
+    /// Name for the Presets menu: the saved preset or starter the settings were made from.
+    var matchingPresetName: String? {
+        matchingPreset?.preset.name ?? matchingStarter?.name
+    }
+
     func presetExists(named name: String) -> Bool {
         presetStore.exists(name: name)
     }
@@ -50,6 +63,18 @@ extension AppModel {
     func applyPreset(_ preset: SettingsPreset) {
         let framesInRange = try? selection?.get().eligibleCount
         let application = preset.apply(to: settings, framesInRange: framesInRange)
+        apply(application, named: preset.name)
+        exportSettings = application.export
+    }
+
+    /// Applies a built-in starter as one undo step. Only sampling, blend,
+    /// weighting and the motion mask change; the export settings stay.
+    func applyStarterPreset(_ starter: StarterPreset) {
+        let framesInRange = try? selection?.get().eligibleCount
+        apply(starter.apply(to: settings, framesInRange: framesInRange), named: starter.name)
+    }
+
+    private func apply(_ application: SettingsPreset.Application, named name: String) {
         pendingActionName = "Apply Preset"
         withUndoGroup {
             suppressChanges = true
@@ -70,8 +95,7 @@ extension AppModel {
             settingsChanged(debounce: false)
         }
         pendingActionName = nil
-        exportSettings = application.export
-        presetActivity = .applied(preset.name, notices: application.notices)
+        presetActivity = .applied(name, notices: application.notices)
     }
 
     func deletePreset(_ stored: StoredPreset) {
@@ -109,17 +133,48 @@ extension AppModel {
             variants.append(BatchVariant(id: "mode:\(mode.rawValue)", name: label(s), settings: s, export: exportSettings))
         }
         let framesInRange = try? selection?.get().eligibleCount
+        for starter in starterPresets where choice.starterIDs.contains(starter.id) {
+            let applied = starter.apply(to: settings, framesInRange: framesInRange)
+            variants.append(BatchVariant(id: "starter:\(starter.id)", name: starter.name, settings: applied.settings, export: exportSettings))
+        }
         for stored in presets where choice.presetURLs.contains(stored.url) {
             let applied = stored.preset.apply(to: settings, framesInRange: framesInRange)
             variants.append(BatchVariant(id: "preset:\(stored.url.path)", name: stored.preset.name, settings: applied.settings, export: applied.export))
         }
         // Two choices that mean the same output (Current = Average, plus Average ticked) are exported once.
         var seen: [BatchVariant] = []
-        return variants.filter { v in
+        let versions = variants.filter { v in
             if seen.contains(where: { $0.settings == v.settings && $0.export == v.export }) { return false }
             seen.append(v)
             return true
         }
+        let segments = batchSegments(for: choice)
+        guard choice.splitsRange, segments.count > 1 else { return versions }
+        // Split: each version once per segment (its own sampling, weighting and
+        // masks applied inside the segment), named so the files sort in time order.
+        var split = choice.includesWholeRange ? versions : []
+        for v in versions {
+            for segment in segments {
+                var s = v.settings
+                s.rangeStart = segment.range.start
+                s.rangeEnd = segment.range.end
+                split.append(BatchVariant(id: "\(v.id)#part\(segment.index)",
+                                          name: "\(v.name) \(RangeSegmenter.label(part: segment.index, of: segments.count))",
+                                          settings: s, export: v.export))
+            }
+        }
+        return split
+    }
+
+    /// The segments the range would be split into (empty without a source).
+    func batchSegments(for choice: BatchChoice) -> [RangeSegment] {
+        guard let timeline else { return [] }
+        return RangeSegmenter.segments(of: range, in: timeline, count: choice.segmentCount)
+    }
+
+    /// Most parts the current range can be split into (one frame each, capped).
+    var maximumBatchSegments: Int {
+        min(max((try? selection?.get().eligibleCount) ?? 0, 1), RangeSegmenter.maximumCount)
     }
 
     var batchBaseName: String {

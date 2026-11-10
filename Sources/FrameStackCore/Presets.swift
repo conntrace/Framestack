@@ -84,15 +84,7 @@ public struct SettingsPreset: Sendable, Codable, Equatable {
         s.geometry.edgeFill = edgeFill
         s.color = color
 
-        var notices: [String] = []
-        if let n = framesInRange {
-            if samplingKind == .exactCount, exactCount > n {
-                notices.append("Exact Count \(exactCount) is more than the \(n) frames in this range; all \(n) are used.")
-            }
-            if samplingKind == .everyNth, nth > max(n - 1, 1) {
-                notices.append("Every \(ordinal(nth)) frame selects only the first frame of this \(n)-frame range.")
-            }
-        }
+        var notices = Self.samplingNotices(kind: samplingKind, nth: nth, exactCount: exactCount, framesInRange: framesInRange)
         var kept = ["the time range"]
         if settings.geometry.crop != .full { kept.append("the crop") }
         if !settings.paintedMask.isEmpty { kept.append("the painted mask (\(settings.paintedMask.strokes.count) stroke\(settings.paintedMask.strokes.count == 1 ? "" : "s"))") }
@@ -108,6 +100,20 @@ public struct SettingsPreset: Sendable, Codable, Equatable {
             notices.append("\(blendMode.displayName) ignores the preset's opacity.")
         }
         return Application(settings: s, export: export, notices: notices)
+    }
+
+    /// Notes on a sampling choice the range cannot honour (the sampler clamps
+    /// it, so the result still renders). Empty when the frame count is unknown.
+    public static func samplingNotices(kind: SamplingKind, nth: Int, exactCount: Int, framesInRange: Int?) -> [String] {
+        guard let n = framesInRange else { return [] }
+        var notices: [String] = []
+        if kind == .exactCount, exactCount > n {
+            notices.append("Exact Count \(exactCount) is more than the \(n) frames in this range; all \(n) are used.")
+        }
+        if kind == .everyNth, nth > max(n - 1, 1) {
+            notices.append("Every \(ordinal(nth)) frame selects only the first frame of this \(n)-frame range.")
+        }
+        return notices
     }
 
     /// True when applying the preset to `settings` would change nothing.
@@ -127,7 +133,7 @@ public struct SettingsPreset: Sendable, Codable, Equatable {
         return stem.isEmpty ? "Preset" : stem
     }
 
-    private func ordinal(_ n: Int) -> String {
+    private static func ordinal(_ n: Int) -> String {
         let suffix: String
         switch (n % 10, n % 100) {
         case (1, let h) where h != 11: suffix = "st"

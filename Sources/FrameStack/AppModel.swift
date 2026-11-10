@@ -105,11 +105,20 @@ struct BatchState: Equatable {
 }
 
 /// What the batch sheet exports: the current settings, other blend modes
-/// over the current settings, and saved presets.
+/// over the current settings, starter and saved presets — each for the whole
+/// range, or once per part when the range is split into segments.
 struct BatchChoice: Equatable {
     var includeCurrent = true
     var blendModes: Set<BlendMode> = []
     var presetURLs: Set<URL> = []
+    /// Ids of built-in starter presets.
+    var starterIDs: Set<String> = []
+    /// Export every chosen version once per segment of the range.
+    var splitsRange = false
+    /// Parts the range is split into when `splitsRange` (clamped to the frames in the range).
+    var segmentCount = 4
+    /// With `splitsRange`: also export each version for the whole range.
+    var includesWholeRange = false
 }
 
 enum RenderActivity: Equatable {

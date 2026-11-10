@@ -27,7 +27,7 @@ private struct BatchChoiceView: View {
     private var variants: [BatchVariant] { model.batchVariants(for: model.batchChoice) }
 
     var body: some View {
-        Text("Export several versions of the same frames to one folder. Each file is named after the project, its variant and the frame count; a name that is already taken gets a number.")
+        Text("Export several versions of the same range to one folder. Each file is named after the project, its variant and the frame count; a name that is already taken gets a number.")
             .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
 
         Toggle(isOn: $model.batchChoice.includeCurrent) {
@@ -50,20 +50,58 @@ private struct BatchChoiceView: View {
             .controlSize(.small)
         }
 
+        GroupBox("Starters over the current settings") {
+            LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], alignment: .leading, spacing: 4) {
+                ForEach(model.starterPresets) { starter in
+                    Toggle(starter.name, isOn: binding(forStarter: starter.id))
+                        .help(starter.summary)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+
         GroupBox("Saved presets (each with its own export settings)") {
             if model.presets.isEmpty {
                 Text("No presets saved. Save one from the Presets section of the inspector.")
                     .font(.callout).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                VStack(alignment: .leading, spacing: 4) {
+                // A long list scrolls so the sheet stays on a small display.
+                let list = VStack(alignment: .leading, spacing: 4) {
                     ForEach(model.presets) { stored in
                         Toggle(stored.preset.name, isOn: binding(for: stored.url))
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 2)
+                if model.presets.count > 5 {
+                    ScrollView { list }.frame(height: 112)
+                } else {
+                    list
+                }
             }
+        }
+
+        GroupBox("Split the range") {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Toggle("One file per part, for each version", isOn: $model.batchChoice.splitsRange)
+                    Spacer()
+                    Stepper(value: $model.batchChoice.segmentCount, in: 2...max(2, model.maximumBatchSegments)) {
+                        Text("\(min(model.batchChoice.segmentCount, max(2, model.maximumBatchSegments))) parts").monospacedDigit()
+                    }
+                    .disabled(!model.batchChoice.splitsRange || model.maximumBatchSegments < 2)
+                    .accessibilityLabel("Parts")
+                }
+                if model.batchChoice.splitsRange {
+                    Toggle("Also export the whole range", isOn: $model.batchChoice.includesWholeRange)
+                    Text(segmentCaption)
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("batchSegments")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 2)
         }
 
         Text(summary)
@@ -88,15 +126,31 @@ private struct BatchChoiceView: View {
     private var summary: String {
         let v = variants
         guard !v.isEmpty else { return "Nothing selected." }
-        let count = (try? model.selection?.get().selectedCount) ?? 0
+        let count = model.timeline.flatMap { try? v[0].settings.selection(in: $0).selectedCount } ?? 0
         let renders = model.source.map { BatchExporter.renderPassCount(for: v, native: $0.displaySize) } ?? v.count
         let example = BatchNaming.fileName(base: model.batchBaseName, variant: v[0].name, frameCount: count, longEdge: nil, format: v[0].export.format)
         return "\(v.count) output\(v.count == 1 ? "" : "s"), \(renders) render pass\(renders == 1 ? "" : "es") — e.g. “\(example)”."
     }
 
+    /// How the range divides: equal frame counts, each part sampled, weighted and masked on its own.
+    private var segmentCaption: String {
+        let segments = model.batchSegments(for: model.batchChoice)
+        guard segments.count > 1 else { return "The range holds a single frame; there is nothing to split." }
+        let seconds = segments.map(\.range.durationSeconds)
+        let length = (seconds.max() ?? 0) - (seconds.min() ?? 0) < 0.0005
+            ? "\(Format.seconds(seconds[0])) each"
+            : "\(Format.seconds(seconds.min() ?? 0)) to \(Format.seconds(seconds.max() ?? 0))"
+        return "\(RangeSegmenter.summary(of: segments)) (\(length)), in time order. Sampling, weighting and masks apply inside each part."
+    }
+
     private func binding(for mode: FrameStackCore.BlendMode) -> Binding<Bool> {
         Binding(get: { model.batchChoice.blendModes.contains(mode) },
                 set: { on in if on { model.batchChoice.blendModes.insert(mode) } else { model.batchChoice.blendModes.remove(mode) } })
+    }
+
+    private func binding(forStarter id: String) -> Binding<Bool> {
+        Binding(get: { model.batchChoice.starterIDs.contains(id) },
+                set: { on in if on { model.batchChoice.starterIDs.insert(id) } else { model.batchChoice.starterIDs.remove(id) } })
     }
 
     private func binding(for url: URL) -> Binding<Bool> {
@@ -112,7 +166,8 @@ private struct BatchProgressView: View {
     var body: some View {
         Text(batch.folder.path(percentEncoded: false))
             .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-        VStack(alignment: .leading, spacing: 6) {
+        // A split batch can have hundreds of outputs: the list scrolls and the sheet stays on screen.
+        let rows = VStack(alignment: .leading, spacing: 6) {
             ForEach(batch.outputs) { output in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Image(systemName: icon(for: output.status))
@@ -129,6 +184,11 @@ private struct BatchProgressView: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("\(output.url.lastPathComponent): \(statusText(output))")
             }
+        }
+        if batch.outputs.count > 12 {
+            ScrollView { rows.padding(.trailing, 12) }.frame(height: 300)
+        } else {
+            rows
         }
         ProgressView(value: Double(batch.outputs.filter(\.status.isFinal).count), total: Double(max(batch.outputs.count, 1)))
         if let summary = batch.summary {

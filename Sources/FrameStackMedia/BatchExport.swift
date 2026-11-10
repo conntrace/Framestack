@@ -9,8 +9,9 @@ public enum PostProcessor {
     }
 }
 
-/// One output of a batch: a full set of settings (the range is shared with
-/// the document, sampling and everything else may differ) and how to write it.
+/// One output of a batch: a full set of settings (sampling, blend and
+/// everything else may differ; the range too, when the document's range is
+/// split into segments) and how to write it.
 public struct BatchVariant: Sendable, Equatable, Identifiable {
     /// Stable identity for the UI; also the label in the file name.
     public var id: String
@@ -234,8 +235,8 @@ public struct BatchExporter: Sendable {
         return BatchSummary(outputs: outputs, rendersPerformed: renders, elapsedSeconds: Date().timeIntervalSince(started))
     }
 
-    /// Frames of a variant: the shared range sampled with the variant's own
-    /// sampling choice and frame overrides (`CompositeSettings.selection`).
+    /// Frames of a variant: its range sampled with its own sampling choice
+    /// and frame overrides (`CompositeSettings.selection`).
     static func selection(for variant: BatchVariant, in plan: BatchPlan) throws -> SamplingResult {
         try variant.settings.selection(in: plan.timeline)
     }
