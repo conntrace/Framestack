@@ -1166,6 +1166,7 @@ final class AppModel: ObservableObject {
             if old.color.exposure != new.color.exposure { return "Change Exposure" }
             if old.color.contrast != new.color.contrast { return "Change Contrast" }
             if old.color.saturation != new.color.saturation { return "Change Saturation" }
+            if old.color.curve != new.color.curve { return "Change Tone Curve" }
             return "Change White Balance"
         }
         return "Change Settings"

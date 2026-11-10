@@ -137,7 +137,7 @@ App UI (verified on the owner's Mac — `AppModelTests` + accessibility-driven G
 - [x] Motion mask (median or playhead-frame background, threshold, feather, open/close clean-up, invert, coverage view; masked frames feed any blend and the result is laid over the background) — D-027
 - [x] Manual mask painting (brush size/softness, paint/erase, invert, clear, one undo step per stroke, overlay on the preview, vector strokes persisted in the project) — D-028
 - [x] Motion accumulation / chronophotography over chosen background — Normal blend + motion mask (D-027); no separate mode needed
-- [x] Post-composite color: exposure, contrast, saturation, WB/tint (cached composite reused — colour and geometry edits no longer decode) — D-029 (curves not done)
+- [x] Post-composite color: exposure, contrast, saturation, WB/tint (cached composite reused — colour and geometry edits no longer decode) — D-029; master tone curve (monotone cubic, five points, shape presets) — D-031
 - [x] 16-bit TIFF with profiles (M4, D-021); reverse order is a sequence option (M5a, D-022); ping-pong is not a separate feature — the composite of a range is the same in either direction for every order-independent mode, and order-dependent modes offer Reverse
 - [x] Presets (source-independent `.framestackpreset` files, applied as one undo step with kept-from-document notices) and batch variants (current + other blend modes + presets, deterministic collision-safe names, one render per distinct composite, cancellation, per-output status) — D-030
 - **Exit:** each feature independently testable, non-destructive, reproducible.

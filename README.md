@@ -30,6 +30,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M6e (colour):** a **Color** section with exposure, contrast, saturation, temperature and tint, applied to the finished composite before crop and straighten. Colour and geometry changes re-process the cached composite instead of decoding the clip again, so they are instant; exports apply exactly the same maths.
 
+**M6g (tone curve):** the Color section ends with a **Tone Curve**: five points dragged up or down over a dotted "no change" diagonal, or a Shape (Soft Contrast, Strong Contrast, Lift Shadows, Fade, Matte). It is a monotone curve on sRGB-encoded tones, applied last in the colour chain, and like the other colour controls it never decodes a frame.
+
 **M6f (presets, batch):** a **Presets** section saves the creative choices — sampling, blend, weighting, alignment mode, mask parameters, straighten angle and edge fill, colour, export settings — as a named `.framestackpreset` file in `~/Library/Application Support/FrameStack/Presets`, never the clip, its time range, crop or painted strokes, so a preset applies to any clip (one undo step; the section says what was kept from the open document). **Batch Export…** (⇧⌘E) writes several variants of the same frames — the current settings, other blend modes, saved presets — into one folder with deterministic, collision-safe names; variants that share a composite are rendered once, each row reports its status, and the batch can be cancelled without leaving partial files.
 
 | Keys | |
@@ -45,7 +47,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: tone curves, crop handles on the preview, RAW stills, HDR tone mapping, built-in starter presets. See the plan.
+Not yet: crop handles on the preview, RAW stills, HDR tone mapping, built-in starter presets. See the plan.
 
 ## Requirements
 
@@ -131,7 +133,7 @@ Please report anything off — especially colors versus QuickTime Player, and an
 
 - Frames are identified by exact presentation timestamps (rational, like `CMTime`); ranges are start-inclusive/end-exclusive.
 - Each frame is converted by Core Image from its own color tags to **linear light** (extended sRGB primaries, 32-bit float), oriented upright, then added to **64-bit accumulators**. Average = sum ÷ count. Memory depends on output size, not frame count.
-- Colour adjustments run on the finished composite: exposure, white balance and saturation in linear light, contrast around mid-gray in sRGB-encoded values; then straighten/crop/edge fill.
+- Colour adjustments run on the finished composite: exposure, white balance and saturation in linear light, contrast around mid-gray and then the tone curve in sRGB-encoded values; then straighten/crop/edge fill.
 - Export clamps to [0, 1], applies the sRGB curve once, rounds, and writes an sRGB-tagged file (PNG/JPEG/TIFF), then re-reads the file to verify it. Display P3 output first converts the linear values with the sRGB→P3 primaries matrix. Downscaled exports resample each frame with Lanczos in linear light before accumulation — the same path the preview uses.
 - Other modes use the same frames: Lighten/Darken are per-channel max/min; Additive is the plain sum (× opacity, kept above 1 until export); Screen, Multiply, Difference and Normal run oldest-to-newest from the first selected frame with `C' = C + opacity × (blend(C, F) − C)`. Normal at 100 % is exactly the last selected frame. Median is the exact per-channel median (mean of the two middle values for an even count), computed band by band so memory stays bounded; Max/Min Luminance pick the whole pixel of the frame with the extreme linear luminance.
 

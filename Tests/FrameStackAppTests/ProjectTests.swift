@@ -1186,6 +1186,58 @@ final class ColorAppTests: XCTestCase {
         try await waitReady(reopened)
         XCTAssertEqual(reopened.color, .identity)
     }
+
+    func testToneCurveReusesTheCompositeExportsExactlyAndRoundTrips() async throws {
+        let model = AppModel(defaults: UserDefaults(suiteName: "CurveApp-\(UUID().uuidString)")!)
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        model.open(fixtures.appendingPathComponent("moving_square_24f.mp4"))
+        try await waitReady(model)
+        model.exportSettings = ExportSettings(format: .png, bitDepth: .eight)
+        let plain = directory.appendingPathComponent("curve-plain.png")
+        model.export(to: plain)
+        try await waitUntil { !model.isExporting }
+        let renders = model.previewRenderCount
+
+        model.color.curve = ToneCurve.Shape.liftShadows.curve
+        XCTAssertEqual(undo.undoActionName, "Change Tone Curve")
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.previewRenderCount, renders, "a curve change re-processes the cached composite; no frames decoded")
+        let curved = directory.appendingPathComponent("curve-lifted.png")
+        model.export(to: curved)
+        try await waitUntil { !model.isExporting }
+        guard case .finished = model.exportActivity else { return XCTFail("\(model.exportActivity)") }
+
+        // Every pixel of the export is the curve applied to the plain export's encoded value (8-bit rounding apart).
+        let before = try readRGB8(plain), after = try readRGB8(curved)
+        XCTAssertEqual(before.count, after.count)
+        var worst = 0.0
+        var changed = 0
+        for i in stride(from: 0, to: before.count, by: 7) {
+            let expected = model.color.curve.value(at: Double(before[i]) / 255) * 255
+            worst = max(worst, abs(expected - Double(after[i])))
+            if before[i] != after[i] { changed += 1 }
+        }
+        // Half an 8-bit step of input rounding times the steepest slope (< 1.4), plus output rounding.
+        XCTAssertLessThan(worst, 1.3)
+        XCTAssertGreaterThan(changed, 100, "the curve visibly changed the picture")
+
+        undo.undo()
+        XCTAssertEqual(model.color.curve, .identity)
+        undo.redo()
+        XCTAssertEqual(model.color.curve, ToneCurve.Shape.liftShadows.curve)
+
+        let projectURL = directory.appendingPathComponent("curve.framestack")
+        XCTAssertTrue(model.save(to: projectURL))
+        let reopened = AppModel(defaults: UserDefaults(suiteName: "CurveApp-\(UUID().uuidString)")!)
+        reopened.open(projectURL)
+        try await waitReady(reopened)
+        XCTAssertEqual(reopened.color.curve, ToneCurve.Shape.liftShadows.curve)
+        let preset = SettingsPreset(name: "Lifted", settings: model.settings, export: model.exportSettings)
+        let back = try JSONDecoder().decode(SettingsPreset.self, from: JSONEncoder().encode(preset))
+        XCTAssertEqual(back.color.curve, ToneCurve.Shape.liftShadows.curve)
+    }
 }
 
 @MainActor

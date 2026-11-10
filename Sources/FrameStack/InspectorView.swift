@@ -1021,14 +1021,42 @@ private struct ColorSection: View {
             adjustment("Temperature", value: $model.color.temperature, range: -1...1, format: percent)
             adjustment("Tint", value: $model.color.tint, range: -1...1, format: percent)
             HStack {
+                Text("Tone Curve").font(.callout)
+                Spacer()
+                Menu("Shape") {
+                    ForEach(ToneCurve.Shape.allCases) { shape in
+                        Button(shape.displayName) { model.color.curve = shape.curve }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .accessibilityLabel("Tone curve shape")
+            }
+            ToneCurveView(curve: model.color.curve) { points in
+                model.color.curve.points = points
+            } onEditingChanged: { editing in
+                editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
+            }
+            .frame(height: 132)
+            Text(curveSummary)
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("toneCurveSummary")
+            HStack {
                 Spacer()
                 Button("Reset") { model.color = .identity }
                     .controlSize(.small)
                     .disabled(model.color.isIdentity)
             }
-            Text("Applied to the finished composite, before crop and straighten, without decoding frames again: exposure (× 2^EV), white balance gains and saturation in linear light; contrast around mid-gray in sRGB-encoded values. Exports use exactly this.")
+            Text("Applied to the finished composite, before crop and straighten, without decoding frames again: exposure (× 2^EV), white balance gains and saturation in linear light; contrast around mid-gray, then the tone curve, on sRGB-encoded values. Exports use exactly this.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private var curveSummary: String {
+        let curve = model.color.curve
+        if curve.isIdentity { return "Linear — drag a point up to brighten those tones, down to darken them." }
+        let parts = curve.normalizedPoints.map { String(format: "%.0f→%.0f", $0.input * 100, $0.output * 100) }
+        return "Tones (%, shadows to highlights): " + parts.joined(separator: " · ")
     }
 
     private func percent(_ v: Double) -> String { String(format: "%+.0f %%", v * 100) }
@@ -1043,6 +1071,79 @@ private struct ColorSection: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(label)
+    }
+}
+
+/// The master tone curve: input tone left → right, output tone bottom →
+/// top, both sRGB-encoded. Five points at fixed inputs are dragged
+/// vertically; the dotted diagonal is "no change".
+private struct ToneCurveView: View {
+    let curve: ToneCurve
+    let onPointsChange: ([TonePoint]) -> Void
+    let onEditingChanged: (Bool) -> Void
+
+    @State private var dragging: Int?
+
+    var body: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+            ZStack {
+                Canvas { context, size in
+                    let inset: CGFloat = 5
+                    let plot = CGRect(x: inset, y: inset, width: size.width - 2 * inset, height: size.height - 2 * inset)
+                    func point(_ x: Double, _ y: Double) -> CGPoint {
+                        CGPoint(x: plot.minX + plot.width * x, y: plot.maxY - plot.height * min(max(y, 0), 1))
+                    }
+                    context.fill(Path(roundedRect: plot.insetBy(dx: -inset, dy: -inset), cornerRadius: 6), with: .color(.black.opacity(0.18)))
+                    var grid = Path()
+                    for q in [0.25, 0.5, 0.75] {
+                        grid.move(to: point(q, 0)); grid.addLine(to: point(q, 1))
+                        grid.move(to: point(0, q)); grid.addLine(to: point(1, q))
+                    }
+                    context.stroke(grid, with: .color(.primary.opacity(0.08)), lineWidth: 1)
+                    var diagonal = Path()
+                    diagonal.move(to: point(0, 0)); diagonal.addLine(to: point(1, 1))
+                    context.stroke(diagonal, with: .color(.primary.opacity(0.3)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    var path = Path()
+                    let steps = 128
+                    for i in 0...steps {
+                        let x = Double(i) / Double(steps)
+                        let p = point(x, curve.value(at: x))
+                        if i == 0 { path.move(to: p) } else { path.addLine(to: p) }
+                    }
+                    context.stroke(path, with: .color(.primary), lineWidth: 1.5)
+                    for cp in curve.points {
+                        let p = point(cp.input, cp.output)
+                        context.fill(Path(ellipseIn: CGRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8)), with: .color(.accentColor))
+                    }
+                }
+                Color.clear.contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                let inset: CGFloat = 5
+                                let plotWidth = size.width - 2 * inset, plotHeight = size.height - 2 * inset
+                                var points = curve.points
+                                if dragging == nil {
+                                    onEditingChanged(true)
+                                    let x = Double((value.startLocation.x - inset) / plotWidth)
+                                    dragging = points.indices.min { abs(points[$0].input - x) < abs(points[$1].input - x) }
+                                }
+                                guard let i = dragging, points.indices.contains(i) else { return }
+                                let y = 1 - Double((value.location.y - inset) / plotHeight)
+                                points[i].output = min(max(y, 0), 1)
+                                onPointsChange(points)
+                            }
+                            .onEnded { _ in
+                                dragging = nil
+                                onEditingChanged(false)
+                            }
+                    )
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Tone curve")
+        .accessibilityValue(curve.isIdentity ? "Linear" : "Edited")
     }
 }
 
