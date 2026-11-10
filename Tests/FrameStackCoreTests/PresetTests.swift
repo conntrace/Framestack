@@ -105,6 +105,41 @@ final class PresetTests: XCTestCase {
         XCTAssertEqual(SettingsPreset.fileStem(for: String(repeating: "x", count: 300)).count, 100)
     }
 
+    func testPresetCarriesPatternAndReverseButNotFrameOverrides() throws {
+        var s = richSettings
+        s.samplingKind = .pattern
+        s.samplingPattern = SamplingPattern(take: 3, skip: 2)
+        s.reverseOrder = true
+        s.frameOverrides = FrameOverrides(excluded: [FrameTime(seconds: 2)], included: [FrameTime(seconds: 3)])
+        let preset = SettingsPreset(name: "Stutter", settings: s, export: ExportSettings())
+        let json = try JSONEncoder().encode(preset)
+        let text = String(decoding: json, as: UTF8.self)
+        XCTAssertFalse(text.contains("frameOverrides"), "overrides belong to a document")
+        XCTAssertFalse(text.contains("excluded"))
+        XCTAssertEqual(try JSONDecoder().decode(SettingsPreset.self, from: json), preset)
+        XCTAssertEqual(preset.samplingPattern, SamplingPattern(take: 3, skip: 2))
+        XCTAssertTrue(preset.reverseOrder)
+
+        var document = CompositeSettings(rangeStart: .zero, rangeEnd: FrameTime(seconds: 1), samplingKind: .all, nth: 2, exactCount: 20,
+                                         blendMode: .average, opacity: 1)
+        document.frameOverrides = FrameOverrides(excluded: [FrameTime(seconds: 0.5)])
+        let applied = preset.apply(to: document, framesInRange: 24)
+        XCTAssertEqual(applied.settings.samplingKind, .pattern)
+        XCTAssertEqual(applied.settings.samplingPattern, SamplingPattern(take: 3, skip: 2))
+        XCTAssertTrue(applied.settings.reverseOrder)
+        XCTAssertEqual(applied.settings.frameOverrides, document.frameOverrides, "the document keeps its own overrides")
+        XCTAssertEqual(applied.notices, ["Kept from this document: the time range, 1 frame override."])
+        XCTAssertTrue(preset.matches(applied.settings, export: ExportSettings()))
+
+        // Reverse is meaningless for an order-independent mode and is not stored for one.
+        s.blendMode = .lighten
+        XCTAssertFalse(SettingsPreset(name: "Lighten", settings: s, export: ExportSettings()).reverseOrder)
+        // Presets written before these fields existed.
+        let bare = try JSONDecoder().decode(SettingsPreset.self, from: Data(#"{"name":"Bare","blendMode":"normal"}"#.utf8))
+        XCTAssertEqual(bare.samplingPattern, .default)
+        XCTAssertFalse(bare.reverseOrder)
+    }
+
     func testBlendModeUsesWeightsMatchesItsReducer() {
         for mode in BlendMode.allCases where !mode.requiresFrameHistory {
             XCTAssertEqual(mode.usesWeights, mode.makeReducer(width: 1, height: 1).usesWeights, "\(mode)")

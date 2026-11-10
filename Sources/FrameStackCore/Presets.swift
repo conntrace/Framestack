@@ -14,8 +14,11 @@ public struct SettingsPreset: Sendable, Codable, Equatable {
     public var samplingKind: SamplingKind
     public var nth: Int
     public var exactCount: Int
+    public var samplingPattern: SamplingPattern
     public var blendMode: BlendMode
     public var opacity: Double
+    /// Stack last to first; stored only for order-dependent blend modes.
+    public var reverseOrder: Bool
     public var alignment: AlignmentSettings
     public var weighting: WeightCurve
     public var motionMask: MotionMaskSettings
@@ -34,8 +37,10 @@ public struct SettingsPreset: Sendable, Codable, Equatable {
         samplingKind = settings.samplingKind
         nth = settings.nth
         exactCount = settings.exactCount
+        samplingPattern = settings.samplingPattern
         blendMode = settings.blendMode
         opacity = settings.opacity
+        reverseOrder = settings.reverseOrder && settings.blendMode.isOrderDependent
         // A reference or background *frame* is a position on one clip's
         // timeline; presets keep the documented automatic choices instead.
         alignment = settings.alignment
@@ -67,8 +72,10 @@ public struct SettingsPreset: Sendable, Codable, Equatable {
         s.samplingKind = samplingKind
         s.nth = nth
         s.exactCount = exactCount
+        s.samplingPattern = samplingPattern
         s.blendMode = blendMode
         s.opacity = opacity
+        s.reverseOrder = reverseOrder
         s.alignment = alignment
         s.weighting = weighting
         s.motionMask = motionMask
@@ -89,6 +96,10 @@ public struct SettingsPreset: Sendable, Codable, Equatable {
         var kept = ["the time range"]
         if settings.geometry.crop != .full { kept.append("the crop") }
         if !settings.paintedMask.isEmpty { kept.append("the painted mask (\(settings.paintedMask.strokes.count) stroke\(settings.paintedMask.strokes.count == 1 ? "" : "s"))") }
+        if !settings.frameOverrides.isEmpty {
+            let n = settings.frameOverrides.count
+            kept.append("\(n) frame override\(n == 1 ? "" : "s")")
+        }
         notices.append("Kept from this document: " + kept.joined(separator: ", ") + ".")
         if !blendMode.usesWeights, weighting.preset != .flat {
             notices.append("\(blendMode.displayName) ignores the preset's weighting.")
@@ -128,8 +139,8 @@ public struct SettingsPreset: Sendable, Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case formatVersion, name, created, samplingKind, nth, exactCount, blendMode, opacity, alignment, weighting,
-             motionMask, paintedMaskInverted, rotationDegrees, edgeFill, color, export
+        case formatVersion, name, created, samplingKind, nth, exactCount, samplingPattern, blendMode, opacity, reverseOrder,
+             alignment, weighting, motionMask, paintedMaskInverted, rotationDegrees, edgeFill, color, export
     }
 
     /// Missing optional parts fall back to their defaults so a hand-edited
@@ -142,6 +153,8 @@ public struct SettingsPreset: Sendable, Codable, Equatable {
         samplingKind = try c.decodeIfPresent(SamplingKind.self, forKey: .samplingKind) ?? .all
         nth = try c.decodeIfPresent(Int.self, forKey: .nth) ?? 2
         exactCount = try c.decodeIfPresent(Int.self, forKey: .exactCount) ?? 20
+        samplingPattern = try c.decodeIfPresent(SamplingPattern.self, forKey: .samplingPattern) ?? .default
+        reverseOrder = try c.decodeIfPresent(Bool.self, forKey: .reverseOrder) ?? false
         blendMode = try c.decode(BlendMode.self, forKey: .blendMode)
         opacity = try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 1
         alignment = try c.decodeIfPresent(AlignmentSettings.self, forKey: .alignment) ?? .off

@@ -56,8 +56,10 @@ extension AppModel {
             samplingKind = application.settings.samplingKind
             nth = application.settings.nth
             exactCount = application.settings.exactCount
+            samplingPattern = application.settings.samplingPattern
             blendMode = application.settings.blendMode
             opacity = application.settings.opacity
+            reverseOrder = application.settings.reverseOrder
             alignment = application.settings.alignment
             weighting = application.settings.weighting
             motionMask = application.settings.motionMask

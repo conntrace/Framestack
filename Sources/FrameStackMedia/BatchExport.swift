@@ -189,7 +189,8 @@ public struct BatchExporter: Sendable {
                 alignment: variant.settings.alignment,
                 weighting: variant.settings.weighting,
                 motionMask: variant.settings.motionMask,
-                paintedMask: variant.settings.paintedMask
+                paintedMask: variant.settings.paintedMask,
+                reverseOrder: variant.settings.reverseOrder
             )
             setStatus(group, .rendering(done: 0, total: request.frames.count))
             publish()
@@ -233,17 +234,10 @@ public struct BatchExporter: Sendable {
         return BatchSummary(outputs: outputs, rendersPerformed: renders, elapsedSeconds: Date().timeIntervalSince(started))
     }
 
-    /// Frames of a variant: the shared range sampled with the variant's own sampling choice.
+    /// Frames of a variant: the shared range sampled with the variant's own
+    /// sampling choice and frame overrides (`CompositeSettings.selection`).
     static func selection(for variant: BatchVariant, in plan: BatchPlan) throws -> SamplingResult {
-        let mode: SamplingMode
-        switch variant.settings.samplingKind {
-        case .all: mode = .all
-        case .everyNth: mode = .everyNth(variant.settings.nth)
-        case .exactCount: mode = .exactCount(variant.settings.exactCount)
-        }
-        return try FrameSampler.select(from: plan.timeline,
-                                       range: FrameTimeRange(start: variant.settings.rangeStart, end: variant.settings.rangeEnd),
-                                       mode: mode)
+        try variant.settings.selection(in: plan.timeline)
     }
 
     struct RenderKey: Equatable {

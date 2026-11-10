@@ -5,6 +5,7 @@ public enum SamplingKind: String, Sendable, Codable, CaseIterable, Identifiable 
     case all
     case everyNth
     case exactCount
+    case pattern
 
     public var id: String { rawValue }
 
@@ -13,8 +14,24 @@ public enum SamplingKind: String, Sendable, Codable, CaseIterable, Identifiable 
         case .all: return "All"
         case .everyNth: return "Every Nth"
         case .exactCount: return "Exact Count"
+        case .pattern: return "Pattern"
         }
     }
+}
+
+/// "Take N, skip M", repeated from the first frame of the range (M6h).
+public struct SamplingPattern: Sendable, Codable, Equatable {
+    public var take: Int
+    public var skip: Int
+
+    public static let `default` = SamplingPattern(take: 1, skip: 1)
+
+    public init(take: Int, skip: Int) {
+        self.take = take
+        self.skip = skip
+    }
+
+    public var summary: String { "take \(take), skip \(skip)" }
 }
 
 /// Every user-editable, non-destructive compositing setting — one value
@@ -40,11 +57,22 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
     public var paintedMask: PaintedMaskSettings
     /// Post-composite colour (M6e). Absent = identity.
     public var color: ColorAdjustments
+    /// Take/skip counts for `SamplingKind.pattern` (M6h). Absent = take 1, skip 1.
+    public var samplingPattern: SamplingPattern
+    /// Per-frame include/exclude decisions (M6h). Absent = none.
+    public var frameOverrides: FrameOverrides
+    /// Stack the selected frames last to first (M6h). Only order-dependent
+    /// blend modes are affected; weights stay attached to timestamps.
+    public var reverseOrder: Bool
 
     public init(rangeStart: FrameTime, rangeEnd: FrameTime, samplingKind: SamplingKind, nth: Int, exactCount: Int,
                 blendMode: BlendMode, opacity: Double, alignment: AlignmentSettings = .off, geometry: GeometrySettings = .identity,
                 weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off, paintedMask: PaintedMaskSettings = .off,
-                color: ColorAdjustments = .identity) {
+                color: ColorAdjustments = .identity, samplingPattern: SamplingPattern = .default,
+                frameOverrides: FrameOverrides = .none, reverseOrder: Bool = false) {
+        self.samplingPattern = samplingPattern
+        self.frameOverrides = frameOverrides
+        self.reverseOrder = reverseOrder
         self.rangeStart = rangeStart
         self.rangeEnd = rangeEnd
         self.samplingKind = samplingKind
@@ -67,11 +95,14 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         var s = self
         s.geometry = .identity
         s.color = .identity
+        // Order-independent modes produce the same composite either way.
+        if !blendMode.isOrderDependent { s.reverseOrder = false }
         return s
     }
 
     private enum CodingKeys: String, CodingKey {
-        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment, geometry, weighting, motionMask, paintedMask, color
+        case rangeStart, rangeEnd, samplingKind, nth, exactCount, blendMode, opacity, alignment, geometry, weighting, motionMask, paintedMask, color,
+             samplingPattern, frameOverrides, reverseOrder
     }
 
     public init(from decoder: Decoder) throws {
@@ -89,6 +120,9 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         motionMask = try c.decodeIfPresent(MotionMaskSettings.self, forKey: .motionMask) ?? .off
         paintedMask = try c.decodeIfPresent(PaintedMaskSettings.self, forKey: .paintedMask) ?? .off
         color = try c.decodeIfPresent(ColorAdjustments.self, forKey: .color) ?? .identity
+        samplingPattern = try c.decodeIfPresent(SamplingPattern.self, forKey: .samplingPattern) ?? .default
+        frameOverrides = try c.decodeIfPresent(FrameOverrides.self, forKey: .frameOverrides) ?? .none
+        reverseOrder = try c.decodeIfPresent(Bool.self, forKey: .reverseOrder) ?? false
     }
 
     public var samplingMode: SamplingMode {
@@ -96,7 +130,15 @@ public struct CompositeSettings: Sendable, Codable, Equatable {
         case .all: return .all
         case .everyNth: return .everyNth(nth)
         case .exactCount: return .exactCount(exactCount)
+        case .pattern: return .pattern(take: samplingPattern.take, skip: samplingPattern.skip)
         }
+    }
+
+    /// The frames these settings select on `timeline`: the range, sampled,
+    /// with the per-frame overrides applied. The one definition the preview,
+    /// exports and batches share.
+    public func selection(in timeline: FrameTimeline) throws -> SamplingResult {
+        try FrameSampler.select(from: timeline, range: range, mode: samplingMode, overrides: frameOverrides)
     }
 
     public var range: FrameTimeRange { FrameTimeRange(start: rangeStart, end: rangeEnd) }

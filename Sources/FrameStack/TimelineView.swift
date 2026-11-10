@@ -9,7 +9,11 @@ import SwiftUI
 /// Interaction: drag a handle to move the in/out point (snapped to frame
 /// boundaries; one undo step per drag); click or drag elsewhere to move the
 /// playhead to the nearest frame. With keyboard focus: ← → step one frame
-/// (⇧ ten), I / O set the in/out point at the playhead.
+/// (⇧ ten), I / O set the in/out point at the playhead, X excludes the
+/// playhead frame (or clears its exclusion).
+///
+/// Frame overrides are marked on the track: a red cross for an excluded
+/// frame, a dot above the tick of a frame that is always included.
 struct TimelineStrip: View {
     @EnvironmentObject private var model: AppModel
     @FocusState private var focused: Bool
@@ -76,7 +80,8 @@ struct TimelineStrip: View {
         let start = Format.seconds(model.rangeStart.seconds)
         let end = Format.seconds(model.rangeEnd.seconds)
         let playhead = model.scrubIndex.map { "playhead at frame \($0)" } ?? "no playhead"
-        return "Timeline: \(count) frames selected between \(start) and \(end); \(playhead)"
+        let overrides = model.frameOverrides.isEmpty ? "" : "; \(model.frameOverrides.excluded.count) excluded, \(model.frameOverrides.included.count) always included"
+        return "Timeline: \(count) frames selected between \(start) and \(end); \(playhead)\(overrides)"
     }
 
     // MARK: Geometry
@@ -116,6 +121,7 @@ struct TimelineStrip: View {
         switch press.characters.lowercased() {
         case "i": model.setInPointAtPlayhead(); return .handled
         case "o": model.setOutPointAtPlayhead(); return .handled
+        case "x": model.toggleExcludeAtPlayhead(); return .handled
         default: return .ignored
         }
     }
@@ -163,6 +169,27 @@ struct TimelineStrip: View {
             ticks.addLine(to: CGPoint(x: px, y: trackRect.maxY - 4))
         }
         context.stroke(ticks, with: .color(.accentColor), lineWidth: selected.count > Int(width / 2) ? 0.5 : 1)
+
+        // Frame overrides: a red cross where a frame is excluded, a dot on a
+        // frame that is always included. Overrides outside the range are
+        // drawn faintly; they have no effect there.
+        let overrides = model.frameOverrides
+        if !overrides.isEmpty {
+            let range = model.range
+            let midY = trackRect.midY
+            for t in overrides.excluded {
+                let px = x(t.seconds, width: width, duration: duration)
+                var cross = Path()
+                cross.move(to: CGPoint(x: px - 3, y: midY - 3)); cross.addLine(to: CGPoint(x: px + 3, y: midY + 3))
+                cross.move(to: CGPoint(x: px - 3, y: midY + 3)); cross.addLine(to: CGPoint(x: px + 3, y: midY - 3))
+                context.stroke(cross, with: .color(.red.opacity(range.contains(t) ? 1 : 0.4)), lineWidth: 1.5)
+            }
+            for t in overrides.included {
+                let px = x(t.seconds, width: width, duration: duration)
+                let dot = Path(ellipseIn: CGRect(x: px - 2.5, y: trackRect.minY + 0.5, width: 5, height: 5))
+                context.fill(dot, with: .color(.white.opacity(range.contains(t) ? 1 : 0.4)))
+            }
+        }
 
         // In/out handles spanning filmstrip + track
         for hx in [startX, endX] {

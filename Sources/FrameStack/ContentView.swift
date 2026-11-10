@@ -307,7 +307,7 @@ private struct BottomBar: View {
     private var selectionSummary: some View {
         switch model.selection {
         case let .success(result)?:
-            Text("\(result.eligibleCount) frames in range → \(result.selectedCount) selected")
+            Text(result.summaryText)
                 .monospacedDigit()
         case let .failure(error)?:
             Label(error.localizedDescription, systemImage: "exclamationmark.circle")
@@ -363,3 +363,15 @@ private struct BottomBar: View {
     }
 }
 
+
+extension SamplingResult {
+    /// "N frames in range → M selected", with the overrides' effect when any.
+    var summaryText: String {
+        var text = "\(eligibleCount) frames in range → \(selectedCount) selected"
+        var parts: [String] = []
+        if removedByOverride > 0 { parts.append("\(removedByOverride) excluded") }
+        if addedByOverride > 0 { parts.append("\(addedByOverride) added") }
+        if !parts.isEmpty { text += " (" + parts.joined(separator: ", ") + ")" }
+        return text
+    }
+}

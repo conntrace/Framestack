@@ -32,6 +32,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M6g (tone curve):** the Color section ends with a **Tone Curve**: five points dragged up or down over a dotted "no change" diagonal, or a Shape (Soft Contrast, Strong Contrast, Lift Shadows, Fade, Matte). It is a monotone curve on sRGB-encoded tones, applied last in the colour chain, and like the other colour controls it never decodes a frame.
 
+**M6h (which frames, in which order):** Sampling has a fourth choice, **Pattern** — take N frames in a row, skip M, repeat from the start of the range. Under it, **Frame under the playhead** lets you **Exclude** one frame (a bird, a bump, a flash) or **Include** one the sampling skipped; nothing replaces an excluded frame, the timeline marks excluded frames with a red cross and forced ones with a white dot, and **X** on the focused timeline toggles Exclude. Overrides belong to the document: they are saved in the project, never in a preset. For the modes where order matters (Screen, Multiply, Difference, Normal) the Blend section offers **Reverse stacking order**, so the first frame ends on top instead of the last; a video is decoded back to front in chunks that stay inside the memory budget, and the section says how many.
+
 **M6f (presets, batch):** a **Presets** section saves the creative choices — sampling, blend, weighting, alignment mode, mask parameters, straighten angle and edge fill, colour, export settings — as a named `.framestackpreset` file in `~/Library/Application Support/FrameStack/Presets`, never the clip, its time range, crop or painted strokes, so a preset applies to any clip (one undo step; the section says what was kept from the open document). **Batch Export…** (⇧⌘E) writes several variants of the same frames — the current settings, other blend modes, saved presets — into one folder with deterministic, collision-safe names; variants that share a composite are rendered once, each row reports its status, and the batch can be cancelled without leaving partial files.
 
 | Keys | |
@@ -42,6 +44,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘Z / ⇧⌘Z | undo / redo settings |
 | ⌥← ⌥→ (⌥⇧ ×10) | step the playhead; with the timeline focused, plain ← → ⇧ Home End also work |
 | ⌥I / ⌥O | set in / out point at the playhead (I / O when the timeline is focused) |
+| X (timeline focused) | exclude the playhead frame from the composite, or put it back |
 | ⌥⌘← ⌥⌘→ · ⌥⌘F | playhead to range start / end · full clip |
 | ⌥⌘1 / 2 / 3 | Composite / Original / Side by Side |
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
@@ -126,6 +129,8 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 21. (M6e) Drag **Exposure** to +1: the preview updates without a render pass (no "Rendering" in the bar) and ⌘Z reads "Undo Change Exposure"; Saturation −100 % gives a neutral image; Reset returns everything. Export and compare with the preview.
 22. (M6f) In Presets click **Save…**, name the current look and Save: the menu button shows the name. Change the blend mode, then pick the preset from the menu: the blend returns, the section says what was kept from this clip (time range, crop, strokes), and ⌘Z reads "Undo Apply Preset". Open another clip: the preset is still there and applies to it.
 23. (M6f) **Batch Export…** (⇧⌘E, or the button under Export): tick two more blend modes and the preset, read "N outputs, M render passes", choose a folder and **Export Here**: each row goes Waiting → Rendering → Writing → size/depth/profile; variants that only differ in colour or crop share a render pass; a file that already exists is kept and the new one gets " 2". **Cancel Batch** mid-way leaves the finished files only; **Show in Finder** selects them.
+24. (M6g) At the bottom of Color, drag the middle point of the **Tone Curve** up: the preview brightens without a render pass and ⌘Z reads "Undo Change Tone Curve". Pick Shape → **Soft Contrast**: the curve becomes an S. Shape → Linear puts the diagonal back.
+25. (M6h) Sampling → **Pattern**, Take 2, Skip 3: the bottom bar reads "N frames in range → M selected" with M = two in every five. Click a selected frame on the timeline and choose **Exclude** (or press X): a red cross appears there, the count drops by one and reads "(1 excluded)". Click a skipped frame and choose **Include**: a white dot, "(1 excluded, 1 added)". **Clear Overrides** removes both. Blend → **Normal**, opacity 100 %: the last frame shows; tick **Reverse stacking order**: the first frame shows and the caption says how the clip was decoded back to front. Switch Blend to Average: the toggle disappears (order cannot matter).
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

@@ -22,10 +22,16 @@ public struct CompositeRequest: Sendable {
     public var motionMask: MotionMaskSettings
     /// Painted mask (M6d); off by default. Shares the motion mask's background.
     public var paintedMask: PaintedMaskSettings
+    /// Stack the frames last to first (M6h). `frames` stays ascending and
+    /// weights stay attached to timestamps; only the order in which frames
+    /// reach an order-dependent reducer changes. Ignored by modes where
+    /// `blendMode.isOrderDependent` is false.
+    public var reverseOrder: Bool
 
     public init(source: MediaSource, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
                 alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off,
-                paintedMask: PaintedMaskSettings = .off) {
+                paintedMask: PaintedMaskSettings = .off, reverseOrder: Bool = false) {
+        self.reverseOrder = reverseOrder
         self.source = source
         self.frames = frames
         self.blendMode = blendMode
@@ -39,9 +45,10 @@ public struct CompositeRequest: Sendable {
 
     public init(source: VideoSourceInfo, frames: [FrameTime], blendMode: BlendMode, opacity: Float = 1, maxLongEdge: Int?,
                 alignment: AlignmentSettings = .off, weighting: WeightCurve = .flat, motionMask: MotionMaskSettings = .off,
-                paintedMask: PaintedMaskSettings = .off) {
+                paintedMask: PaintedMaskSettings = .off, reverseOrder: Bool = false) {
         self.init(source: .video(source), frames: frames, blendMode: blendMode, opacity: opacity, maxLongEdge: maxLongEdge,
-                  alignment: alignment, weighting: weighting, motionMask: motionMask, paintedMask: paintedMask)
+                  alignment: alignment, weighting: weighting, motionMask: motionMask, paintedMask: paintedMask,
+                  reverseOrder: reverseOrder)
     }
 }
 
@@ -100,6 +107,22 @@ public struct MedianReport: Sendable, Equatable {
     }
 }
 
+/// How a video was decoded for reverse stacking: back to front in chunks,
+/// each chunk decoded forward and held at output size before being stacked
+/// last frame first.
+public struct ReverseDecodeReport: Sendable, Equatable {
+    public let chunks: Int
+    /// Most output-size frames held in memory at once.
+    public let framesPerChunk: Int
+    public let memoryBudgetBytes: Int
+
+    public var summary: String {
+        chunks == 1
+            ? "Stacked last to first; the whole selection was held in one chunk."
+            : "Stacked last to first in \(chunks) chunks of up to \(framesPerChunk) frames (the decoder restarts once per chunk to stay within \(ByteCountFormatter.string(fromByteCount: Int64(memoryBudgetBytes), countStyle: .memory)) of held frames)."
+    }
+}
+
 /// A point where the decoder gave up (corrupt or unsupported data) and the
 /// renderer restarted it after the damage.
 public struct DecodeFailure: Sendable, Equatable {
@@ -119,9 +142,15 @@ public struct CompositeResult: Sendable {
     public let missingFrames: [FrameTime]
     /// Decoder failures encountered and skipped. Empty for a healthy file.
     public let decodeFailures: [DecodeFailure]
-    /// True when composited frames arrived in strictly increasing
-    /// presentation order (relevant for order-dependent blend modes).
+    /// True when the frames were stacked in the requested order: strictly
+    /// increasing presentation time, or strictly decreasing when the request
+    /// reversed an order-dependent mode (see `stackedInReverse`).
     public let deliveredInPresentationOrder: Bool
+    /// The frames were stacked last to first (the request asked for it and
+    /// the blend mode depends on order).
+    public let stackedInReverse: Bool
+    /// Reverse stacking of a video: how the clip was decoded back to front.
+    public let reverseDecode: ReverseDecodeReport?
     public let elapsedSeconds: Double
     /// Present when the request asked for alignment and more than one frame was selected.
     public let alignment: AlignmentReport?
@@ -138,7 +167,9 @@ public struct CompositeResult: Sendable {
     public init(image: LinearImage, framesComposited: Int, missingFrames: [FrameTime], decodeFailures: [DecodeFailure],
                 deliveredInPresentationOrder: Bool, elapsedSeconds: Double, alignment: AlignmentReport? = nil,
                 weighting: WeightingReport? = nil, median: MedianReport? = nil, motionMask: MotionMaskReport? = nil,
-                coverage: [Float]? = nil) {
+                coverage: [Float]? = nil, stackedInReverse: Bool = false, reverseDecode: ReverseDecodeReport? = nil) {
+        self.stackedInReverse = stackedInReverse
+        self.reverseDecode = reverseDecode
         self.image = image
         self.framesComposited = framesComposited
         self.missingFrames = missingFrames
@@ -275,6 +306,11 @@ public final class CompositeRenderer: @unchecked Sendable {
         let passIndex: Int
         let passCount: Int
         var masker: Masker?
+        /// Frames reach the reducer last to first.
+        let reversed: Bool
+        /// Prepared frames held for reverse stacking, not yet reduced.
+        var pending = 0
+        var reverseDecode: ReverseDecodeReport?
 
         init(request: CompositeRequest, progress: (@Sendable (CompositeProgress) -> Void)?,
              band: Range<Int>? = nil, passIndex: Int = 0, passCount: Int = 1) {
@@ -285,6 +321,7 @@ public final class CompositeRenderer: @unchecked Sendable {
             self.band = band
             self.passIndex = passIndex
             self.passCount = passCount
+            self.reversed = request.reverseOrder && request.blendMode.isOrderDependent
             if request.weighting.isFlat {
                 weights = nil
                 weightSelection = nil
@@ -298,7 +335,7 @@ public final class CompositeRenderer: @unchecked Sendable {
         var isComplete: Bool { seen.count == total }
 
         func reportProgress() {
-            progress?(CompositeProgress(framesComposited: seen.count, framesTotal: total, pass: passIndex + 1, passes: passCount))
+            progress?(CompositeProgress(framesComposited: seen.count + pending, framesTotal: total, pass: passIndex + 1, passes: passCount))
         }
     }
 
@@ -552,7 +589,9 @@ public final class CompositeRenderer: @unchecked Sendable {
             weighting: weightingReport,
             median: median,
             motionMask: maskReport,
-            coverage: coverage
+            coverage: coverage,
+            stackedInReverse: reduction.reversed,
+            reverseDecode: reduction.reverseDecode
         )
     }
 
@@ -649,8 +688,16 @@ public final class CompositeRenderer: @unchecked Sendable {
         return transform.apply(to: image)
     }
 
-    /// Orients, size-checks, resamples and reduces one upright frame.
+    /// Prepares and reduces one upright frame (forward stacking).
     private func consume(_ image: CIImage, at pts: FrameTime, into r: Reduction) throws {
+        guard try prepare(image, at: pts, into: r) else { return }
+        try r.frameBuffer.withUnsafeBufferPointer { try reduce($0, at: pts, into: r) }
+    }
+
+    /// Size-checks, aligns, resamples and masks one upright frame into
+    /// `r.frameBuffer`. Returns false when the frame is left out (it could
+    /// not be registered).
+    private func prepare(_ image: CIImage, at pts: FrameTime, into r: Reduction) throws -> Bool {
         let size = PixelSize(width: Int(image.extent.width.rounded()), height: Int(image.extent.height.rounded()))
         if let expected = r.sourceSize {
             guard expected == size else {
@@ -672,7 +719,7 @@ public final class CompositeRenderer: @unchecked Sendable {
             guard let moved = aligned(image, at: pts, sourceSize: size, aligner: aligner) else {
                 // Could not be registered: left out, reported, never stacked misaligned.
                 r.reportProgress()
-                return
+                return false
             }
             image = moved
         }
@@ -707,16 +754,20 @@ public final class CompositeRenderer: @unchecked Sendable {
             }
             masker.framesMasked += 1
         }
+        return true
+    }
+
+    /// Adds one prepared frame to the reducer and records it.
+    private func reduce(_ frame: UnsafeBufferPointer<Float>, at pts: FrameTime, into r: Reduction) throws {
         if let weights = r.weights {
             // Average normalises Σw itself; Additive and the sequential modes
             // take the raw curve value; Lighten/Darken ignore it.
-            let w = weights[pts] ?? 1
-            try r.frameBuffer.withUnsafeBufferPointer { try r.reducer!.add($0, weight: w) }
+            try r.reducer!.add(frame, weight: weights[pts] ?? 1)
         } else {
-            try r.frameBuffer.withUnsafeBufferPointer { try r.reducer!.add($0) }
+            try r.reducer!.add(frame)
         }
         r.seen.insert(pts)
-        if let previous = r.previous, !(previous < pts) { r.inOrder = false }
+        if let previous = r.previous, !(r.reversed ? pts < previous : previous < pts) { r.inOrder = false }
         r.previous = pts
         r.reportProgress()
     }
@@ -724,14 +775,65 @@ public final class CompositeRenderer: @unchecked Sendable {
     // MARK: Video
 
     private func decodeVideo(_ source: VideoSourceInfo, into r: Reduction) async throws {
-        let request = r.request
-        guard let first = request.frames.first, let last = request.frames.last else { return }
+        let frames = r.request.frames
+        guard !frames.isEmpty else { return }
         let asset = VideoSourceLoader.makeAsset(source.url)
         let track = try await VideoSourceLoader.videoTrack(of: asset, trackID: source.trackID)
         try Task.checkCancellation()
 
-        // Decode only the span containing the selection. The end is one tick
-        // past the last selected timestamp, so that frame is included.
+        if r.reversed, frames.count > 1 {
+            // A decoder only runs forward, so the selection is taken from the
+            // end in chunks: each chunk is decoded forward, its prepared
+            // (aligned, resampled, masked) frames are held at output size,
+            // and then stacked last frame first. The chunk size keeps the
+            // held frames within the memory budget; one frame always fits.
+            let output = source.displaySize.fitting(maxLongEdge: r.request.maxLongEdge)
+            let bytesPerFrame = max(1, output.pixelCount * LinearImage.channelCount * MemoryLayout<Float>.stride)
+            let perChunk = max(1, min(frames.count, memoryBudgetBytes / bytesPerFrame))
+            r.reverseDecode = ReverseDecodeReport(chunks: (frames.count + perChunk - 1) / perChunk, framesPerChunk: perChunk,
+                                                  memoryBudgetBytes: memoryBudgetBytes)
+            var upper = frames.count
+            while upper > 0 {
+                try Task.checkCancellation()
+                let lower = max(0, upper - perChunk)
+                var held: [(time: FrameTime, pixels: [Float])] = []
+                held.reserveCapacity(upper - lower)
+                try decodeSpan(of: source, asset: asset, track: track, frames: frames[lower..<upper], into: r) { image, pts in
+                    if try self.prepare(image, at: pts, into: r) {
+                        held.append((pts, r.frameBuffer))
+                        r.pending += 1
+                        r.reportProgress()
+                    }
+                }
+                held.sort { $0.time < $1.time }
+                while let frame = held.popLast() {
+                    try Task.checkCancellation()
+                    r.pending -= 1
+                    try frame.pixels.withUnsafeBufferPointer { try reduce($0, at: frame.time, into: r) }
+                }
+                upper = lower
+            }
+        } else {
+            try decodeSpan(of: source, asset: asset, track: track, frames: frames[...], into: r) { image, pts in
+                try self.consume(image, at: pts, into: r)
+            }
+        }
+        // Nothing at all could be decoded: report the decoder's own reason.
+        if r.reducer == nil, let failure = r.failures.last {
+            throw MediaError.readerFailed(failure.message)
+        }
+    }
+
+    /// Decodes `frames` (ascending, non-empty) forward with one reader per
+    /// undamaged stretch, handing each wanted frame to `deliver` once.
+    private func decodeSpan(of source: VideoSourceInfo, asset: AVAsset, track: AVAssetTrack, frames: ArraySlice<FrameTime>,
+                            into r: Reduction, deliver: (CIImage, FrameTime) throws -> Void) throws {
+        guard let first = frames.first, let last = frames.last else { return }
+        let wanted = Set(frames)
+        var handled = Set<FrameTime>()
+
+        // Decode only the span containing the frames. The end is one tick
+        // past the last wanted timestamp, so that frame is included.
         let end = CMTimeAdd(last.cmTime, CMTime(value: 1, timescale: last.timescale))
         let orientation = CGImagePropertyOrientation(rawValue: UInt32(source.orientation.rawValue)) ?? .up
         var resumeFrom = first
@@ -751,12 +853,13 @@ public final class CompositeRenderer: @unchecked Sendable {
                     guard let sample = output.copyNextSampleBuffer() else { return true }
                     guard let pts = FrameTime(CMSampleBufferGetPresentationTimeStamp(sample)) else { return false }
                     lastDelivered = pts
-                    guard r.wanted.contains(pts), !r.seen.contains(pts),
+                    guard wanted.contains(pts), !handled.contains(pts),
                           let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
                         return false
                     }
-                    try consume(orientedImage(pixelBuffer, orientation: orientation), at: pts, into: r)
-                    return r.isComplete
+                    handled.insert(pts)
+                    try deliver(orientedImage(pixelBuffer, orientation: orientation), pts)
+                    return handled.count == wanted.count
                 }
                 if finished { break }
             }
@@ -764,14 +867,13 @@ public final class CompositeRenderer: @unchecked Sendable {
             guard reader.status == .failed else { break readers }
 
             // The decoder gave up. Skip past the damage: resume at the next
-            // selected frame after the last one delivered (or after the
-            // start of this pass if nothing was delivered). `next` is
-            // strictly greater than the anchor, so every restart advances.
+            // wanted frame after the last one delivered (or after the start
+            // of this pass if nothing was delivered). `next` is strictly
+            // greater than the anchor, so every restart advances.
             let message = reader.error?.localizedDescription ?? "unknown error"
             let anchor = lastDelivered ?? resumeFrom
             guard r.failures.count < Self.maxDecoderRestarts,
-                  let next = request.frames.first(where: { $0 > anchor && !r.seen.contains($0) }) else {
-                if r.reducer == nil { throw MediaError.readerFailed(message) }
+                  let next = frames.first(where: { $0 > anchor && !handled.contains($0) }) else {
                 r.failures.append(DecodeFailure(afterFrame: lastDelivered, resumedAt: last, message: message))
                 break readers
             }
@@ -782,11 +884,12 @@ public final class CompositeRenderer: @unchecked Sendable {
 
     // MARK: Image sequence
 
-    /// Decodes each selected still in playback order. A file that cannot be
-    /// decoded is reported as a decode failure and left out — never
-    /// replaced by a neighbour.
+    /// Decodes each selected still in stacking order (playback order, or last
+    /// to first when reversed). A file that cannot be decoded is reported as
+    /// a decode failure and left out — never replaced by a neighbour.
     private func decodeSequence(_ sequence: ImageSequenceInfo, into r: Reduction) throws {
-        for pts in r.request.frames {
+        let order = r.reversed ? Array(r.request.frames.reversed()) : r.request.frames
+        for pts in order {
             try Task.checkCancellation()
             guard let file = sequence.file(at: pts) else {
                 r.failures.append(DecodeFailure(afterFrame: r.previous, resumedAt: pts,

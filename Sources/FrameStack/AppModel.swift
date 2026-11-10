@@ -43,6 +43,10 @@ struct PreviewSnapshot {
     let coverageImage: CGImage?
     /// Size of the rendered canvas before straighten/crop (`size` is after).
     let canvasSize: PixelSize
+    /// The frames were stacked newest first (an order-dependent mode with Reverse on).
+    let stackedInReverse: Bool
+    /// How a video was decoded back to front, when it was.
+    let reverseDecode: ReverseDecodeReport?
 }
 
 enum SourceState {
@@ -147,6 +151,12 @@ final class AppModel: ObservableObject {
     @Published var samplingKind: SamplingKind = .all { didSet { settingsChanged() } }
     @Published var nth: Int = 2 { didSet { settingsChanged() } }
     @Published var exactCount: Int = 20 { didSet { settingsChanged() } }
+    /// Take/skip counts of the Pattern sampling (M6h); undoable and saved.
+    @Published var samplingPattern: SamplingPattern = .default { didSet { if samplingPattern != oldValue { settingsChanged() } } }
+    /// Per-frame include/exclude decisions (M6h); undoable and saved; they belong to one source.
+    @Published var frameOverrides: FrameOverrides = .none { didSet { if frameOverrides != oldValue { settingsChanged() } } }
+    /// Stack last to first (M6h); only order-dependent modes re-render.
+    @Published var reverseOrder: Bool = false { didSet { if reverseOrder != oldValue { settingsChanged() } } }
     @Published var blendMode: BlendMode = .average { didSet { settingsChanged() } }
     /// 0…1; only modes with `usesOpacity` re-render when it changes.
     @Published var opacity: Double = 1 {
@@ -362,20 +372,15 @@ final class AppModel: ObservableObject {
 
     // MARK: Derived values
 
-    var samplingMode: SamplingMode {
-        switch samplingKind {
-        case .all: return .all
-        case .everyNth: return .everyNth(nth)
-        case .exactCount: return .exactCount(exactCount)
-        }
-    }
+    var samplingMode: SamplingMode { settings.samplingMode }
 
     var range: FrameTimeRange { FrameTimeRange(start: rangeStart, end: rangeEnd) }
 
     var settings: CompositeSettings {
         CompositeSettings(rangeStart: rangeStart, rangeEnd: rangeEnd, samplingKind: samplingKind,
                           nth: nth, exactCount: exactCount, blendMode: blendMode, opacity: opacity, alignment: alignment,
-                          geometry: geometry, weighting: weighting, motionMask: motionMask, paintedMask: paintedMask, color: color)
+                          geometry: geometry, weighting: weighting, motionMask: motionMask, paintedMask: paintedMask, color: color,
+                          samplingPattern: samplingPattern, frameOverrides: frameOverrides, reverseOrder: reverseOrder)
     }
 
     var selectedTimes: [FrameTime] {
@@ -727,6 +732,7 @@ final class AppModel: ObservableObject {
         // Alignment and geometry belong to a source (a project restores its
         // own); blend, sampling and export choices carry over like preferences.
         suppressChanges = true
+        frameOverrides = .none
         alignment = .off
         geometry = .identity
         weighting = .flat
@@ -885,8 +891,11 @@ final class AppModel: ObservableObject {
         samplingKind = s.samplingKind
         nth = max(1, s.nth)
         exactCount = max(1, s.exactCount)
+        samplingPattern = SamplingPattern(take: max(1, s.samplingPattern.take), skip: max(0, s.samplingPattern.skip))
+        frameOverrides = s.frameOverrides
         blendMode = s.blendMode
         opacity = min(max(s.opacity, 0), 1)
+        reverseOrder = s.reverseOrder
         alignment = s.alignment
         geometry = GeometrySettings(rotationDegrees: min(max(s.geometry.rotationDegrees, -GeometrySettings.maximumRotation), GeometrySettings.maximumRotation),
                                     crop: s.geometry.crop.clamped(in: info.displaySize), edgeFill: s.geometry.edgeFill)
@@ -1030,6 +1039,41 @@ final class AppModel: ObservableObject {
         scrubIndex = timeline.nearestIndex(to: time)
     }
 
+    // Frame overrides (PRD §4.3)
+
+    /// The override on the frame under the playhead (`nil` without a playhead).
+    var overrideAtPlayhead: FrameOverrides.State? {
+        scrubTime.map { frameOverrides.state(of: $0) }
+    }
+
+    /// The frame under the playhead is inside the time range.
+    var playheadIsInRange: Bool {
+        scrubTime.map { range.contains($0) } ?? false
+    }
+
+    /// The frame under the playhead is part of the current selection.
+    var playheadIsSelected: Bool {
+        guard let i = scrubIndex, case let .success(result)? = selection else { return false }
+        return result.selectedIndices.contains(i)
+    }
+
+    func setOverrideAtPlayhead(_ state: FrameOverrides.State) {
+        guard let time = scrubTime else { return }
+        var overrides = frameOverrides
+        overrides.set(state, for: time)
+        frameOverrides = overrides
+    }
+
+    /// Excludes the playhead frame, or returns it to the sampling's decision.
+    func toggleExcludeAtPlayhead() {
+        guard let state = overrideAtPlayhead else { return }
+        setOverrideAtPlayhead(state == .excluded ? .auto : .excluded)
+    }
+
+    func clearFrameOverrides() {
+        frameOverrides = .none
+    }
+
     func setInPointAtPlayhead() {
         guard let i = scrubIndex else { return }
         let last = frameRange.map { max($0.upperBound, i) } ?? i
@@ -1096,8 +1140,11 @@ final class AppModel: ObservableObject {
         samplingKind = s.samplingKind
         nth = s.nth
         exactCount = s.exactCount
+        samplingPattern = s.samplingPattern
+        frameOverrides = s.frameOverrides
         blendMode = s.blendMode
         opacity = s.opacity
+        reverseOrder = s.reverseOrder
         alignment = s.alignment
         geometry = s.geometry
         weighting = s.weighting
@@ -1134,7 +1181,7 @@ final class AppModel: ObservableObject {
         settingsRevision += 1
         if let timeline {
             do {
-                selection = .success(try FrameSampler.select(from: timeline, range: range, mode: samplingMode))
+                selection = .success(try new.selection(in: timeline))
             } catch let error as SamplingError {
                 selection = .failure(error)
             } catch {
@@ -1146,8 +1193,17 @@ final class AppModel: ObservableObject {
 
     private static func actionName(from old: CompositeSettings, to new: CompositeSettings) -> String {
         if old.rangeStart != new.rangeStart || old.rangeEnd != new.rangeEnd { return "Change Time Range" }
-        if old.samplingKind != new.samplingKind || old.nth != new.nth || old.exactCount != new.exactCount { return "Change Sampling" }
+        if old.samplingKind != new.samplingKind || old.nth != new.nth || old.exactCount != new.exactCount
+            || old.samplingPattern != new.samplingPattern { return "Change Sampling" }
+        if old.frameOverrides != new.frameOverrides {
+            let (before, after) = (old.frameOverrides, new.frameOverrides)
+            if after.isEmpty { return before.count == 1 ? "Clear Frame Override" : "Clear Frame Overrides" }
+            if after.excluded.count > before.excluded.count { return "Exclude Frame" }
+            if after.included.count > before.included.count { return "Always Include Frame" }
+            return "Clear Frame Override"
+        }
         if old.blendMode != new.blendMode { return "Change Blend Mode" }
+        if old.reverseOrder != new.reverseOrder { return "Reverse Stacking Order" }
         if old.opacity != new.opacity { return "Change Opacity" }
         if old.alignment != new.alignment { return "Change Alignment" }
         if old.geometry.rotationDegrees != new.geometry.rotationDegrees { return "Straighten" }
@@ -1192,7 +1248,8 @@ final class AppModel: ObservableObject {
             alignment: alignment,
             weighting: weighting,
             motionMask: motionMask,
-            paintedMask: paintedMask
+            paintedMask: paintedMask,
+            reverseOrder: reverseOrder
         )
         let revision = settingsRevision
         let renderer = renderer
@@ -1246,7 +1303,9 @@ final class AppModel: ObservableObject {
                     median: result.median,
                     motionMask: result.motionMask,
                     coverageImage: coverageImage,
-                    canvasSize: result.image.size
+                    canvasSize: result.image.size,
+                    stackedInReverse: result.stackedInReverse,
+                    reverseDecode: result.reverseDecode
                 )
                 self.renderActivity = .idle
             } catch is CancellationError {
@@ -1311,7 +1370,8 @@ final class AppModel: ObservableObject {
             alignment: alignment,
             weighting: weighting,
             motionMask: motionMask,
-            paintedMask: paintedMask
+            paintedMask: paintedMask,
+            reverseOrder: reverseOrder
         )
         let settings = exportSettings
         let geometry = geometry

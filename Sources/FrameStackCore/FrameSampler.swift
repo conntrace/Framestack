@@ -102,6 +102,71 @@ public enum SamplingMode: Sendable, Codable, Equatable, Hashable {
     /// first and last eligible frames are always included; K = 1 picks the
     /// middle frame (lower middle for an even count).
     case exactCount(Int)
+    /// A repeating pattern over the eligible frames, starting with the
+    /// first: take `take` consecutive frames (>= 1), then skip `skip`
+    /// (>= 0). `take: 1, skip: n - 1` is the same as `.everyNth(n)`.
+    case pattern(take: Int, skip: Int)
+}
+
+/// Per-frame decisions that override sampling (PRD §4.3). Frames are
+/// identified by their exact presentation timestamp. An excluded frame is
+/// removed from the selection and never replaced by a neighbour; an included
+/// frame inside the range is always used, whatever the sampling mode picks.
+/// Overrides outside the current range are kept but have no effect, so
+/// narrowing and widening the range does not lose them.
+public struct FrameOverrides: Sendable, Codable, Equatable {
+    public enum State: Sendable, Hashable {
+        /// The sampling mode decides.
+        case auto
+        case included
+        case excluded
+    }
+
+    /// Ascending, unique.
+    public private(set) var excluded: [FrameTime]
+    /// Ascending, unique, disjoint from `excluded`.
+    public private(set) var included: [FrameTime]
+
+    public static let none = FrameOverrides()
+
+    /// Sorts and de-duplicates; a time listed in both is excluded.
+    public init(excluded: [FrameTime] = [], included: [FrameTime] = []) {
+        let out = Set(excluded)
+        self.excluded = out.sorted()
+        self.included = Set(included).subtracting(out).sorted()
+    }
+
+    public var isEmpty: Bool { excluded.isEmpty && included.isEmpty }
+    public var count: Int { excluded.count + included.count }
+
+    public func state(of time: FrameTime) -> State {
+        if Self.contains(excluded, time) { return .excluded }
+        if Self.contains(included, time) { return .included }
+        return .auto
+    }
+
+    public mutating func set(_ state: State, for time: FrameTime) {
+        excluded.removeAll { $0 == time }
+        included.removeAll { $0 == time }
+        switch state {
+        case .auto: break
+        case .excluded: excluded.insert(time, at: FrameSampler.lowerBound(excluded, time))
+        case .included: included.insert(time, at: FrameSampler.lowerBound(included, time))
+        }
+    }
+
+    private static func contains(_ sorted: [FrameTime], _ time: FrameTime) -> Bool {
+        let i = FrameSampler.lowerBound(sorted, time)
+        return i < sorted.count && sorted[i] == time
+    }
+
+    private enum CodingKeys: String, CodingKey { case excluded, included }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(excluded: try c.decodeIfPresent([FrameTime].self, forKey: .excluded) ?? [],
+                  included: try c.decodeIfPresent([FrameTime].self, forKey: .included) ?? [])
+    }
 }
 
 public enum SamplingNotice: Sendable, Equatable, CustomStringConvertible {
@@ -122,6 +187,9 @@ public enum SamplingError: Error, Equatable, LocalizedError {
     case noEligibleFrames
     case invalidInterval(Int)
     case invalidCount(Int)
+    case invalidPattern(take: Int, skip: Int)
+    /// Exclusions removed every frame the sampling selected.
+    case allFramesExcluded(excluded: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -133,6 +201,10 @@ public enum SamplingError: Error, Equatable, LocalizedError {
             return "Frame interval must be at least 1 (got \(n))."
         case let .invalidCount(k):
             return "Frame count must be at least 1 (got \(k))."
+        case let .invalidPattern(take, skip):
+            return "A pattern takes at least 1 frame and skips 0 or more (got take \(take), skip \(skip))."
+        case let .allFramesExcluded(excluded):
+            return "Every selected frame is excluded (\(excluded) excluded in this range). Clear an exclusion or change the sampling."
         }
     }
 }
@@ -145,6 +217,16 @@ public struct SamplingResult: Sendable, Equatable {
     /// ascending, therefore unique and chronological.
     public let selectedIndices: [Int]
     public let notices: [SamplingNotice]
+    /// Frames inside the range that carry an "exclude" override (ascending).
+    public let excludedIndices: [Int]
+    /// Frames inside the range that carry an "always include" override (ascending).
+    public let forcedIndices: [Int]
+    /// Exclusions that removed a frame the sampling mode had picked.
+    public let removedByOverride: Int
+    /// Inclusions that added a frame the sampling mode had not picked.
+    public let addedByOverride: Int
+    /// Overrides on frames outside the range (kept, no effect).
+    public let inactiveOverrides: Int
 
     public var eligibleCount: Int { eligibleIndices.count }
     public var selectedCount: Int { selectedIndices.count }
@@ -165,16 +247,39 @@ public enum FrameSampler {
     public static func select(
         from timeline: FrameTimeline,
         range: FrameTimeRange,
-        mode: SamplingMode
+        mode: SamplingMode,
+        overrides: FrameOverrides = .none
     ) throws -> SamplingResult {
         guard !range.isEmpty else { throw SamplingError.emptyRange }
         let eligible = eligibleIndices(in: timeline, range: range)
         guard !eligible.isEmpty else { throw SamplingError.noEligibleFrames }
         let (positions, notices) = try selectPositions(eligibleCount: eligible.count, mode: mode)
+        let sampled = positions.map { eligible.lowerBound + $0 }
+        guard !overrides.isEmpty else {
+            return SamplingResult(eligibleIndices: eligible, selectedIndices: sampled, notices: notices,
+                                  excludedIndices: [], forcedIndices: [], removedByOverride: 0, addedByOverride: 0, inactiveOverrides: 0)
+        }
+        // Overrides address frames by exact timestamp; one that matches no
+        // frame of this range is inactive.
+        func index(of time: FrameTime) -> Int? {
+            let i = lowerBound(timeline.frames, time)
+            return i < timeline.frames.count && timeline.frames[i] == time && eligible.contains(i) ? i : nil
+        }
+        let excluded = overrides.excluded.compactMap(index)
+        let forced = overrides.included.compactMap(index)
+        let picked = Set(sampled)
+        let out = Set(excluded)
+        let selected = picked.union(forced).subtracting(out).sorted()
+        guard !selected.isEmpty else { throw SamplingError.allFramesExcluded(excluded: excluded.count) }
         return SamplingResult(
             eligibleIndices: eligible,
-            selectedIndices: positions.map { eligible.lowerBound + $0 },
-            notices: notices
+            selectedIndices: selected,
+            notices: notices,
+            excludedIndices: excluded,
+            forcedIndices: forced,
+            removedByOverride: excluded.filter { picked.contains($0) }.count,
+            addedByOverride: forced.filter { !picked.contains($0) }.count,
+            inactiveOverrides: overrides.count - excluded.count - forced.count
         )
     }
 
@@ -212,6 +317,11 @@ public enum FrameSampler {
             let steps = k - 1
             let positions = (0..<k).map { i in (2 * i * span + steps) / (2 * steps) }
             return (positions, [])
+
+        case let .pattern(take, skip):
+            guard take >= 1, skip >= 0 else { throw SamplingError.invalidPattern(take: take, skip: skip) }
+            let period = take + skip
+            return ((0..<m).filter { $0 % period < take }, [])
         }
     }
 

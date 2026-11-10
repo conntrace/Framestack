@@ -488,6 +488,9 @@ private struct SamplingSection: View {
                 IntegerStepper(label: "Take every", suffix: "frame(s), starting with the first", value: $model.nth)
             case .exactCount:
                 IntegerStepper(label: "Frames", suffix: "evenly spaced, first and last included", value: $model.exactCount)
+            case .pattern:
+                IntegerStepper(label: "Take", suffix: "frame(s) in a row, starting with the first", value: $model.samplingPattern.take)
+                IntegerStepper(label: "Skip", suffix: "frame(s) after them, then repeat", value: $model.samplingPattern.skip, minimum: 0)
             }
 
             if case let .success(result)? = model.selection {
@@ -497,7 +500,75 @@ private struct SamplingSection: View {
                         .foregroundStyle(.orange)
                 }
             }
+
+            if model.timeline != nil {
+                FrameOverrideControls()
+            }
         }
+    }
+}
+
+/// Per-frame overrides: the frame under the playhead can be left to the
+/// sampling, always included, or excluded.
+private struct FrameOverrideControls: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Divider()
+            Text("Frame under the playhead").font(.callout)
+            if let state = model.overrideAtPlayhead {
+                Picker("Frame under the playhead", selection: Binding(get: { state }, set: { model.setOverrideAtPlayhead($0) })) {
+                    Text("Auto").tag(FrameOverrides.State.auto)
+                    Text("Include").tag(FrameOverrides.State.included)
+                    Text("Exclude").tag(FrameOverrides.State.excluded)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Text(status(state))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Click the timeline to place the playhead, then include or exclude that frame. With the timeline focused, X excludes it.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !model.frameOverrides.isEmpty {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(counts)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("Clear Overrides") { model.clearFrameOverrides() }
+                        .controlSize(.small)
+                }
+            }
+        }
+    }
+
+    private func status(_ state: FrameOverrides.State) -> String {
+        guard model.playheadIsInRange else {
+            return state == .auto
+                ? "This frame is outside the time range."
+                : "This frame is outside the time range; its override applies when the range covers it."
+        }
+        switch state {
+        case .auto: return model.playheadIsSelected ? "The sampling selects this frame." : "The sampling skips this frame."
+        case .included: return "Always included, whatever the sampling."
+        case .excluded: return "Left out of the composite."
+        }
+    }
+
+    private var counts: String {
+        let overrides = model.frameOverrides
+        var parts: [String] = []
+        if !overrides.excluded.isEmpty { parts.append("\(overrides.excluded.count) excluded") }
+        if !overrides.included.isEmpty { parts.append("\(overrides.included.count) always included") }
+        var text = parts.joined(separator: ", ")
+        if case let .success(result)? = model.selection, result.inactiveOverrides > 0 {
+            text += " (\(result.inactiveOverrides) outside the range)"
+        }
+        return text
     }
 }
 
@@ -505,6 +576,7 @@ private struct IntegerStepper: View {
     let label: String
     let suffix: String
     @Binding var value: Int
+    var minimum = 1
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -515,7 +587,7 @@ private struct IntegerStepper: View {
                     .monospacedDigit()
                     .frame(width: 80)
                     .labelsHidden()
-                Stepper(label, value: clamped, in: 1...1_000_000)
+                Stepper(label, value: clamped, in: minimum...1_000_000)
                     .labelsHidden()
             }
             Text(suffix).font(.caption).foregroundStyle(.secondary)
@@ -523,7 +595,7 @@ private struct IntegerStepper: View {
     }
 
     private var clamped: Binding<Int> {
-        Binding(get: { value }, set: { value = max(1, $0) })
+        Binding(get: { value }, set: { value = max(minimum, $0) })
     }
 }
 
@@ -559,9 +631,15 @@ private struct BlendSection: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if model.blendMode.isOrderDependent {
-                Label("Frames are combined oldest to newest.", systemImage: "arrow.right")
+                Toggle("Reverse stacking order", isOn: $model.reverseOrder)
+                    .font(.callout)
+                Label(model.reverseOrder ? "Frames are combined newest to oldest." : "Frames are combined oldest to newest.",
+                      systemImage: model.reverseOrder ? "arrow.left" : "arrow.right")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if model.reverseOrder, model.isPreviewCurrent, let report = model.preview?.reverseDecode {
+                    Text(report.summary).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
             }
             if model.blendMode == .median {
                 if let plan = model.medianPlan(for: model.source?.displaySize.fitting(maxLongEdge: model.previewQuality.maxLongEdge)),
