@@ -38,7 +38,10 @@ public enum SourceFrames {
                 if let last = result.last, !(last.time < timeline.frames[index]) { continue }
                 let files = sequence.orderedFiles
                 guard index < files.count,
-                      let image = stillImage(files[index].url, maxPixelSize: maxHeight * 2) else { continue }
+                      // A RAW's embedded preview is good enough for the strip and
+                      // far cheaper than developing 32 frames.
+                      let image = stillImage(files[index].url, maxPixelSize: maxHeight * 2,
+                                             preferEmbeddedPreview: files[index].isRAW) else { continue }
                 result.append(TimelineThumbnail(time: timeline.frames[index], image: image))
             }
             return result
@@ -103,11 +106,14 @@ public enum SourceFrames {
     }
 
     /// A still decoded by ImageIO at most `maxPixelSize` on its long edge,
-    /// with the EXIF orientation applied.
-    static func stillImage(_ url: URL, maxPixelSize: Int) -> CGImage? {
+    /// with the EXIF orientation applied. With `preferEmbeddedPreview` the
+    /// file's own preview is used when it has one (RAW filmstrip); otherwise
+    /// the picture is always made from the image data (for RAW: the same
+    /// default rendering the compositor uses, measured within 0.001).
+    static func stillImage(_ url: URL, maxPixelSize: Int, preferEmbeddedPreview: Bool = false) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            (preferEmbeddedPreview ? kCGImageSourceCreateThumbnailFromImageIfAbsent : kCGImageSourceCreateThumbnailFromImageAlways): true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
             kCGImageSourceShouldCache: false,

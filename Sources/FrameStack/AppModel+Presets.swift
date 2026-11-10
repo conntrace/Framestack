@@ -214,6 +214,7 @@ extension AppModel {
     func startBatch(choice: BatchChoice, folder: URL) {
         guard let plan = batchPlan(for: choice, folder: folder), !plan.variants.isEmpty, batch?.isRunning != true else { return }
         previewTask?.cancel()
+        clearMemoryStop()
         let outputs = BatchExporter.outputs(for: plan)
         batch = BatchState(folder: folder, outputs: outputs, summary: nil)
         let exporter = BatchExporter(renderer: renderer)
@@ -227,6 +228,8 @@ extension AppModel {
             guard let self else { return }
             self.batch?.outputs = summary.outputs
             self.batch?.summary = summary
+            // Stopped for low memory: nothing heavy restarts on its own.
+            if self.takeMemoryStop() { return }
             if !self.isPreviewCurrent { self.renderPreviewNow() }
         }
     }

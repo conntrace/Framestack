@@ -17,6 +17,15 @@ public struct ImageSequenceFile: Sendable, Equatable {
     public let typeIdentifier: String
 
     public var fileName: String { url.lastPathComponent }
+
+    /// Camera RAW (DNG, ARW, CR3, NEF, …): decoded with Apple's default
+    /// rendering (`RawStill`), not as stored pixels.
+    public var isRAW: Bool { UTType(typeIdentifier)?.conforms(to: .rawImage) ?? false }
+
+    /// Size as stored, before the EXIF orientation.
+    public var storedSize: PixelSize {
+        (5...8).contains(orientation) ? PixelSize(width: pixelSize.height, height: pixelSize.width) : pixelSize
+    }
 }
 
 /// How stills whose size differs from the canvas (the first image's size)
@@ -125,6 +134,15 @@ public struct ImageSequenceInfo: Sendable, Equatable {
 
     public var bitsPerComponent: Int { files.map(\.bitsPerComponent).max() ?? 8 }
     public var hasAlpha: Bool { files.contains { $0.hasAlpha } }
+    public var rawFileCount: Int { files.filter(\.isRAW).count }
+
+    /// Shots present both as a RAW file and as another image of the same
+    /// base name (a camera's RAW + JPEG pair).
+    public var rawPairCount: Int {
+        let base: (ImageSequenceFile) -> String = { ($0.fileName as NSString).deletingPathExtension.lowercased() }
+        let others = Set(files.filter { !$0.isRAW }.map(base))
+        return Set(files.filter(\.isRAW).map(base)).intersection(others).count
+    }
 
     public var warnings: [String] {
         var w: [String] = []
@@ -137,6 +155,15 @@ public struct ImageSequenceInfo: Sendable, Equatable {
         }
         if hasAlpha {
             w.append("Some images have transparency: transparent pixels count as no light in the composite; PNG/TIFF exports keep the alpha channel, JPEG flattens onto black.")
+        }
+        let raw = rawFileCount
+        if raw > 0 {
+            let which = raw == files.count ? "These are camera RAW files" : "\(raw) of the images are camera RAW files"
+            w.append("\(which): each is developed with macOS's default rendering (as-shot white balance, standard tone curve — the picture Preview shows) and then stacked. There are no RAW development controls, and full-size decoding is slow (a second or two per frame from a 60-megapixel camera).")
+            let pairs = rawPairCount
+            if pairs > 0 {
+                w.append("\(pairs) shot\(pairs == 1 ? " is" : "s are") in the folder twice, as a RAW file and as a JPEG or HEIC of the same name, so \(pairs == 1 ? "it counts" : "they count") twice in the stack. Open only one kind to stack each shot once.")
+            }
         }
         let resized = resizedFiles
         if !resized.isEmpty {
@@ -166,9 +193,10 @@ public struct ImageSequenceInfo: Sendable, Equatable {
 }
 
 public enum ImageSequenceLoader {
-    /// Still formats FrameStack accepts (what ImageIO decodes on every Mac;
-    /// RAW is a later exploration, PRD §4.2).
-    public static let imageTypes: [UTType] = [.jpeg, .png, .tiff, .heic, .heif]
+    /// Still formats FrameStack accepts: what ImageIO decodes on every Mac,
+    /// plus camera RAW where this macOS has a decoder for the camera (D-035;
+    /// a RAW file it cannot read is skipped and listed).
+    public static let imageTypes: [UTType] = [.jpeg, .png, .tiff, .heic, .heif, .rawImage]
 
     public static func isImageFile(_ url: URL) -> Bool {
         guard let type = UTType(filenameExtension: url.pathExtension) else { return false }

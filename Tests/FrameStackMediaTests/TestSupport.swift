@@ -26,6 +26,15 @@ enum Fixture: String {
     /// 8 frames, 320×180, one static block-noise scene cut at the known
     /// offsets in scripts/make_fixtures.py `HANDHELD_OFFSETS` (H.264 crf 12).
     case handheld = "handheld_8f"
+    /// 24 frames, 320×180, black; a white 8×8 point at x = 16 + 8·i, y = 88:
+    /// every column in [16, 208) is lit by exactly one frame.
+    case brightPoint = "bright_point_24f"
+    /// 24 frames, 320×180, wall sRGB 200; a dark (sRGB 16) 24×96 shape at
+    /// x = 16 + 8·i, y in [40, 136): columns [32, 208) are covered by
+    /// exactly three consecutive frames.
+    case silhouette = "silhouette_24f"
+    /// 8 frames, 160×96 mid gray whose transfer tag says logarithmic 100:1.
+    case logTagged = "log_tagged_8f"
 
     var url: URL {
         guard let url = Bundle.module.url(forResource: rawValue, withExtension: "mp4", subdirectory: "Fixtures") else {

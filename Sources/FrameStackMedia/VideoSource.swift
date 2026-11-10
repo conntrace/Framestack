@@ -111,6 +111,31 @@ public struct VideoSourceInfo: Sendable, Equatable {
         return Int((duration.seconds * fps).rounded())
     }
 
+    /// What the transfer-function tag says about the footage (M6k). Log
+    /// footage that is untagged or tagged Rec. 709 — the usual case for
+    /// camera log profiles — cannot be told apart from ordinary video.
+    public enum TransferKind: Equatable, Sendable {
+        /// No tag: read as Rec. 709 (D-005).
+        case untagged
+        /// Rec. 709, sRGB, Rec. 2020 SDR, SMPTE 240M, linear, or a plain gamma.
+        case standard
+        /// PQ or HLG.
+        case hdr
+        /// H.273 logarithmic curves (100:1 and 316:1), or a tag naming "log".
+        case logarithmic
+        case unrecognised(String)
+    }
+
+    public var transferKind: TransferKind {
+        guard let tag = transferFunction else { return .untagged }
+        let standard: Set<String> = ["ITU_R_709_2", "IEC_sRGB", "ITU_R_2020", "SMPTE_240M_1995", "Linear", "UseGamma", "SMPTE_ST_428_1"]
+        if standard.contains(tag) { return .standard }
+        if tag == "SMPTE_ST_2084_PQ" || tag == "ITU_R_2100_HLG" { return .hdr }
+        // AVFoundation has no names for H.273 values 9 and 10 and reports them by number.
+        if tag == "TransferFunction#9" || tag == "TransferFunction#10" || tag.localizedCaseInsensitiveContains("log") { return .logarithmic }
+        return .unrecognised(tag)
+    }
+
     /// Human-readable color tag summary.
     public var colorDescription: String {
         func short(_ s: String?) -> String {
@@ -126,6 +151,14 @@ public struct VideoSourceInfo: Sendable, Equatable {
         var w: [String] = []
         if isHDR {
             w.append("HDR video: frames are decoded at full precision and composited in linear light relative to SDR white; highlights above white are clipped on export (no tone mapping yet).")
+        }
+        switch transferKind {
+        case .logarithmic:
+            w.append("This clip is tagged as logarithmic (log) footage. FrameStack has no log conversion: the frames are stacked as they are stored, so the result looks flat and its tones are not in linear light. Convert the clip to Rec. 709 first for a faithful stack.")
+        case let .unrecognised(tag):
+            w.append("This clip's transfer function (\(tag)) is not one FrameStack knows. It is read the way macOS interprets it, which may not match the camera's intent; check the colours against the original.")
+        case .standard, .hdr, .untagged:
+            break
         }
         if let par = pixelAspectRatio, abs(par - 1) > 0.001 {
             w.append(String(format: "Non-square pixels (%.3f:1) are not corrected yet; output keeps the encoded pixel grid.", par))

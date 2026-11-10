@@ -195,6 +195,11 @@ private struct BatchProgressView: View {
             Text(summaryText(summary))
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
+        if let note = batch.note {
+            Label(note, systemImage: "exclamationmark.triangle")
+                .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("batchNote")
+        }
         HStack {
             Spacer()
             if batch.isRunning {

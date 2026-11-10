@@ -18,7 +18,10 @@ struct FrameStackApp: App {
                     model.open(url)
                     appDelegate.requestedURL = nil
                 }
-                .onAppear { appDelegate.model = model }
+                .onAppear {
+                    appDelegate.model = model
+                    model.startMemoryPressureMonitoring()
+                }
         }
         .defaultSize(width: 1320, height: 840)
         .commands {

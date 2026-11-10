@@ -33,20 +33,30 @@ BT709_TAGS = [
 ]
 
 
-def encode(name, frames, fps, extra_input=None, extra_output=None):
-    """Pipe RGB24 frames into ffmpeg and write an H.264 MP4."""
+def encode(name, frames, fps, extra_input=None, extra_output=None, transfer=None):
+    """Pipe RGB24 frames into ffmpeg and write an H.264 MP4.
+
+    `transfer` overrides the transfer-characteristics tag only (the pixels are
+    encoded exactly as for BT.709): e.g. "log100" writes a clip that says it
+    is logarithmic, which AVFoundation reports as "TransferFunction#9".
+    """
     h, w, _ = frames[0].shape
     path = os.path.join(OUT, name)
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     cmd += extra_input or []
+    vf = "scale=out_color_matrix=bt709:out_range=tv:flags=neighbor"
+    tags = list(BT709_TAGS)
+    if transfer:
+        vf += f",setparams=color_primaries=bt709:color_trc={transfer}:colorspace=bt709:range=tv"
+        tags[tags.index("-color_trc") + 1] = transfer
     cmd += [
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
         "-r", str(fps), "-i", "-",
-        "-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=neighbor",
+        "-vf", vf,
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "high",
     ]
     cmd += extra_output or []
-    cmd += BT709_TAGS + ["-movflags", "+faststart", "-an", path]
+    cmd += tags + ["-movflags", "+faststart", "-an", path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     for f in frames:
         proc.stdin.write(np.ascontiguousarray(f, dtype=np.uint8).tobytes())
@@ -220,6 +230,54 @@ def black_white():
            extra_output=["-crf", "8", "-g", "1", "-bf", "0"])
 
 
+def bright_point():
+    """24 frames at 30 fps, 320x180, black: a small light crossing the dark.
+
+    A white 8x8 point at x = 16 + 8*i, y = 88 (frame i): every column in
+    [16, 208) is lit by exactly one frame, nothing else ever is. Lighten
+    keeps the whole trail at white; Average leaves it at 1/24; Darken and
+    Median keep black. All-intra.
+    """
+    w, h = 320, 180
+    frames = []
+    for i in range(24):
+        f = np.zeros((h, w, 3), dtype=np.uint8)
+        x = 16 + 8 * i
+        f[88:96, x:x + 8, :] = 255
+        frames.append(f)
+    encode("bright_point_24f.mp4", frames, 30,
+           extra_output=["-crf", "8", "-g", "1", "-bf", "0"])
+
+
+def silhouette():
+    """24 frames at 30 fps, 320x180: a dark shape crossing a light wall.
+
+    Background sRGB 200. A dark (sRGB 16) 24x96 rectangle at x = 16 + 8*i,
+    y in [40, 136) (frame i): every column in [32, 208) is covered by exactly
+    three consecutive frames. Darken keeps the dark band [16, 224); Lighten
+    and Median keep the clean wall; Average is 3/24 dark in linear light.
+    All-intra.
+    """
+    w, h = 320, 180
+    frames = []
+    for i in range(24):
+        f = np.full((h, w, 3), 200, dtype=np.uint8)
+        x = 16 + 8 * i
+        f[40:136, x:x + 24, :] = 16
+        frames.append(f)
+    encode("silhouette_24f.mp4", frames, 30,
+           extra_output=["-crf", "8", "-g", "1", "-bf", "0"])
+
+
+def log_tagged():
+    """8 frames at 30 fps, 160x96 mid gray, whose transfer tag says
+    "logarithmic (100:1)" (H.273 value 9). The pixels are ordinary; only the
+    tag differs. Used to check that a log-tagged clip is warned about."""
+    frames = [np.full((96, 160, 3), 128, dtype=np.uint8) for _ in range(8)]
+    encode("log_tagged_8f.mp4", frames, 30,
+           extra_output=["-crf", "12", "-g", "1", "-bf", "0"], transfer="log100")
+
+
 def portrait():
     """10 frames, encoded 320x180 landscape, with a display matrix rotating
     90 degrees clockwise (ffprobe reports "rotation of -90.00 degrees"), as
@@ -298,6 +356,11 @@ if __name__ == "__main__":
     if only == ["handheld"]:
         handheld_sequence()
         sys.exit(0)
+    if only == ["regression"]:
+        bright_point()
+        silhouette()
+        log_tagged()
+        sys.exit(0)
     count_clip()
     trimmed_edit_list()
     moving_square()
@@ -307,3 +370,6 @@ if __name__ == "__main__":
     ten_bit_ramp()
     png_sequence()
     handheld_sequence()
+    bright_point()
+    silhouette()
+    log_tagged()

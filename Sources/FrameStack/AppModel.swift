@@ -100,6 +100,8 @@ struct BatchState: Equatable {
     var folder: URL
     var outputs: [BatchOutput]
     var summary: BatchSummary?
+    /// Why the batch stopped early when it was not the user's doing (low memory).
+    var note: String?
     var isRunning: Bool { summary == nil }
     var finishedCount: Int { outputs.filter { if case .finished = $0.status { return true } else { return false } }.count }
 }
@@ -126,6 +128,14 @@ enum RenderActivity: Equatable {
     case waiting
     case rendering(done: Int, total: Int)
     case failed(String)
+}
+
+/// What macOS reported about the Mac's memory (`DISPATCH_MEMORYPRESSURE_*`).
+enum MemoryPressureLevel: Equatable {
+    /// Memory is getting tight: give back what can be rebuilt.
+    case warning
+    /// The system is about to start killing or stalling apps: stop the heavy work.
+    case critical
 }
 
 enum ExportActivity: Equatable {
@@ -406,6 +416,10 @@ final class AppModel: ObservableObject {
     private var thumbnailTask: Task<Void, Never>?
     private var sourceFrameTask: Task<Void, Never>?
     var previewTask: Task<Void, Never>?
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+    private var stoppedForMemory = false
+    /// Memory-pressure events handled so far (for tests and diagnostics).
+    private(set) var memoryPressureEvents = 0
     private var exportTask: Task<Void, Never>?
     var suppressChanges = false
     private var lastSettings: CompositeSettings?
@@ -1390,6 +1404,63 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Memory pressure (M6k, PRD §11)
+
+    static let memoryStopMessage = "Stopped because macOS reported that memory is critically low. Close other apps, or choose a smaller preview quality or export size, then try again."
+
+    /// Starts listening for the system's memory-pressure events. Called once
+    /// by the app; tests drive `handleMemoryPressure` directly.
+    func startMemoryPressureMonitoring() {
+        guard memoryPressureSource == nil else { return }
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
+        source.setEventHandler { [weak self, weak source] in
+            guard let event = source?.data else { return }
+            MainActor.assumeIsolated {
+                self?.handleMemoryPressure(event.contains(.critical) ? .critical : .warning)
+            }
+        }
+        source.resume()
+        memoryPressureSource = source
+    }
+
+    /// Warning: Core Image's pooled memory is released (rebuilt on demand;
+    /// nothing visible changes). Critical: the running preview render, export
+    /// or batch is stopped with a message, and the composite kept for quick
+    /// colour and crop edits is dropped too. Nothing restarts on its own.
+    func handleMemoryPressure(_ level: MemoryPressureLevel) {
+        memoryPressureEvents += 1
+        renderer.releaseCaches()
+        guard level == .critical else { return }
+        cachedComposite = nil
+        if batch?.isRunning == true {
+            stoppedForMemory = true
+            batch?.note = Self.memoryStopMessage
+            cancelBatch()
+        } else if isExporting {
+            stoppedForMemory = true
+            exportTask?.cancel()
+        }
+        switch renderActivity {
+        case .waiting, .rendering:
+            previewTask?.cancel()
+            renderActivity = .failed(Self.memoryStopMessage)
+        case .idle, .failed:
+            break
+        }
+    }
+
+    /// True once after work was stopped for memory: the automatic preview
+    /// refresh that follows an export or a batch is skipped that time.
+    func takeMemoryStop() -> Bool {
+        defer { stoppedForMemory = false }
+        return stoppedForMemory
+    }
+
+    /// A new export or batch starts with a clean slate.
+    func clearMemoryStop() {
+        stoppedForMemory = false
+    }
+
     func cancelRendering() {
         if batch?.isRunning == true {
             cancelBatch()
@@ -1452,6 +1523,7 @@ final class AppModel: ObservableObject {
         let renderer = renderer
         // Keep resource use bounded: one full-resolution render at a time.
         previewTask?.cancel()
+        stoppedForMemory = false
         exportActivity = .rendering(done: 0, total: request.frames.count)
 
         exportTask = Task { [weak self] in
@@ -1469,6 +1541,10 @@ final class AppModel: ObservableObject {
                     report, missingFrames: composite.missingFrames.count, decodeFailure: composite.decodeFailureSummary
                 )
             } catch is CancellationError {
+                if self?.takeMemoryStop() == true {
+                    self?.exportActivity = .failed(Self.memoryStopMessage)
+                    return
+                }
                 self?.exportActivity = .cancelled
             } catch {
                 self?.exportActivity = .failed(error.localizedDescription)

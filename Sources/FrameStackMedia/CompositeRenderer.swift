@@ -282,6 +282,13 @@ public final class CompositeRenderer: @unchecked Sendable {
         self.memoryBudgetBytes = memoryBudgetBytes
     }
 
+    /// Frees what Core Image keeps between renders (pooled surfaces and
+    /// intermediates; everything is rebuilt on demand). Called when macOS
+    /// reports memory pressure; safe while a render is running.
+    public func releaseCaches() {
+        context.clearCaches()
+    }
+
     /// Everything the per-frame step needs; shared by the video and the
     /// image-sequence producers so both reduce frames identically.
     private final class Reduction {
@@ -689,16 +696,22 @@ public final class CompositeRenderer: @unchecked Sendable {
     }
 
     /// Prepares and reduces one upright frame (forward stacking).
-    private func consume(_ image: CIImage, at pts: FrameTime, into r: Reduction) throws {
-        guard try prepare(image, at: pts, into: r) else { return }
+    private func consume(_ image: CIImage, representing canvas: PixelSize? = nil, at pts: FrameTime, into r: Reduction) throws {
+        guard try prepare(image, representing: canvas, at: pts, into: r) else { return }
         try r.frameBuffer.withUnsafeBufferPointer { try reduce($0, at: pts, into: r) }
     }
 
     /// Size-checks, aligns, resamples and masks one upright frame into
     /// `r.frameBuffer`. Returns false when the frame is left out (it could
     /// not be registered).
-    private func prepare(_ image: CIImage, at pts: FrameTime, into r: Reduction) throws -> Bool {
-        let size = PixelSize(width: Int(image.extent.width.rounded()), height: Int(image.extent.height.rounded()))
+    ///
+    /// `canvas` is given when the picture covers a frame of that size at
+    /// another resolution (a RAW decoded smaller for a preview, D-035): the
+    /// frame counts as `canvas` everywhere, and is resampled once, from its
+    /// own pixels straight to the output.
+    private func prepare(_ image: CIImage, representing canvas: PixelSize? = nil, at pts: FrameTime, into r: Reduction) throws -> Bool {
+        var imageSize = PixelSize(width: Int(image.extent.width.rounded()), height: Int(image.extent.height.rounded()))
+        let size = canvas ?? imageSize
         if let expected = r.sourceSize {
             guard expected == size else {
                 throw MediaError.frameSizeChanged(expected: expected, actual: size)
@@ -716,6 +729,15 @@ public final class CompositeRenderer: @unchecked Sendable {
         }
         var image = image
         if let aligner = r.aligner {
+            if imageSize != size {
+                // Registration works in source pixels: bring the picture to
+                // the frame's own size first (slower; only with alignment on).
+                image = image.clampedToExtent()
+                    .transformed(by: CGAffineTransform(scaleX: CGFloat(size.width) / image.extent.width,
+                                                       y: CGFloat(size.height) / image.extent.height))
+                    .cropped(to: CGRect(x: 0, y: 0, width: size.width, height: size.height))
+                imageSize = size
+            }
             guard let moved = aligned(image, at: pts, sourceSize: size, aligner: aligner) else {
                 // Could not be registered: left out, reported, never stacked misaligned.
                 r.reportProgress()
@@ -723,7 +745,7 @@ public final class CompositeRenderer: @unchecked Sendable {
             }
             image = moved
         }
-        renderFrame(image, sourceSize: size, outputSize: r.outputSize, band: r.band, into: &r.frameBuffer)
+        renderFrame(image, sourceSize: imageSize, outputSize: r.outputSize, band: r.band, into: &r.frameBuffer)
         if let masker = r.masker {
             // Mask against the background's rows for this band, multiply the
             // frame by the mask, and accumulate coverage.
@@ -897,7 +919,7 @@ public final class CompositeRenderer: @unchecked Sendable {
                 continue
             }
             try autoreleasepool {
-                guard let decoded = CIImage(contentsOf: file.url) else {
+                guard let decoded = Self.decodeStill(file, in: sequence, maxLongEdge: r.request.maxLongEdge) else {
                     r.failures.append(DecodeFailure(afterFrame: r.previous, resumedAt: pts,
                                                     message: "\(file.fileName) could not be decoded"))
                     return
@@ -910,19 +932,40 @@ public final class CompositeRenderer: @unchecked Sendable {
                 image = image.transformed(by: CGAffineTransform(translationX: -origin.x, y: -origin.y))
                 if file.pixelSize != sequence.displaySize, sequence.canvasPolicy != .strict {
                     // Fit/Fill onto the canvas (uniform scale, centred); the
-                    // canvas extent is kept so coverage lands in alpha.
+                    // canvas extent is kept so coverage lands in alpha. The
+                    // scale is taken from the picture's own pixels, which for
+                    // a RAW decoded smaller are fewer than the file's.
                     let (scale, offset) = sequence.placement(for: file.pixelSize)
                     let canvas = CGRect(x: 0, y: 0, width: sequence.displaySize.width, height: sequence.displaySize.height)
+                    let placed = CGSize(width: Double(file.pixelSize.width) * scale, height: Double(file.pixelSize.height) * scale)
+                    let sy = placed.height / image.extent.height, sx = placed.width / image.extent.width
                     image = image.clampedToExtent()
-                        .applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: scale, kCIInputAspectRatioKey: 1.0])
-                        .cropped(to: CGRect(x: 0, y: 0, width: Double(file.pixelSize.width) * scale, height: Double(file.pixelSize.height) * scale))
+                        .applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: sy, kCIInputAspectRatioKey: sx / sy])
+                        .cropped(to: CGRect(origin: .zero, size: placed))
                         .transformed(by: CGAffineTransform(translationX: offset.x, y: offset.y))
                         .composited(over: CIImage(color: .clear).cropped(to: canvas))
                         .cropped(to: canvas)
+                    try consume(image, at: pts, into: r)
+                } else {
+                    // A RAW's picture may be smaller than the frame it covers.
+                    try consume(image, representing: file.isRAW ? file.pixelSize : nil, at: pts, into: r)
                 }
-                try consume(image, at: pts, into: r)
             }
         }
+    }
+
+    /// One still in its stored orientation. RAW files go through Apple's
+    /// default rendering, decoded at a reduced native scale when the output
+    /// is at most half the size the file will occupy (D-035); everything
+    /// else is read as stored.
+    static func decodeStill(_ file: ImageSequenceFile, in sequence: ImageSequenceInfo, maxLongEdge: Int?) -> CIImage? {
+        guard file.isRAW else { return CIImage(contentsOf: file.url) }
+        let canvas = sequence.displaySize
+        let output = canvas.fitting(maxLongEdge: maxLongEdge)
+        // Output pixels per source pixel of this file: the canvas reduction
+        // times its Fit/Fill placement scale.
+        let needed = Double(output.longEdge) / Double(canvas.longEdge) * sequence.placement(for: file.pixelSize).scale
+        return RawStill.image(url: file.url, decodeScale: RawStill.decodeScale(forOutputRatio: needed))
     }
 
     private func makeReader(
