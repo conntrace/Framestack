@@ -84,12 +84,12 @@ public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
                 + "Needs the whole frame history: computed in horizontal bands within a memory "
                 + "budget, decoding the clip once per band. Order and weights do not matter."
         case .maxLuminance:
-            return "At each pixel the complete colour of the single frame with the greatest "
+            return "At each pixel the complete color of the single frame with the greatest "
                 + "linear luminance (0.2126 R + 0.7152 G + 0.0722 B). Unlike Lighten the result is "
-                + "always a colour some frame really had there. Ties keep the earlier frame."
+                + "always a color some frame really had there. Ties keep the earlier frame."
         case .minLuminance:
-            return "At each pixel the complete colour of the single frame with the least linear "
-                + "luminance. Unlike Darken the result is always a colour some frame really had "
+            return "At each pixel the complete color of the single frame with the least linear "
+                + "luminance. Unlike Darken the result is always a color some frame really had "
                 + "there. Ties keep the earlier frame."
         }
     }

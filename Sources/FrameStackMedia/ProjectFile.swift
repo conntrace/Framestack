@@ -259,22 +259,40 @@ public enum SourceLocator {
     /// Compares one file or folder (e.g. chosen in a relink panel) with the
     /// saved reference.
     public static func check(_ url: URL, against reference: SourceReference) -> SourceResolution {
+        check(url, against: reference, isPlaceholder: CloudFiles.isNotDownloaded)
+    }
+
+    /// `isPlaceholder` answers "is this file in iCloud and not on this Mac";
+    /// tests supply it because the file-system flag cannot be set by hand.
+    static func check(_ url: URL, against reference: SourceReference, isPlaceholder: (URL) -> Bool) -> SourceResolution {
         guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
         let current: SourceIdentity
         if let saved = reference.sequence {
             guard ImageSequenceLoader.isDirectory(url) else {
                 return .changed(url, differences: ["not a folder of images"])
             }
-            // Header-only listing of exactly the saved file names.
-            let files = saved.fileNames.compactMap { ImageSequenceLoader.describe(url.appendingPathComponent($0)) }
+            // Header-only listing of exactly the saved file names. An image
+            // that is an iCloud placeholder is not opened (D-037).
+            let urls = saved.fileNames.map { url.appendingPathComponent($0) }
+            let cloud = Set(urls.filter(isPlaceholder))
+            let inCloud = cloud.count
+            let files = urls.compactMap { cloud.contains($0) ? nil : ImageSequenceLoader.describe($0) }
             let sequence = ImageSequenceInfo(folderURL: url, files: files, displaySize: files.first?.pixelSize ?? PixelSize(width: 0, height: 0),
                                              framesPerSecond: saved.framesPerSecond, reversed: saved.reversed, skippedFileNames: [])
             current = SourceIdentity.compute(forSequence: sequence)
             var differences = current.differences(from: reference.identity)
-            if files.count != saved.fileNames.count {
-                differences.insert("\(saved.fileNames.count - files.count) of \(saved.fileNames.count) images missing", at: 0)
+            let missing = saved.fileNames.count - files.count - inCloud
+            if missing > 0 {
+                differences.insert("\(missing) of \(saved.fileNames.count) images missing", at: 0)
+            }
+            if inCloud > 0 {
+                differences.insert("\(inCloud) of \(saved.fileNames.count) images stored in iCloud, not downloaded to this Mac", at: 0)
             }
             return differences.isEmpty ? .found(url) : .changed(url, differences: differences)
+        }
+        // Fingerprinting reads the file, which would download a placeholder.
+        if isPlaceholder(url) {
+            return .changed(url, differences: ["stored in iCloud, not downloaded to this Mac (download it in Finder, then open the project again)"])
         }
         guard let identity = try? SourceIdentity.compute(for: url) else {
             return .changed(url, differences: ["unreadable"])

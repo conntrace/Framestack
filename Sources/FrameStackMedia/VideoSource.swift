@@ -3,10 +3,27 @@ import CoreMedia
 import Foundation
 import FrameStackCore
 
+/// iCloud placeholders: files whose name and size are on this Mac while
+/// their contents are not. Reading one makes macOS download it, so every
+/// path that would open a source file asks here first (D-016, D-037).
+public enum CloudFiles {
+    /// Asked of the file system only (`lstat` and a resource value); the
+    /// file is not opened, so nothing downloads.
+    public static func isNotDownloaded(_ url: URL) -> Bool {
+        var info = stat()
+        if lstat(url.path, &info) == 0, info.st_flags & UInt32(SF_DATALESS) != 0 { return true }
+        if let values = try? url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]),
+           values.ubiquitousItemDownloadingStatus == .notDownloaded { return true }
+        return false
+    }
+}
+
 public enum MediaError: Error, LocalizedError, Equatable {
     case fileNotFound(path: String)
     /// The file is an iCloud placeholder whose contents are not on this Mac.
     case notDownloaded(path: String)
+    /// Every image in the folder is an iCloud placeholder.
+    case imagesNotDownloaded(path: String, count: Int)
     case unreadable(path: String, reason: String)
     case noVideoTrack(path: String)
     case unsupportedTransform(String)
@@ -29,6 +46,8 @@ public enum MediaError: Error, LocalizedError, Equatable {
             return "The file “\((path as NSString).lastPathComponent)” could not be found."
         case let .notDownloaded(path):
             return "“\((path as NSString).lastPathComponent)” is stored in iCloud and has not been downloaded to this Mac. Download it in Finder first, then open it again."
+        case let .imagesNotDownloaded(path, count):
+            return "The \(count == 1 ? "image" : "\(count) images") in “\((path as NSString).lastPathComponent)” \(count == 1 ? "is" : "are") stored in iCloud and \(count == 1 ? "has" : "have") not been downloaded to this Mac. Download \(count == 1 ? "it" : "them") in Finder first, then open the folder again."
         case let .unreadable(path, reason):
             return "“\((path as NSString).lastPathComponent)” is not a readable movie. \(reason)"
         case let .noVideoTrack(path):
@@ -156,7 +175,7 @@ public struct VideoSourceInfo: Sendable, Equatable {
         case .logarithmic:
             w.append("This clip is tagged as logarithmic (log) footage. FrameStack has no log conversion: the frames are stacked as they are stored, so the result looks flat and its tones are not in linear light. Convert the clip to Rec. 709 first for a faithful stack.")
         case let .unrecognised(tag):
-            w.append("This clip's transfer function (\(tag)) is not one FrameStack knows. It is read the way macOS interprets it, which may not match the camera's intent; check the colours against the original.")
+            w.append("This clip's transfer function (\(tag)) is not one FrameStack knows. It is read the way macOS interprets it, which may not match the camera's intent; check the colors against the original.")
         case .standard, .hdr, .untagged:
             break
         }
@@ -182,8 +201,7 @@ public enum VideoSourceLoader {
         // An iCloud placeholder (Desktop & Documents sync, iCloud Drive) looks
         // like a normal file but AVFoundation would block on the download —
         // possibly forever. Say so instead.
-        if let values = try? url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]),
-           let status = values.ubiquitousItemDownloadingStatus, status == .notDownloaded {
+        if CloudFiles.isNotDownloaded(url) {
             throw MediaError.notDownloaded(path: path)
         }
         let asset = makeAsset(url)

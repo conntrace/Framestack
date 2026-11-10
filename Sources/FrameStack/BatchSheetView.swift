@@ -246,14 +246,14 @@ private struct BatchProgressView: View {
             let base = "\(report.width)×\(report.height), \(report.bitDepth)-bit, \(report.colorProfileName ?? "untagged")"
             return missing > 0 ? "\(base); \(missing) frames missing" : base
         case let .failed(message): return "Failed: \(message)"
-        case .cancelled: return "Cancelled"
+        case .cancelled: return "Canceled"
         }
     }
 
     private func summaryText(_ summary: BatchSummary) -> String {
         var parts = ["\(summary.finishedCount) of \(summary.outputs.count) written in \(String(format: "%.1f", summary.elapsedSeconds)) s with \(summary.rendersPerformed) render pass\(summary.rendersPerformed == 1 ? "" : "es")"]
         if summary.failedCount > 0 { parts.append("\(summary.failedCount) failed") }
-        if summary.cancelledCount > 0 { parts.append("\(summary.cancelledCount) cancelled") }
+        if summary.cancelledCount > 0 { parts.append("\(summary.cancelledCount) canceled") }
         return parts.joined(separator: ", ") + "."
     }
 }

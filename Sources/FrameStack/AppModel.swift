@@ -753,7 +753,7 @@ final class AppModel: ObservableObject {
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
         panel.nameFieldStringValue = (projectName ?? (source?.fileName as NSString?)?.deletingPathExtension ?? "Untitled") + ".\(ProjectFile.fileExtension)"
-        panel.message = "Save the project (settings and a reference to the video — the video is not copied)"
+        panel.message = "Save the project (settings and a reference to the source; the source is not copied)"
         guard panel.runModal() == .OK, var url = panel.url else { return false }
         if url.pathExtension.lowercased() != ProjectFile.fileExtension {
             url.appendPathExtension(ProjectFile.fileExtension)
@@ -960,7 +960,7 @@ final class AppModel: ObservableObject {
         }
         var s = project.settings
         if s.rangeEnd > info.duration || s.rangeStart >= info.duration || !(s.rangeStart < s.rangeEnd) {
-            notices.append("The saved time range \(Format.seconds(s.rangeStart.seconds)) – \(Format.seconds(s.rangeEnd.seconds)) does not fit this video; it was clamped.")
+            notices.append("The saved time range \(Format.seconds(s.rangeStart.seconds)) – \(Format.seconds(s.rangeEnd.seconds)) does not fit this \(word); it was clamped.")
             s.rangeEnd = min(s.rangeEnd, info.duration)
             if !(s.rangeStart < s.rangeEnd) { s.rangeStart = .zero }
         }

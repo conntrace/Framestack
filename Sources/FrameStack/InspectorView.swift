@@ -32,7 +32,7 @@ struct InspectorView: View {
                         InspectorSection(title: "Export", key: "export") { ExportSection() }
                     }
                 } else {
-                    Text("Open or drop a video to begin.")
+                    Text("Open or drop a video or a folder of images to begin.")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -94,7 +94,7 @@ private struct ProjectSection: View {
                 InfoRow(label: "Status", value: model.hasUnsavedChanges ? "Unsaved changes" : "Saved")
             } else {
                 Text("Not saved as a project").font(.callout).foregroundStyle(.secondary)
-                Text("A project stores the settings and a reference to the video, not a copy of it.")
+                Text("A project stores the settings and a reference to the source, not a copy of it.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -161,7 +161,7 @@ private struct PresetsSection: View {
                     name = model.matchingPreset?.preset.name ?? ""
                     isNaming = true
                 }
-                .help("Save the sampling, blend, weighting, alignment, mask, straighten, colour and export settings under a name")
+                .help("Save the sampling, blend, weighting, alignment, mask, straighten, color and export settings under a name")
                 Menu {
                     ForEach(model.presets) { stored in
                         Button("Delete “\(stored.preset.name)”", role: .destructive) { isConfirmingDelete = stored }
@@ -219,7 +219,7 @@ private struct PresetsSection: View {
             .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The sampling, blend, weighting, alignment, mask, straighten, colour and export settings will be saved. The time range, crop and painted strokes belong to this clip and are not.")
+            Text("The sampling, blend, weighting, alignment, mask, straighten, color and export settings will be saved. The time range, crop and painted strokes belong to this clip and are not.")
         }
         .alert("Replace “\(name)”?", isPresented: $isConfirmingReplace) {
             Button("Replace", role: .destructive) { model.savePreset(named: name, replacing: true) }
@@ -722,10 +722,10 @@ private struct WeightingSection: View {
 
     private var modeNote: String {
         switch model.blendMode {
-        case .average: return "Average: the weighted mean Σw·frame ÷ Σw (weights normalised, so brightness is unchanged)."
-        case .additive: return "Additive: each frame is added × its raw weight (exposure accumulation, not normalised)."
+        case .average: return "Average: the weighted mean Σw·frame ÷ Σw (weights normalized, so brightness is unchanged)."
+        case .additive: return "Additive: each frame is added × its raw weight (exposure accumulation, not normalized)."
         case .lighten, .darken: return "Lighten/Darken keep per-channel extremes and have no weights; the curve is ignored."
-        default: return "\(model.blendMode.displayName): each frame's opacity is multiplied by its raw weight; the first frame still initialises the composite."
+        default: return "\(model.blendMode.displayName): each frame's opacity is multiplied by its raw weight; the first frame still initializes the composite."
         }
     }
 }
@@ -860,12 +860,12 @@ private struct AlignmentSection: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                Text("Vision registers every frame to the reference at up to 2048 px (about one pixel of precision at that size) before blending. Parallax, moving subjects and rolling shutter cannot be aligned; the frames that fail are used unmoved and counted here.")
+                Text("Vision registers every frame to the reference at up to 2048 px (about one pixel of precision at that size) before blending. Parallax, moving subjects and rolling shutter cannot be aligned; a frame that cannot be registered is left out of the composite and counted here.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("Off: frames are stacked exactly as recorded. Turn on for handheld footage so a drifting camera does not blur the background (PRD §6.1).")
+                Text("Off: frames are stacked exactly as recorded. Turn on for handheld footage so a drifting camera does not blur the background.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1035,7 +1035,7 @@ private struct GeometrySection: View {
                 Text(String(format: "%.1f°", model.geometry.rotationDegrees))
                     .font(.callout).monospacedDigit().frame(width: 48, alignment: .trailing)
             }
-            Text("Rotates the finished composite about its centre (counter-clockwise is positive); the corners it uncovers are transparent until you crop.")
+            Text("Rotates the finished composite about its center (counter-clockwise is positive); the corners it uncovers are transparent until you crop.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle(isOn: $model.isEditingCrop) {
                 Label("Edit Crop on Preview", systemImage: "crop")
@@ -1047,7 +1047,7 @@ private struct GeometrySection: View {
                 Picker("Shape", selection: aspectBinding) {
                     ForEach(model.cropAspectChoices) { Text($0.displayName).tag($0) }
                 }
-                .help("Hold the crop to a shape. Choosing one reshapes the crop about its centre; Free lets each side move on its own.")
+                .help("Hold the crop to a shape. Choosing one reshapes the crop about its center; Free lets each side move on its own.")
                 Button { model.flipCropAspect() } label: { Image(systemName: "arrow.triangle.2.circlepath") }
                     .disabled(!model.canFlipCropAspect)
                     .help("Turn the shape between landscape and portrait")
@@ -1331,7 +1331,7 @@ private struct ExportSection: View {
                 }
                 .font(.caption)
             case .cancelled:
-                Text("Export cancelled.").font(.caption).foregroundStyle(.secondary)
+                Text("Export canceled.").font(.caption).foregroundStyle(.secondary)
             case let .failed(message):
                 Label(message, systemImage: "xmark.octagon").font(.caption).foregroundStyle(.red)
             default:

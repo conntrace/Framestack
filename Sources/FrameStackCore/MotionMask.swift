@@ -69,7 +69,39 @@ public struct MotionMaskSettings: Sendable, Codable, Equatable {
 
 /// Mask arithmetic on output-sized Float buffers (one value per pixel,
 /// 0…1). Pure functions; the renderer calls them per frame.
+///
+/// The per-pixel work runs on all cores in contiguous chunks of rows or
+/// columns (D-038). Every value is computed by the same arithmetic in the
+/// same order as a plain serial loop, so the result does not depend on the
+/// number of cores (`MaskOpsReferenceTests` compares against serial code).
 public enum MaskOps {
+    /// Calls `body` with contiguous ranges covering `0..<count`, in parallel
+    /// when there is enough work; each index belongs to exactly one range.
+    static func parallel(_ count: Int, minimumChunk: Int, _ body: (Range<Int>) -> Void) {
+        guard count > 0 else { return }
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        let chunks = max(1, min(cores, count / max(1, minimumChunk)))
+        if chunks == 1 { return body(0..<count) }
+        let size = (count + chunks - 1) / chunks
+        DispatchQueue.concurrentPerform(iterations: chunks) { c in
+            let lo = c * size, hi = min(lo + size, count)
+            if lo < hi { body(lo..<hi) }
+        }
+    }
+
+    /// Rows per chunk so that a chunk is at least about 32k values.
+    private static func rowChunk(width: Int) -> Int { max(1, 32768 / max(1, width)) }
+
+    /// `dst[i] = max(dst[i], src[i])` (or min) for `count` values.
+    @inline(__always)
+    private static func extreme(_ dst: UnsafeMutablePointer<Float>, _ src: UnsafePointer<Float>, count: Int, dilate: Bool) {
+        #if canImport(Accelerate)
+        if dilate { vDSP_vmax(src, 1, dst, 1, dst, 1, vDSP_Length(count)) } else { vDSP_vmin(src, 1, dst, 1, dst, 1, vDSP_Length(count)) }
+        #else
+        if dilate { for i in 0..<count where src[i] > dst[i] { dst[i] = src[i] } } else { for i in 0..<count where src[i] < dst[i] { dst[i] = src[i] } }
+        #endif
+    }
+
     /// Euclidean RGB distance in linear light between two premultiplied
     /// RGBA buffers, one value per pixel.
     public static func difference(_ frame: UnsafeBufferPointer<Float>, _ background: UnsafeBufferPointer<Float>, pixels: Int) -> [Float] {
@@ -77,10 +109,12 @@ public enum MaskOps {
         let f = frame.baseAddress!, b = background.baseAddress!
         out.withUnsafeMutableBufferPointer { o in
             let d = o.baseAddress!
-            for p in 0..<pixels {
-                let i = p * LinearImage.channelCount
-                let dr = f[i] - b[i], dg = f[i + 1] - b[i + 1], db = f[i + 2] - b[i + 2]
-                d[p] = (dr * dr + dg * dg + db * db).squareRoot()
+            parallel(pixels, minimumChunk: 32768) { range in
+                for p in range {
+                    let i = p * LinearImage.channelCount
+                    let dr = f[i] - b[i], dg = f[i + 1] - b[i + 1], db = f[i + 2] - b[i + 2]
+                    d[p] = (dr * dr + dg * dg + db * db).squareRoot()
+                }
             }
         }
         return out
@@ -89,37 +123,52 @@ public enum MaskOps {
     /// 1 where `value > threshold`, else 0.
     public static func threshold(_ values: inout [Float], _ threshold: Float) {
         values.withUnsafeMutableBufferPointer { v in
-            for i in 0..<v.count { v[i] = v[i] > threshold ? 1 : 0 }
+            let p = v.baseAddress!
+            parallel(v.count, minimumChunk: 65536) { range in
+                for i in range { p[i] = p[i] > threshold ? 1 : 0 }
+            }
         }
     }
 
     /// Separable running minimum (erode) or maximum (dilate) over a
     /// (2r+1)² square, edges clamped.
     public static func morph(_ mask: inout [Float], width: Int, height: Int, radius: Int, dilate: Bool) {
-        guard radius > 0 else { return }
+        guard radius > 0, width > 0, height > 0 else { return }
         var tmp = [Float](repeating: 0, count: mask.count)
-        // Horizontal
-        for y in 0..<height {
-            for x in 0..<width {
-                var best: Float = dilate ? -.infinity : .infinity
-                for dx in -radius...radius {
-                    let xx = min(max(x + dx, 0), width - 1)
-                    let v = mask[y * width + xx]
-                    best = dilate ? max(best, v) : min(best, v)
+        let interior = width - 2 * radius
+        mask.withUnsafeMutableBufferPointer { m in
+            tmp.withUnsafeMutableBufferPointer { t in
+                let src = m.baseAddress!, mid = t.baseAddress!
+                // Horizontal: mask → tmp. Away from the edges the window is
+                // the same 2r+1 shifted copies of the row for every pixel.
+                parallel(height, minimumChunk: rowChunk(width: width)) { rows in
+                    for y in rows {
+                        let s = UnsafePointer(src + y * width), d = mid + y * width
+                        if interior > 0 {
+                            (d + radius).update(from: s, count: interior)
+                            for k in 1...(2 * radius) { extreme(d + radius, s + k, count: interior, dilate: dilate) }
+                        }
+                        let edge = interior > 0 ? radius : width
+                        for x in Array(0..<edge) + (interior > 0 ? Array((width - radius)..<width) : []) {
+                            var best: Float = dilate ? -.infinity : .infinity
+                            for dx in -radius...radius {
+                                let v = s[min(max(x + dx, 0), width - 1)]
+                                best = dilate ? max(best, v) : min(best, v)
+                            }
+                            d[x] = best
+                        }
+                    }
                 }
-                tmp[y * width + x] = best
-            }
-        }
-        // Vertical
-        for y in 0..<height {
-            for x in 0..<width {
-                var best: Float = dilate ? -.infinity : .infinity
-                for dy in -radius...radius {
-                    let yy = min(max(y + dy, 0), height - 1)
-                    let v = tmp[yy * width + x]
-                    best = dilate ? max(best, v) : min(best, v)
+                // Vertical: tmp → mask, whole rows at a time.
+                parallel(height, minimumChunk: rowChunk(width: width)) { rows in
+                    for y in rows {
+                        let d = src + y * width
+                        d.update(from: mid + min(max(y - radius, 0), height - 1) * width, count: width)
+                        for dy in (1 - radius)...radius {
+                            extreme(d, mid + min(max(y + dy, 0), height - 1) * width, count: width, dilate: dilate)
+                        }
+                    }
                 }
-                mask[y * width + x] = best
             }
         }
     }
@@ -137,35 +186,57 @@ public enum MaskOps {
     /// Separable box blur of radius r, applied three times (≈ Gaussian),
     /// edges clamped. Keeps values in 0…1.
     public static func feather(_ mask: inout [Float], width: Int, height: Int, radius: Int) {
-        guard radius > 0 else { return }
+        guard radius > 0, width > 0, height > 0 else { return }
         var tmp = [Float](repeating: 0, count: mask.count)
         let window = Float(2 * radius + 1)
-        for _ in 0..<3 {
-            for y in 0..<height {
-                var sum: Float = 0
-                for dx in -radius...radius { sum += mask[y * width + min(max(dx, 0), width - 1)] }
-                for x in 0..<width {
-                    tmp[y * width + x] = sum / window
-                    let leaving = min(max(x - radius, 0), width - 1)
-                    let entering = min(max(x + radius + 1, 0), width - 1)
-                    sum += mask[y * width + entering] - mask[y * width + leaving]
-                }
-            }
-            for x in 0..<width {
-                var sum: Float = 0
-                for dy in -radius...radius { sum += tmp[min(max(dy, 0), height - 1) * width + x] }
-                for y in 0..<height {
-                    mask[y * width + x] = sum / window
-                    let leaving = min(max(y - radius, 0), height - 1)
-                    let entering = min(max(y + radius + 1, 0), height - 1)
-                    sum += tmp[entering * width + x] - tmp[leaving * width + x]
-                }
-            }
-            // Running sums leave ±1e-7 residues where the mask is really 0 or 1;
-            // snap them so "no coverage" stays exactly zero.
-            mask.withUnsafeMutableBufferPointer { v in
-                for i in 0..<v.count {
-                    if v[i] < 1e-5 { v[i] = 0 } else if v[i] > 1 - 1e-5 { v[i] = 1 }
+        mask.withUnsafeMutableBufferPointer { m in
+            tmp.withUnsafeMutableBufferPointer { t in
+                let a = m.baseAddress!, b = t.baseAddress!
+                for _ in 0..<3 {
+                    // Horizontal running sum, one row at a time: mask → tmp.
+                    parallel(height, minimumChunk: rowChunk(width: width)) { rows in
+                        for y in rows {
+                            let s = a + y * width, d = b + y * width
+                            var sum: Float = 0
+                            for dx in -radius...radius { sum += s[min(max(dx, 0), width - 1)] }
+                            for x in 0..<width {
+                                d[x] = sum / window
+                                let leaving = min(max(x - radius, 0), width - 1)
+                                let entering = min(max(x + radius + 1, 0), width - 1)
+                                sum += s[entering] - s[leaving]
+                            }
+                        }
+                    }
+                    // Vertical running sums, one per column, swept row by row
+                    // (the same additions per column as a column-by-column
+                    // loop, but in memory order): tmp → mask.
+                    parallel(width, minimumChunk: max(64, 32768 / height)) { columns in
+                        let n = columns.count, x0 = columns.lowerBound
+                        var sums = [Float](repeating: 0, count: n)
+                        sums.withUnsafeMutableBufferPointer { sumBuffer in
+                            let sum = sumBuffer.baseAddress!
+                            for dy in -radius...radius {
+                                let row = b + min(max(dy, 0), height - 1) * width + x0
+                                for i in 0..<n { sum[i] += row[i] }
+                            }
+                            for y in 0..<height {
+                                let d = a + y * width + x0
+                                let leaving = b + min(max(y - radius, 0), height - 1) * width + x0
+                                let entering = b + min(max(y + radius + 1, 0), height - 1) * width + x0
+                                for i in 0..<n {
+                                    d[i] = sum[i] / window
+                                    sum[i] += entering[i] - leaving[i]
+                                }
+                            }
+                        }
+                    }
+                    // Running sums leave ±1e-7 residues where the mask is really 0 or 1;
+                    // snap them so "no coverage" stays exactly zero.
+                    parallel(m.count, minimumChunk: 65536) { range in
+                        for i in range {
+                            if a[i] < 1e-5 { a[i] = 0 } else if a[i] > 1 - 1e-5 { a[i] = 1 }
+                        }
+                    }
                 }
             }
         }
@@ -179,10 +250,13 @@ public enum MaskOps {
     public static func apply(_ mask: [Float], to frame: UnsafeMutableBufferPointer<Float>) {
         let f = frame.baseAddress!
         mask.withUnsafeBufferPointer { m in
-            for p in 0..<m.count {
-                let i = p * LinearImage.channelCount
-                let w = m[p]
-                f[i] *= w; f[i + 1] *= w; f[i + 2] *= w; f[i + 3] *= w
+            let w = m.baseAddress!
+            parallel(m.count, minimumChunk: 32768) { range in
+                for p in range {
+                    let i = p * LinearImage.channelCount
+                    let v = w[p]
+                    f[i] *= v; f[i + 1] *= v; f[i + 2] *= v; f[i + 3] *= v
+                }
             }
         }
     }

@@ -67,11 +67,17 @@ public struct ImageSequenceInfo: Sendable, Equatable {
     public let reversed: Bool
     /// Names in the folder that are not decodable images and were ignored.
     public let skippedFileNames: [String]
+    /// Images in the folder that are iCloud placeholders (their contents are
+    /// not on this Mac). They are left out unopened, because reading one
+    /// makes macOS download it (D-037).
+    public let notDownloadedFileNames: [String]
     /// How images that are not the canvas size are placed.
     public let canvasPolicy: CanvasPolicy
 
     public init(folderURL: URL, files: [ImageSequenceFile], displaySize: PixelSize, framesPerSecond: Double,
-                reversed: Bool, skippedFileNames: [String], canvasPolicy: CanvasPolicy = .strict) {
+                reversed: Bool, skippedFileNames: [String], notDownloadedFileNames: [String] = [],
+                canvasPolicy: CanvasPolicy = .strict) {
+        self.notDownloadedFileNames = notDownloadedFileNames
         self.folderURL = folderURL
         self.files = files
         self.displaySize = displaySize
@@ -146,6 +152,13 @@ public struct ImageSequenceInfo: Sendable, Equatable {
 
     public var warnings: [String] {
         var w: [String] = []
+        if !notDownloadedFileNames.isEmpty {
+            let n = notDownloadedFileNames.count
+            let shown = notDownloadedFileNames.prefix(3).joined(separator: ", ") + (n > 3 ? ", …" : "")
+            w.append(n == 1
+                ? "1 image in the folder is stored in iCloud, not on this Mac, and was left out (\(shown)). Download it in Finder and open the folder again to include it."
+                : "\(n) images in the folder are stored in iCloud, not on this Mac, and were left out (\(shown)). Download them in Finder and open the folder again to include them.")
+        }
         if !skippedFileNames.isEmpty {
             let n = skippedFileNames.count
             let shown = skippedFileNames.prefix(3).joined(separator: ", ") + (n > 3 ? ", …" : "")
@@ -159,7 +172,7 @@ public struct ImageSequenceInfo: Sendable, Equatable {
         let raw = rawFileCount
         if raw > 0 {
             let which = raw == files.count ? "These are camera RAW files" : "\(raw) of the images are camera RAW files"
-            w.append("\(which): each is developed with macOS's default rendering (as-shot white balance, standard tone curve — the picture Preview shows) and then stacked. There are no RAW development controls, and full-size decoding is slow (a second or two per frame from a 60-megapixel camera).")
+            w.append("\(which): each is developed with macOS's default rendering (as-shot white balance, standard tone curve) and then stacked. There are no RAW development controls, and full-size decoding is slow (a second or two per frame from a 60-megapixel camera).")
             let pairs = rawPairCount
             if pairs > 0 {
                 w.append("\(pairs) shot\(pairs == 1 ? " is" : "s are") in the folder twice, as a RAW file and as a JPEG or HEIC of the same name, so \(pairs == 1 ? "it counts" : "they count") twice in the stack. Open only one kind to stack each shot once.")
@@ -177,7 +190,8 @@ public struct ImageSequenceInfo: Sendable, Equatable {
     public func with(framesPerSecond: Double? = nil, reversed: Bool? = nil) -> ImageSequenceInfo {
         ImageSequenceInfo(folderURL: folderURL, files: files, displaySize: displaySize,
                           framesPerSecond: framesPerSecond ?? self.framesPerSecond,
-                          reversed: reversed ?? self.reversed, skippedFileNames: skippedFileNames, canvasPolicy: canvasPolicy)
+                          reversed: reversed ?? self.reversed, skippedFileNames: skippedFileNames,
+                          notDownloadedFileNames: notDownloadedFileNames, canvasPolicy: canvasPolicy)
     }
 
     /// Uniform scale and offset that place a `size` still on the canvas
@@ -244,8 +258,10 @@ public enum ImageSequenceLoader {
         }
     }
 
-    private static func load(folder: URL, candidates: [URL], framesPerSecond: Double, reversed: Bool,
-                             canvasPolicy: CanvasPolicy) async throws -> ImageSequenceInfo {
+    /// `isPlaceholder` is a parameter so a test can stand in for iCloud.
+    static func load(folder: URL, candidates: [URL], framesPerSecond: Double, reversed: Bool,
+                     canvasPolicy: CanvasPolicy,
+                     isPlaceholder: (URL) -> Bool = CloudFiles.isNotDownloaded) async throws -> ImageSequenceInfo {
         guard framesPerSecond > 0, framesPerSecond.isFinite else {
             throw MediaError.invalidSequenceRate(framesPerSecond)
         }
@@ -256,9 +272,16 @@ public enum ImageSequenceLoader {
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
         var files: [ImageSequenceFile] = []
         var skipped: [String] = []
+        var notDownloaded: [String] = []
         for url in sorted {
             try Task.checkCancellation()
             if isDirectory(url) { continue }
+            // Before anything opens the file: reading a placeholder would
+            // make macOS download it (D-037).
+            if isImageFile(url), isPlaceholder(url) {
+                notDownloaded.append(url.lastPathComponent)
+                continue
+            }
             guard isImageFile(url), let file = describe(url) else {
                 skipped.append(url.lastPathComponent)
                 continue
@@ -266,6 +289,9 @@ public enum ImageSequenceLoader {
             files.append(file)
         }
         guard let canvas = files.first?.pixelSize else {
+            if !notDownloaded.isEmpty {
+                throw MediaError.imagesNotDownloaded(path: folder.path, count: notDownloaded.count)
+            }
             throw MediaError.noImagesFound(path: folder.path)
         }
         let mismatched = files.filter { $0.pixelSize != canvas }
@@ -276,7 +302,8 @@ public enum ImageSequenceLoader {
             )
         }
         return ImageSequenceInfo(folderURL: folder, files: files, displaySize: canvas, framesPerSecond: framesPerSecond,
-                                 reversed: reversed, skippedFileNames: skipped, canvasPolicy: canvasPolicy)
+                                 reversed: reversed, skippedFileNames: skipped, notDownloadedFileNames: notDownloaded,
+                                 canvasPolicy: canvasPolicy)
     }
 
     /// Header-only description; nil when ImageIO cannot read the file.

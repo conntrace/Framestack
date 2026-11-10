@@ -38,7 +38,7 @@ struct ContentView: View {
                 } label: {
                     Label("Open", systemImage: "folder")
                 }
-                .help("Open a video (⌘O)")
+                .help("Open a video, a folder of images or a project (⌘O)")
                 Picker("Preview", selection: $model.previewQuality) {
                     ForEach(PreviewQuality.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -110,7 +110,7 @@ private struct PreviewArea: View {
                         Button("Fit All Into the First Image's Size") { model.setSequence(canvasPolicy: .fit) }
                         Button("Fill (Crop Overflow)") { model.setSequence(canvasPolicy: .fill) }
                     }
-                    Text("Both scale uniformly and centre each image; Fit leaves transparent bars, Fill crops. Nothing is stretched.")
+                    Text("Both scale uniformly and center each image; Fit leaves transparent bars, Fill crops. Nothing is stretched.")
                         .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
                 }
                 Button("Open Another…") { model.presentOpenPanel() }
@@ -267,7 +267,7 @@ private struct RelinkView: View {
             Image(systemName: request.candidate == nil ? "questionmark.folder" : "exclamationmark.triangle")
                 .font(.system(size: 40, weight: .light))
                 .foregroundStyle(.orange)
-            Text(request.candidate == nil ? "Video not found" : "Video has changed").font(.title2)
+            Text(request.candidate == nil ? "Source not found" : "Source has changed").font(.title2)
             Text("Project “\(request.projectURL.deletingPathExtension().lastPathComponent)” was saved with “\(request.savedFileName)” (\(request.project.source.frameCount) frames, \(request.project.source.displaySize)).")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -299,8 +299,8 @@ private struct DropHint: View {
                 .font(.system(size: 48, weight: .light))
                 .foregroundStyle(.secondary)
             Text("Drop a video or a folder of images here").font(.title2)
-            Text("MOV or MP4 — anything this Mac can decode; JPEG, PNG, TIFF or HEIF stills").foregroundStyle(.secondary)
-            Button("Open Video…") { model.presentOpenPanel() }
+            Text("MOV or MP4 — anything this Mac can decode; JPEG, PNG, TIFF, HEIF or camera RAW stills").foregroundStyle(.secondary)
+            Button("Open…") { model.presentOpenPanel() }
                 .keyboardShortcut(.defaultAction)
         }
     }
