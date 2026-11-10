@@ -53,6 +53,9 @@ struct ContentView: View {
                 .help("Export the composite as an image (⌘E)")
             }
         }
+        .sheet(isPresented: $model.isBatchSheetPresented) {
+            BatchSheetView().environmentObject(model)
+        }
         .navigationTitle(model.windowTitle)
         .navigationSubtitle(model.windowSubtitle)
         .onAppear { model.undoManager = undoManager }

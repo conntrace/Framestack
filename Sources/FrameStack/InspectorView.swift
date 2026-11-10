@@ -11,6 +11,7 @@ struct InspectorView: View {
                 if let source = model.source {
                     if model.timeline != nil {
                         InspectorSection(title: "Project", key: "project") { ProjectSection() }
+                        InspectorSection(title: "Presets", key: "presets") { PresetsSection() }
                     }
                     InspectorSection(title: "Source", key: "source") {
                         switch source {
@@ -120,6 +121,108 @@ private struct ProjectSection: View {
             case .idle:
                 EmptyView()
             }
+        }
+    }
+}
+
+// MARK: Presets
+
+private struct PresetsSection: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var isNaming = false
+    @State private var isConfirmingReplace = false
+    @State private var isConfirmingDelete: StoredPreset?
+    @State private var name = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Menu {
+                    if model.presets.isEmpty {
+                        Text("No presets saved")
+                    }
+                    ForEach(model.presets) { stored in
+                        Button(stored.preset.name) { model.applyPreset(stored) }
+                    }
+                } label: {
+                    Label(model.matchingPreset?.preset.name ?? "Apply Preset", systemImage: "slider.horizontal.3")
+                        .lineLimit(1)
+                }
+                .help(model.presets.isEmpty ? "Save the current settings as a preset first" : "Replace the creative settings with a saved preset; the time range, crop and painted strokes stay")
+                Button("Save…") {
+                    name = model.matchingPreset?.preset.name ?? ""
+                    isNaming = true
+                }
+                .help("Save the sampling, blend, weighting, alignment, mask, straighten, colour and export settings under a name")
+                Menu {
+                    ForEach(model.presets) { stored in
+                        Button("Delete “\(stored.preset.name)”", role: .destructive) { isConfirmingDelete = stored }
+                    }
+                    if !model.presets.isEmpty { Divider() }
+                    Button("Show in Finder") { model.revealPresets() }
+                    Button("Reload") { model.reloadPresets() }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Delete presets or open their folder")
+            }
+            .controlSize(.small)
+            Text("A preset holds the creative choices, not the file or its time range, so it applies to any clip.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            switch model.presetActivity {
+            case let .saved(name):
+                Label("Saved preset “\(name)”", systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary)
+            case let .applied(name, notices):
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Applied “\(name)”", systemImage: "checkmark.circle").foregroundStyle(.secondary)
+                    ForEach(notices, id: \.self) { notice in
+                        Label(notice, systemImage: notice.hasPrefix("Kept") ? "info.circle" : "exclamationmark.triangle")
+                            .foregroundStyle(notice.hasPrefix("Kept") ? Color.secondary : Color.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .font(.caption)
+            case let .deleted(name):
+                Label("Deleted preset “\(name)”", systemImage: "trash").font(.caption).foregroundStyle(.secondary)
+            case let .failed(message):
+                Label(message, systemImage: "xmark.octagon").font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            case .idle:
+                EmptyView()
+            }
+            if !model.presetListing.problems.isEmpty {
+                ForEach(model.presetListing.problems, id: \.self) { problem in
+                    Label(problem, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .alert("Save Preset", isPresented: $isNaming) {
+            TextField("Name", text: $name)
+            Button("Save") {
+                if model.presetExists(named: name) {
+                    isConfirmingReplace = true
+                } else {
+                    model.savePreset(named: name)
+                }
+            }
+            .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The sampling, blend, weighting, alignment, mask, straighten, colour and export settings will be saved. The time range, crop and painted strokes belong to this clip and are not.")
+        }
+        .alert("Replace “\(name)”?", isPresented: $isConfirmingReplace) {
+            Button("Replace", role: .destructive) { model.savePreset(named: name, replacing: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A preset with this name already exists.")
+        }
+        .alert("Delete “\(isConfirmingDelete?.preset.name ?? "")”?", isPresented: Binding(get: { isConfirmingDelete != nil }, set: { if !$0 { isConfirmingDelete = nil } })) {
+            Button("Delete", role: .destructive) { if let stored = isConfirmingDelete { model.deletePreset(stored) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The preset file is removed from the presets folder. Projects that used it keep their settings.")
         }
     }
 }
@@ -988,6 +1091,14 @@ private struct ExportSection: View {
             }
             .controlSize(.large)
             .disabled(!model.canExport)
+            Button {
+                model.isBatchSheetPresented = true
+            } label: {
+                Label("Batch Export…", systemImage: "square.stack.3d.up")
+                    .frame(maxWidth: .infinity)
+            }
+            .disabled(!model.canExport && model.batch == nil)
+            .help("Export several blend modes or presets of these frames to a folder (⇧⌘E)")
 
             switch model.exportActivity {
             case let .finished(report, missing, decodeFailure):

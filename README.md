@@ -30,6 +30,8 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 
 **M6e (colour):** a **Color** section with exposure, contrast, saturation, temperature and tint, applied to the finished composite before crop and straighten. Colour and geometry changes re-process the cached composite instead of decoding the clip again, so they are instant; exports apply exactly the same maths.
 
+**M6f (presets, batch):** a **Presets** section saves the creative choices — sampling, blend, weighting, alignment mode, mask parameters, straighten angle and edge fill, colour, export settings — as a named `.framestackpreset` file in `~/Library/Application Support/FrameStack/Presets`, never the clip, its time range, crop or painted strokes, so a preset applies to any clip (one undo step; the section says what was kept from the open document). **Batch Export…** (⇧⌘E) writes several variants of the same frames — the current settings, other blend modes, saved presets — into one folder with deterministic, collision-safe names; variants that share a composite are rendered once, each row reports its status, and the batch can be cancelled without leaving partial files.
+
 | Keys | |
 |---|---|
 | ⌘O · Open Recent · drop | open a clip, a folder of stills, several stills, or a `.framestack` project |
@@ -43,7 +45,7 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: presets and batch variants (rest of M6), tone curves, crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
+Not yet: tone curves, crop handles on the preview, RAW stills, HDR tone mapping, built-in starter presets. See the plan.
 
 ## Requirements
 
@@ -120,6 +122,8 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 19. (M6c) Blend → **Normal**, then turn on **Keep only what moves**: the subject appears at every position over a clean background (chronophotography); the section reports the background used and the moving-pixel share. Tick **Show mask coverage**: white where motion was. Raise the threshold until noise disappears; **Invert** shows the still scene only; **Use Playhead Frame** swaps the background for a frame.
 20. (M6d) In Painted Mask turn on **Paint on the preview** and drag a stroke across part of the image: a red stroke appears, the blend applies only inside it and the background shows elsewhere; ⌘Z removes the stroke ("Undo Paint Mask"). Switch the brush to Erase and cross the stroke; **Invert** flips the region.
 21. (M6e) Drag **Exposure** to +1: the preview updates without a render pass (no "Rendering" in the bar) and ⌘Z reads "Undo Change Exposure"; Saturation −100 % gives a neutral image; Reset returns everything. Export and compare with the preview.
+22. (M6f) In Presets click **Save…**, name the current look and Save: the menu button shows the name. Change the blend mode, then pick the preset from the menu: the blend returns, the section says what was kept from this clip (time range, crop, strokes), and ⌘Z reads "Undo Apply Preset". Open another clip: the preset is still there and applies to it.
+23. (M6f) **Batch Export…** (⇧⌘E, or the button under Export): tick two more blend modes and the preset, read "N outputs, M render passes", choose a folder and **Export Here**: each row goes Waiting → Rendering → Writing → size/depth/profile; variants that only differ in colour or crop share a render pass; a file that already exists is kept and the new one gets " 2". **Cancel Batch** mid-way leaves the finished files only; **Show in Finder** selects them.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

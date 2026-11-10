@@ -48,6 +48,9 @@ struct FrameStackApp: App {
                 Button("Export Image…") { model.presentExportPanel() }
                     .keyboardShortcut("e")
                     .disabled(!model.canExport)
+                Button("Batch Export…") { model.isBatchSheetPresented = true }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .disabled(!model.canExport && model.batch == nil)
             }
             CommandGroup(before: .toolbar) {
                 Picker("Show", selection: $model.viewMode) {

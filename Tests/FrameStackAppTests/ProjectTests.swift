@@ -1187,3 +1187,151 @@ final class ColorAppTests: XCTestCase {
         XCTAssertEqual(reopened.color, .identity)
     }
 }
+
+@MainActor
+final class PresetAndBatchAppTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("FrameStackPresetApp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("out"), withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var fixtures: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("FrameStackMediaTests/Fixtures")
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 30, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { throw XCTSkip("timed out") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func makeModel() -> AppModel {
+        AppModel(defaults: UserDefaults(suiteName: "PresetApp-\(UUID().uuidString)")!,
+                 presetStore: PresetStore(directory: directory.appendingPathComponent("presets")))
+    }
+
+    private func waitReady(_ model: AppModel) async throws {
+        try await waitUntil { if case .ready = model.sourceState { return true } else { return false } }
+        try await waitUntil { model.isPreviewCurrent }
+    }
+
+    func testSaveApplyUndoAndDeletePresets() async throws {
+        let model = makeModel()
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        model.open(fixtures.appendingPathComponent("moving_square_24f.mp4"))
+        try await waitReady(model)
+        XCTAssertTrue(model.presets.isEmpty)
+
+        model.blendMode = .lighten
+        model.color.exposure = 0.5
+        model.weighting = WeightCurve(preset: .late)
+        model.exportSettings = ExportSettings(format: .tiff, bitDepth: .sixteen)
+        XCTAssertFalse(model.savePreset(named: "   "), "a blank name is refused")
+        XCTAssertEqual(model.presetActivity, .failed("A preset needs a name."))
+        XCTAssertTrue(model.savePreset(named: " Light Trails "))
+        XCTAssertEqual(model.presets.map(\.preset.name), ["Light Trails"])
+        XCTAssertEqual(model.presetActivity, .saved("Light Trails"))
+        XCTAssertEqual(model.matchingPreset?.preset.name, "Light Trails", "the current settings are exactly this preset")
+        XCTAssertFalse(model.savePreset(named: "Light Trails"), "no silent overwrite")
+        XCTAssertTrue(model.presetExists(named: "Light Trails"))
+
+        // A changed document: different range, crop and a stroke, then the preset goes on top.
+        model.blendMode = .average
+        model.color = .identity
+        model.weighting = .flat
+        model.exportSettings = ExportSettings()
+        model.setFrameRange(first: 4, last: 15)
+        model.geometry.crop = NormalizedRect(x: 0, y: 0, width: 0.5, height: 1)
+        model.addStroke(points: [.init(x: 0.2, y: 0.2)])
+        XCTAssertNil(model.matchingPreset)
+        try await waitUntil { model.isPreviewCurrent }
+        let before = model.settings
+        let rendersBefore = model.previewRenderCount
+
+        model.applyPreset(model.presets[0])
+        XCTAssertEqual(undo.undoActionName, "Apply Preset")
+        XCTAssertEqual(model.blendMode, .lighten)
+        XCTAssertEqual(model.color.exposure, 0.5)
+        XCTAssertEqual(model.weighting.preset, .late)
+        XCTAssertEqual(model.exportSettings.format, .tiff)
+        XCTAssertEqual(model.frameRange, 4...15, "the range is the document's")
+        XCTAssertEqual(model.geometry.crop, NormalizedRect(x: 0, y: 0, width: 0.5, height: 1))
+        XCTAssertEqual(model.paintedMask.strokes.count, 1)
+        guard case let .applied(name, notices) = model.presetActivity else { return XCTFail("\(model.presetActivity)") }
+        XCTAssertEqual(name, "Light Trails")
+        XCTAssertEqual(notices, ["Kept from this document: the time range, the crop, the painted mask (1 stroke).",
+                                 "Lighten ignores the preset's weighting."])
+        try await waitUntil { model.isPreviewCurrent }
+        XCTAssertEqual(model.previewRenderCount, rendersBefore + 1, "one render for the whole preset")
+        XCTAssertEqual(model.matchingPreset?.preset.name, "Light Trails")
+
+        undo.undo()
+        XCTAssertEqual(model.settings, before, "one undo step restores everything the preset changed")
+        XCTAssertEqual(undo.redoActionName, "Apply Preset")
+        undo.redo()
+        XCTAssertEqual(model.blendMode, .lighten)
+
+        // Presets survive the model: a fresh model on the same folder sees it; deleting removes the file.
+        let other = makeModel()
+        XCTAssertEqual(other.presets.map(\.preset.name), ["Light Trails"])
+        other.deletePreset(other.presets[0])
+        XCTAssertEqual(other.presetActivity, .deleted("Light Trails"))
+        XCTAssertTrue(other.presets.isEmpty)
+        model.reloadPresets()
+        XCTAssertTrue(model.presets.isEmpty)
+    }
+
+    func testBatchVariantsAreDedupedAndTheBatchWritesEveryOutput() async throws {
+        let model = makeModel()
+        model.open(fixtures.appendingPathComponent("moving_square_24f.mp4"))
+        try await waitReady(model)
+        model.exportSettings = ExportSettings(format: .png, bitDepth: .eight)
+        model.color.exposure = 1
+        XCTAssertTrue(model.savePreset(named: "Bright"))
+        model.color = .identity
+        try await waitUntil { model.isPreviewCurrent }
+
+        var choice = BatchChoice()
+        choice.includeCurrent = true
+        choice.blendModes = [.average, .lighten] // Average = the current settings → one output, not two
+        choice.presetURLs = [model.presets[0].url]
+        let variants = model.batchVariants(for: choice)
+        XCTAssertEqual(variants.map(\.name), ["Average", "Lighten", "Bright"])
+        XCTAssertEqual(variants.map(\.id), ["current", "mode:lighten", "preset:\(model.presets[0].url.path)"])
+        model.batchChoice = choice
+        XCTAssertTrue(model.canStartBatch)
+        XCTAssertEqual(model.batchBaseName, "moving_square_24f")
+
+        let folder = directory.appendingPathComponent("out")
+        model.startBatch(choice: choice, folder: folder)
+        XCTAssertTrue(model.isExporting, "a running batch blocks single exports")
+        XCTAssertFalse(model.canExport)
+        XCTAssertEqual(model.batch?.outputs.map(\.url.lastPathComponent), [
+            "moving_square_24f Average 24f.png", "moving_square_24f Lighten 24f.png", "moving_square_24f Bright 24f.png",
+        ])
+        try await waitUntil { model.batch?.summary != nil }
+        let summary = try XCTUnwrap(model.batch?.summary)
+        XCTAssertEqual(summary.finishedCount, 3)
+        XCTAssertEqual(summary.rendersPerformed, 2, "Bright shares the Average composite")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), [
+            "moving_square_24f Average 24f.png", "moving_square_24f Bright 24f.png", "moving_square_24f Lighten 24f.png",
+        ])
+        XCTAssertTrue(model.canExport, "single export is available again")
+        model.dismissBatch()
+        XCTAssertNil(model.batch)
+
+        // Nothing chosen → nothing to start.
+        model.batchChoice = BatchChoice(includeCurrent: false)
+        XCTAssertFalse(model.canStartBatch)
+    }
+}

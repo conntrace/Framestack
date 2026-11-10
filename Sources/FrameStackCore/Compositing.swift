@@ -114,6 +114,14 @@ public enum BlendMode: String, Sendable, Codable, CaseIterable, Identifiable {
         }
     }
 
+    /// Temporal weights change the result (mirrors the reducers' `usesWeights`).
+    public var usesWeights: Bool {
+        switch self {
+        case .lighten, .darken, .median, .maxLuminance, .minLuminance: return false
+        case .average, .additive, .screen, .multiply, .difference, .normal: return true
+        }
+    }
+
     /// Creates the streaming reducer for this mode at the given output size.
     /// `opacity` (0…1) is ignored by modes where `usesOpacity` is false.
     public func makeReducer(width: Int, height: Int, opacity: Float = 1) -> FrameReducer {

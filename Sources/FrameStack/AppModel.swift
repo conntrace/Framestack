@@ -83,6 +83,31 @@ enum ProjectActivity: Equatable {
     case failed(String)
 }
 
+enum PresetActivity: Equatable {
+    case idle
+    case saved(String)
+    case applied(String, notices: [String])
+    case deleted(String)
+    case failed(String)
+}
+
+/// A running or finished batch export (PRD §9.3).
+struct BatchState: Equatable {
+    var folder: URL
+    var outputs: [BatchOutput]
+    var summary: BatchSummary?
+    var isRunning: Bool { summary == nil }
+    var finishedCount: Int { outputs.filter { if case .finished = $0.status { return true } else { return false } }.count }
+}
+
+/// What the batch sheet exports: the current settings, other blend modes
+/// over the current settings, and saved presets.
+struct BatchChoice: Equatable {
+    var includeCurrent = true
+    var blendModes: Set<BlendMode> = []
+    var presetURLs: Set<URL> = []
+}
+
 enum RenderActivity: Equatable {
     case idle
     case waiting
@@ -155,7 +180,7 @@ final class AppModel: ObservableObject {
 
     /// The post-composite pipeline shared by preview and export: colour, then geometry.
     nonisolated static func postProcess(_ image: LinearImage, color: ColorAdjustments, geometry: GeometrySettings) throws -> LinearImage {
-        try GeometryProcessor.apply(geometry, to: ColorProcessor.apply(color, to: image))
+        try PostProcessor.apply(image, color: color, geometry: geometry)
     }
     /// Painting tool state (not saved): brush as a fraction of the canvas long edge, softness, erase.
     @Published var brushRadius: Double = 0.04
@@ -270,6 +295,20 @@ final class AppModel: ObservableObject {
     @Published private(set) var renderPass: String?
     @Published private(set) var exportActivity: ExportActivity = .idle
 
+    // Presets (M6f)
+    let presetStore: PresetStore
+    @Published var presetListing = PresetListing.empty
+    @Published var presetActivity: PresetActivity = .idle
+    /// Names the next registered undo step instead of deriving it from the
+    /// changed fields (a preset changes many at once).
+    var pendingActionName: String?
+
+    // Batch export (M6f)
+    @Published var batch: BatchState?
+    @Published var isBatchSheetPresented = false
+    @Published var batchChoice = BatchChoice()
+    var batchTask: Task<Void, Never>?
+
     /// The window's undo manager, handed in by the view. Settings changes
     /// register undo steps on it.
     weak var undoManager: UndoManager? {
@@ -282,9 +321,12 @@ final class AppModel: ObservableObject {
     private let defaults: UserDefaults
     private static let recentFilesKey = "recentFiles"
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, presetStore: PresetStore? = nil) {
         self.defaults = defaults
+        self.presetStore = presetStore ?? PresetStore(directory: (try? PresetStore.defaultDirectory())
+            ?? FileManager.default.temporaryDirectory.appendingPathComponent("FrameStack/Presets", isDirectory: true))
         recentFiles = (defaults.stringArray(forKey: Self.recentFilesKey) ?? []).map { URL(fileURLWithPath: $0) }
+        reloadPresets()
     }
 
     private func noteRecent(_ url: URL) {
@@ -302,13 +344,13 @@ final class AppModel: ObservableObject {
         NSDocumentController.shared.clearRecentDocuments(nil)
     }
 
-    private let renderer = CompositeRenderer()
+    let renderer = CompositeRenderer()
     private var loadTask: Task<Void, Never>?
     private var thumbnailTask: Task<Void, Never>?
     private var sourceFrameTask: Task<Void, Never>?
-    private var previewTask: Task<Void, Never>?
+    var previewTask: Task<Void, Never>?
     private var exportTask: Task<Void, Never>?
-    private var suppressChanges = false
+    var suppressChanges = false
     private var lastSettings: CompositeSettings?
     private var interactiveEditDepth = 0
     /// Settings when the current interactive edit (drag, slider) began; the
@@ -354,6 +396,7 @@ final class AppModel: ObservableObject {
     var isPreviewCurrent: Bool { preview?.revision == settingsRevision }
 
     var isExporting: Bool {
+        if batch?.isRunning == true { return true }
         switch exportActivity {
         case .rendering, .writing: return true
         default: return false
@@ -676,6 +719,8 @@ final class AppModel: ObservableObject {
         renderActivity = .idle
         exportActivity = .idle
         projectActivity = .idle
+        batchTask?.cancel()
+        batch = nil
         sourceNotice = nil
         sourceIdentity = nil
         mixedSizeRetry = nil
@@ -1038,7 +1083,7 @@ final class AppModel: ObservableObject {
             MainActor.assumeIsolated { model.apply(old) }
         }
         if !undoManager.isUndoing, !undoManager.isRedoing {
-            undoManager.setActionName(Self.actionName(from: old, to: new))
+            undoManager.setActionName(pendingActionName ?? Self.actionName(from: old, to: new))
         }
         if needsGroup { undoManager.endUndoGrouping() }
     }
@@ -1079,7 +1124,7 @@ final class AppModel: ObservableObject {
         alignment.reference.resolve(in: selectedTimes)
     }
 
-    private func settingsChanged(debounce: Bool = true) {
+    func settingsChanged(debounce: Bool = true) {
         guard !suppressChanges else { return }
         let new = settings
         if interactiveEditDepth == 0, let old = lastSettings {
@@ -1213,7 +1258,9 @@ final class AppModel: ObservableObject {
     }
 
     func cancelRendering() {
-        if isExporting {
+        if batch?.isRunning == true {
+            cancelBatch()
+        } else if isExporting {
             exportTask?.cancel()
         } else {
             previewTask?.cancel()
