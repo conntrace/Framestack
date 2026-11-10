@@ -43,6 +43,7 @@ struct ContentView: View {
                     ForEach(PreviewQuality.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .pickerStyle(.menu)
+                .accessibilityLabel("Preview resolution")
                 .help("Preview resolution. Export is always full resolution.")
                 Button {
                     model.presentExportPanel()

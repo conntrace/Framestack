@@ -627,6 +627,8 @@ private struct BlendSection: View {
                         // One undo step per drag, not one per pixel.
                         editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
                     }
+                    .accessibilityLabel("Opacity")
+                    .accessibilityValue("\(Int((model.opacity * 100).rounded())) percent")
                     Text("\(Int((model.opacity * 100).rounded())) %")
                         .font(.callout)
                         .monospacedDigit()
@@ -917,6 +919,8 @@ private struct MotionMaskSection: View {
                     Slider(value: $model.motionMask.threshold, in: 0.01...0.5) { editing in
                         editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
                     }
+                    .accessibilityLabel("Motion threshold")
+                    .accessibilityValue(String(format: "%.2f", model.motionMask.threshold))
                     Text(String(format: "%.2f", model.motionMask.threshold)).font(.callout).monospacedDigit().frame(width: 40, alignment: .trailing)
                 }
                 HStack {
@@ -924,11 +928,15 @@ private struct MotionMaskSection: View {
                     Stepper(value: $model.motionMask.feather, in: 0...MotionMaskSettings.maximumRadius) {
                         Text("\(model.motionMask.feather) px").font(.callout).monospacedDigit()
                     }
+                    .accessibilityLabel("Feather")
+                    .accessibilityValue(model.motionMask.feather == 1 ? "1 pixel" : "\(model.motionMask.feather) pixels")
                     Spacer()
                     Text("Clean up").font(.callout)
                     Stepper(value: $model.motionMask.cleanup, in: 0...MotionMaskSettings.maximumRadius) {
                         Text("\(model.motionMask.cleanup) px").font(.callout).monospacedDigit()
                     }
+                    .accessibilityLabel("Clean up")
+                    .accessibilityValue(model.motionMask.cleanup == 1 ? "1 pixel" : "\(model.motionMask.cleanup) pixels")
                 }
                 Toggle("Invert (keep only what stays still)", isOn: $model.motionMask.invert).font(.callout)
                 Toggle("Show mask coverage instead of the composite", isOn: $model.showMaskCoverage).font(.callout)
@@ -992,11 +1000,15 @@ private struct PaintedMaskSection: View {
             HStack {
                 Text("Size").font(.callout)
                 Slider(value: $model.brushRadius, in: 0.005...0.25)
+                    .accessibilityLabel("Brush size")
+                    .accessibilityValue("\(Int((model.brushRadius * 100).rounded())) percent")
                 Text("\(Int((model.brushRadius * 100).rounded())) %").font(.callout).monospacedDigit().frame(width: 40, alignment: .trailing)
             }
             HStack {
                 Text("Softness").font(.callout)
                 Slider(value: $model.brushSoftness, in: 0...1)
+                    .accessibilityLabel("Brush softness")
+                    .accessibilityValue("\(Int((model.brushSoftness * 100).rounded())) percent")
                 Text("\(Int((model.brushSoftness * 100).rounded())) %").font(.callout).monospacedDigit().frame(width: 40, alignment: .trailing)
             }
             Toggle("Invert (painted areas excluded)", isOn: $model.paintedMask.invert).font(.callout)
@@ -1032,6 +1044,8 @@ private struct GeometrySection: View {
                 Slider(value: $model.geometry.rotationDegrees, in: -15...15, step: 0.1) { editing in
                     editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
                 }
+                .accessibilityLabel("Straighten")
+                .accessibilityValue(String(format: "%.1f degrees", model.geometry.rotationDegrees))
                 Text(String(format: "%.1f°", model.geometry.rotationDegrees))
                     .font(.callout).monospacedDigit().frame(width: 48, alignment: .trailing)
             }
@@ -1174,6 +1188,8 @@ private struct ColorSection: View {
             Slider(value: value, in: range) { editing in
                 editing ? model.beginInteractiveEdit() : model.endInteractiveEdit()
             }
+            .accessibilityLabel(label)
+            .accessibilityValue(format(value.wrappedValue))
             Text(format(value.wrappedValue)).font(.callout).monospacedDigit().frame(width: 72, alignment: .trailing)
         }
         .accessibilityElement(children: .contain)
@@ -1277,6 +1293,8 @@ private struct ExportSection: View {
                 HStack {
                     Text("Quality")
                     Slider(value: $model.exportSettings.jpegQuality, in: 0.5...1)
+                        .accessibilityLabel("JPEG quality")
+                        .accessibilityValue("\(Int((model.exportSettings.jpegQuality * 100).rounded())) percent")
                     Text("\(Int((model.exportSettings.jpegQuality * 100).rounded())) %").monospacedDigit().frame(width: 44, alignment: .trailing)
                 }
                 .font(.callout)

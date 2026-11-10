@@ -234,6 +234,7 @@ struct PlayheadControls: View {
                 .monospacedDigit()
                 .frame(width: 64)
                 .labelsHidden()
+                .accessibilityLabel("Frame under the playhead")
                 .help("Frame under the playhead (0-based)")
             Button { model.stepScrub(by: 1) } label: { Image(systemName: "chevron.right") }
                 .help("Next frame (⌥→)")
