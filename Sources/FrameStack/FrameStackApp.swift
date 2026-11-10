@@ -69,6 +69,10 @@ struct FrameStackApp: App {
                 Button("Zoom Out") { model.zoomOut(viewport: AppDelegate.previewViewport) }
                     .keyboardShortcut("-")
                 Divider()
+                Toggle("Crop on Preview", isOn: $model.isEditingCrop)
+                    .keyboardShortcut("k")
+                    .disabled(!model.canEditCrop)
+                Divider()
             }
             CommandMenu("Frame") {
                 Button("Previous Frame") { model.stepScrub(by: -1) }

@@ -52,7 +52,9 @@ Personal creative tool, offline, no accounts. Spec: [`PRD.md`](PRD.md) · agent 
 | ⌘0 · ⌘1 · ⌘= · ⌘− | zoom to fit · actual size · in · out |
 | ⌘R · ⌘. | render preview now · cancel |
 
-Not yet: crop handles on the preview, RAW stills, HDR tone mapping. See the plan.
+**M6j (crop on the preview):** in Crop & Straighten, **Edit Crop on Preview** (also View ▸ Crop on Preview, ⌘K) shows the whole straightened canvas with the crop drawn over it. Drag a corner or an edge to resize, drag inside to move, drag outside the crop to draw a new one; **Done** on the preview returns to the cropped picture. Each drag is one undo step and does not re-process the picture. **Shape** locks the crop to Original or to 1:1, 5:4, 4:3, 3:2, 16:9 or 2:1 (**Flip Shape** for portrait); the lock also holds for the number fields and for Crop to Safe Area, and is not saved with the project. Exports always use the crop, whether or not you are editing it (D-034).
+
+Not yet: RAW stills, HDR tone mapping. See the plan.
 
 ## Requirements
 
@@ -134,6 +136,7 @@ The tests use small deterministic clips in `Tests/FrameStackMediaTests/Fixtures`
 24. (M6g) At the bottom of Color, drag the middle point of the **Tone Curve** up: the preview brightens without a render pass and ⌘Z reads "Undo Change Tone Curve". Pick Shape → **Soft Contrast**: the curve becomes an S. Shape → Linear puts the diagonal back.
 25. (M6h) Sampling → **Pattern**, Take 2, Skip 3: the bottom bar reads "N frames in range → M selected" with M = two in every five. Click a selected frame on the timeline and choose **Exclude** (or press X): a red cross appears there, the count drops by one and reads "(1 excluded)". Click a skipped frame and choose **Include**: a white dot, "(1 excluded, 1 added)". **Clear Overrides** removes both. Blend → **Normal**, opacity 100 %: the last frame shows; tick **Reverse stacking order**: the first frame shows and the caption says how the clip was decoded back to front. Switch Blend to Average: the toggle disappears (order cannot matter).
 26. (M6i) In Presets open the menu: **Starters** lists six looks above your saved presets. Pick **Light Trails**: the blend becomes Lighten, the section says "Applied “Light Trails”" and that everything else was kept; ⌘Z ("Undo Apply Preset") brings the previous look back, and the export settings never change. Open **Batch Export…**, tick **Split the range**, set 4 parts: the caption reads "4 parts of N frames (… each), in time order" and the summary shows versions × 4 outputs. **Export Here**: the folder holds "… part 1 of 4 …" to "… part 4 of 4 …" for every ticked version, each made only of its own quarter of the range.
+27. (M6j) Open **Crop & Straighten** and click **Edit Crop on Preview** (or press ⌘K): the preview shows the whole canvas with a margin, a grid and handles, and a bar at the top reads the crop size with a **Done** button. Drag the bottom-right corner inward: the outside dims, the Width and Height fields and "Output W×H of the canvas" follow, and one **Undo** ("Undo Change Crop") restores the crop. Drag inside the crop to move it; drag from outside it to draw a new one. Choose **Shape → 16 : 9**: the crop reshapes about its centre, the read-out adds "· 16 : 9", and corner drags keep the shape; **Flip Shape** makes it 9 : 16. Click **Done**: the preview shows only the crop, and an export has exactly the Output size.
 
 Please report anything off — especially colors versus QuickTime Player, and any "frames could not be decoded" warnings on real footage.
 

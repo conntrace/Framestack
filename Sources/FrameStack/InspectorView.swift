@@ -1037,19 +1037,35 @@ private struct GeometrySection: View {
             }
             Text("Rotates the finished composite about its centre (counter-clockwise is positive); the corners it uncovers are transparent until you crop.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Toggle(isOn: $model.isEditingCrop) {
+                Label("Edit Crop on Preview", systemImage: "crop")
+            }
+            .toggleStyle(.button)
+            .disabled(!model.canEditCrop)
+            .help("Show the whole canvas with crop handles: drag a corner or an edge to resize, inside to move, outside to draw a new crop (⌘K)")
+            HStack(spacing: 6) {
+                Picker("Shape", selection: aspectBinding) {
+                    ForEach(model.cropAspectChoices) { Text($0.displayName).tag($0) }
+                }
+                .help("Hold the crop to a shape. Choosing one reshapes the crop about its centre; Free lets each side move on its own.")
+                Button { model.flipCropAspect() } label: { Image(systemName: "arrow.triangle.2.circlepath") }
+                    .disabled(!model.canFlipCropAspect)
+                    .help("Turn the shape between landscape and portrait")
+                    .accessibilityLabel("Flip Shape")
+            }
             Text("Crop (canvas pixels)").font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 6) {
-                CropField(label: "Left", value: cropBinding(\.origin.x))
-                CropField(label: "Top", value: cropBinding(\.origin.y))
-                CropField(label: "Width", value: cropBinding(\.size.width))
-                CropField(label: "Height", value: cropBinding(\.size.height))
+                CropField(label: "Left", value: cropBinding(.left, \.origin.x))
+                CropField(label: "Top", value: cropBinding(.top, \.origin.y))
+                CropField(label: "Width", value: cropBinding(.width, \.size.width))
+                CropField(label: "Height", value: cropBinding(.height, \.size.height))
             }
             HStack {
                 Button("Crop to Safe Area") { model.cropToSafeArea() }
                     .disabled(!model.canCropToSafeArea)
-                    .help("The largest rectangle every aligned frame covers, after the straighten angle")
+                    .help("The largest rectangle every aligned frame covers, after the straighten angle" + (model.cropAspect.isLocked ? ", in the chosen shape" : ""))
                 Button("Reset") { model.resetGeometry() }
-                    .disabled(model.geometry.isIdentity)
+                    .disabled(model.geometry.isIdentity && !model.cropAspect.isLocked)
             }
             .controlSize(.small)
             Picker("Edges", selection: $model.geometry.edgeFill) {
@@ -1059,8 +1075,9 @@ private struct GeometrySection: View {
             Text(edgeExplanation)
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let canvas = model.canvasSize {
-                Text("Output \(model.geometry.outputSize(for: canvas)) of the \(canvas) canvas" + (model.geometry.hasTransform ? "" : " (uncropped)"))
+                Text("Output \(model.cropSummary) of the \(canvas) canvas" + (model.geometry.hasTransform ? "" : " (uncropped)"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("cropOutput")
             }
         }
     }
@@ -1073,14 +1090,14 @@ private struct GeometrySection: View {
         }
     }
 
-    private func cropBinding(_ keyPath: WritableKeyPath<CGRect, CGFloat>) -> Binding<Int> {
+    private var aspectBinding: Binding<CropAspect> {
+        Binding(get: { model.cropAspect }, set: { model.setCropAspect($0) })
+    }
+
+    private func cropBinding(_ field: CropFieldKind, _ keyPath: KeyPath<CGRect, CGFloat>) -> Binding<Int> {
         Binding(
             get: { Int(model.cropPixels[keyPath: keyPath].rounded()) },
-            set: { new in
-                var rect = model.cropPixels
-                rect[keyPath: keyPath] = CGFloat(new)
-                model.setCropPixels(rect)
-            }
+            set: { model.setCropField(field, to: $0) }
         )
     }
 }

@@ -151,9 +151,26 @@ private struct PreviewArea: View {
                 caption: (showingCoverage ? "Mask coverage" : "Composite") + " · \(preview.framesComposited) frames"
                     + (preview.alignment != nil ? " · aligned" : "") + (preview.motionMask != nil && !showingCoverage ? " · masked" : ""),
                 safeArea: showSafeArea ? safeArea(of: preview) : nil,
-                paint: paintHandlers(for: preview)
+                paint: paintHandlers(for: preview),
+                crop: cropHandlers
             )
             .opacity(model.isPreviewCurrent ? 1 : 0.55)
+            .overlay(alignment: .top) {
+                if model.isEditingCrop {
+                    HStack(spacing: 10) {
+                        Image(systemName: "crop")
+                        Text(model.cropSummary).monospacedDigit()
+                            .accessibilityIdentifier("cropSummary")
+                        Button("Done") { model.isEditingCrop = false }
+                            .controlSize(.small)
+                            .help("Leave crop editing and show the cropped result (⌘K)")
+                    }
+                    .font(.callout)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(10)
+                }
+            }
             .overlay(alignment: .topLeading) {
                 if !model.isPreviewCurrent {
                     Label("Preview outdated", systemImage: "clock.arrow.circlepath")
@@ -168,6 +185,18 @@ private struct PreviewArea: View {
         } else {
             ProgressView("Rendering preview…").frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    /// Crop handles over the whole straightened canvas while the crop is edited.
+    private var cropHandlers: ZoomableImageView.CropHandlers? {
+        guard model.isEditingCrop, let canvas = model.canvasSize else { return nil }
+        return ZoomableImageView.CropHandlers(
+            rect: model.cropPixels,
+            canvas: canvas,
+            onDrag: { start, handle, translation in model.dragCrop(from: start, handle: handle, by: translation) },
+            onDraw: { anchor, point in model.drawCrop(from: anchor, to: point) },
+            onEnd: { model.endCropDrag() }
+        )
     }
 
     /// Painting on the displayed (cropped, unrotated) composite.
@@ -196,7 +225,7 @@ private struct PreviewArea: View {
         guard let area = preview.alignment?.validArea, !area.isNull, preview.size.width > 0, preview.size.height > 0,
               model.geometry.rotationDegrees == 0 else { return nil }   // a straightened canvas has no axis-aligned safe area to draw
         // The preview may be cropped: move the area into the cropped image's space.
-        let cropOrigin = model.geometry.crop.pixelRect(in: preview.canvasSize).origin
+        let cropOrigin = model.displayGeometry.crop.pixelRect(in: preview.canvasSize).origin
         let shifted = area.offsetBy(dx: -cropOrigin.x, dy: -cropOrigin.y)
             .intersection(CGRect(x: 0, y: 0, width: preview.size.width, height: preview.size.height))
         guard !shifted.isNull else { return nil }

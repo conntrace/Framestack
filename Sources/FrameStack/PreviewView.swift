@@ -1,3 +1,4 @@
+import AppKit
 import FrameStackCore
 import SwiftUI
 
@@ -66,6 +67,9 @@ struct ZoomableImageView: View {
     /// Painting: when set, drags on the image are reported as normalised
     /// (0…1 of the displayed image) points; `nil` disables painting.
     var paint: PaintHandlers? = nil
+    /// Crop editing: when set, the crop rectangle is drawn over the image
+    /// with handles and drags on the image edit it; `nil` hides it.
+    var crop: CropHandlers? = nil
 
     @State private var pinchBase: Double?
     @State private var strokeInProgress: [CGPoint] = []
@@ -79,10 +83,26 @@ struct ZoomableImageView: View {
         let onStrokeEnd: ([CGPoint]) -> Void
     }
 
+    static let cropFitMargin: CGFloat = 44
+
+    struct CropHandlers {
+        /// The crop in full-resolution canvas pixels (origin top-left).
+        let rect: CGRect
+        let canvas: PixelSize
+        /// A handle (or the inside) dragged: the crop when the drag began, the handle, the movement in canvas pixels.
+        let onDrag: (CGRect, CropHandle, CGSize) -> Void
+        /// A new crop dragged out between two canvas points.
+        let onDraw: (CGPoint, CGPoint) -> Void
+        let onEnd: () -> Void
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let viewport = geometry.size
-            let scale = zoom.scale(for: fullSize, in: viewport)
+            // While the crop is edited "fit" leaves a margin, so the handles on the
+            // canvas edge are clear of the window edge and of the Done bar.
+            let margin: CGFloat = crop == nil ? 0 : Self.cropFitMargin
+            let scale = zoom.scale(for: fullSize, in: CGSize(width: max(1, viewport.width - 2 * margin), height: max(1, viewport.height - 2 * margin)))
             let width = max(1, CGFloat(fullSize.width) * scale)
             let height = max(1, CGFloat(fullSize.height) * scale)
 
@@ -115,6 +135,11 @@ struct ZoomableImageView: View {
                                 )
                         }
                     }
+                    .overlay {
+                        if let crop {
+                            CropOverlay(crop: crop, scale: scale)
+                        }
+                    }
                     .overlay(alignment: .topLeading) {
                         if let safeArea, !safeArea.isNull {
                             Rectangle()
@@ -144,6 +169,157 @@ struct ZoomableImageView: View {
                     .padding(8)
                     .accessibilityIdentifier("zoomCaption")
             }
+        }
+    }
+}
+
+/// The crop rectangle over the whole canvas: everything outside it dimmed, a
+/// thirds grid inside, and eight handles. Dragging a handle resizes, dragging
+/// inside moves, dragging outside (or anywhere while the crop is the whole
+/// canvas) draws a new crop. All positions are reported in canvas pixels.
+struct CropOverlay: View {
+    let crop: ZoomableImageView.CropHandlers
+    /// View points per canvas pixel.
+    let scale: Double
+
+    @State private var drag: DragKind?
+
+    private enum DragKind {
+        case handle(CropHandle, start: CGRect)
+        case draw(anchor: CGPoint)
+    }
+
+    /// How close (in points) the pointer must be to an edge or corner to grab it.
+    static let grabDistance: CGFloat = 10
+
+    /// What a press at `point` (view points) would grab: a handle, the
+    /// inside, or nil for "draw a new crop". `rect` is the crop in view points.
+    static func handle(at point: CGPoint, rect: CGRect, isWholeCanvas: Bool, tolerance: CGFloat = grabDistance) -> CropHandle? {
+        // Small crops keep a grabbable middle: the tolerance shrinks to a third of the side.
+        let tx = min(tolerance, max(2, rect.width / 3)), ty = min(tolerance, max(2, rect.height / 3))
+        let nearLeft = abs(point.x - rect.minX) <= tx, nearRight = abs(point.x - rect.maxX) <= tx
+        let nearTop = abs(point.y - rect.minY) <= ty, nearBottom = abs(point.y - rect.maxY) <= ty
+        let inX = point.x >= rect.minX - tx && point.x <= rect.maxX + tx
+        let inY = point.y >= rect.minY - ty && point.y <= rect.maxY + ty
+        guard inX, inY else { return nil }
+        if nearLeft, nearTop { return .topLeft }
+        if nearRight, nearTop { return .topRight }
+        if nearLeft, nearBottom { return .bottomLeft }
+        if nearRight, nearBottom { return .bottomRight }
+        if nearLeft { return .left }
+        if nearRight { return .right }
+        if nearTop { return .top }
+        if nearBottom { return .bottom }
+        // Moving a crop that already covers the canvas does nothing: draw a new one instead.
+        return isWholeCanvas ? nil : .body
+    }
+
+    private var isWholeCanvas: Bool {
+        crop.rect.minX <= 0 && crop.rect.minY <= 0
+            && crop.rect.width >= CGFloat(crop.canvas.width) && crop.rect.height >= CGFloat(crop.canvas.height)
+    }
+
+    private var viewRect: CGRect {
+        CGRect(x: crop.rect.minX * scale, y: crop.rect.minY * scale, width: crop.rect.width * scale, height: crop.rect.height * scale)
+    }
+
+    var body: some View {
+        let rect = viewRect
+        Canvas { context, size in
+            var outside = Path(CGRect(origin: .zero, size: size))
+            outside.addRect(rect)
+            context.fill(outside, with: .color(.black.opacity(0.55)), style: FillStyle(eoFill: true))
+            // Thirds.
+            var grid = Path()
+            for i in 1...2 {
+                let x = rect.minX + rect.width * CGFloat(i) / 3, y = rect.minY + rect.height * CGFloat(i) / 3
+                grid.move(to: CGPoint(x: x, y: rect.minY)); grid.addLine(to: CGPoint(x: x, y: rect.maxY))
+                grid.move(to: CGPoint(x: rect.minX, y: y)); grid.addLine(to: CGPoint(x: rect.maxX, y: y))
+            }
+            context.stroke(grid, with: .color(.white.opacity(0.35)), lineWidth: 0.5)
+            // Border: white on a dark hairline so it reads over any picture.
+            context.stroke(Path(rect.insetBy(dx: -0.5, dy: -0.5)), with: .color(.black.opacity(0.6)), lineWidth: 2)
+            context.stroke(Path(rect), with: .color(.white), lineWidth: 1)
+            // Handles: corner brackets and edge bars, inside the rectangle so they stay on the image.
+            let arm = min(16, rect.width / 3, rect.height / 3)
+            var handles = Path()
+            for (cx, sx) in [(rect.minX, CGFloat(1)), (rect.maxX, CGFloat(-1))] {
+                for (cy, sy) in [(rect.minY, CGFloat(1)), (rect.maxY, CGFloat(-1))] {
+                    handles.move(to: CGPoint(x: cx + sx * arm, y: cy + sy * 1.5))
+                    handles.addLine(to: CGPoint(x: cx + sx * 1.5, y: cy + sy * 1.5))
+                    handles.addLine(to: CGPoint(x: cx + sx * 1.5, y: cy + sy * arm))
+                }
+            }
+            if rect.width > 60 {
+                for y in [rect.minY + 1.5, rect.maxY - 1.5] {
+                    handles.move(to: CGPoint(x: rect.midX - arm / 2, y: y)); handles.addLine(to: CGPoint(x: rect.midX + arm / 2, y: y))
+                }
+            }
+            if rect.height > 60 {
+                for x in [rect.minX + 1.5, rect.maxX - 1.5] {
+                    handles.move(to: CGPoint(x: x, y: rect.midY - arm / 2)); handles.addLine(to: CGPoint(x: x, y: rect.midY + arm / 2))
+                }
+            }
+            context.stroke(handles, with: .color(.white), style: StrokeStyle(lineWidth: 3, lineCap: .square, lineJoin: .miter))
+        }
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if drag == nil {
+                        if let handle = Self.handle(at: value.startLocation, rect: rect, isWholeCanvas: isWholeCanvas) {
+                            drag = .handle(handle, start: crop.rect)
+                        } else {
+                            drag = .draw(anchor: CGPoint(x: value.startLocation.x / scale, y: value.startLocation.y / scale))
+                        }
+                    }
+                    switch drag {
+                    case let .handle(handle, start)?:
+                        crop.onDrag(start, handle, CGSize(width: value.translation.width / scale, height: value.translation.height / scale))
+                    case let .draw(anchor)?:
+                        crop.onDraw(anchor, CGPoint(x: value.location.x / scale, y: value.location.y / scale))
+                    case nil:
+                        break
+                    }
+                }
+                .onEnded { _ in
+                    drag = nil
+                    crop.onEnd()
+                }
+        )
+        .onContinuousHover { phase in
+            switch phase {
+            case let .active(point):
+                Self.cursor(for: Self.handle(at: point, rect: rect, isWholeCanvas: isWholeCanvas)).set()
+            case .ended:
+                NSCursor.arrow.set()
+            }
+        }
+        // An element the size of the crop itself, so assistive tools (and tests) can find where it is.
+        .overlay(alignment: .topLeading) {
+            Color.clear
+                .frame(width: max(1, rect.width), height: max(1, rect.height))
+                .offset(x: rect.minX, y: rect.minY)
+                .allowsHitTesting(false)
+                .accessibilityElement()
+                .accessibilityLabel("Crop rectangle")
+                .accessibilityValue("Left \(Int(crop.rect.minX)), top \(Int(crop.rect.minY)), \(Int(crop.rect.width)) by \(Int(crop.rect.height)) pixels")
+                .accessibilityIdentifier("cropRectangle")
+        }
+    }
+
+    static func cursor(for handle: CropHandle?) -> NSCursor {
+        guard let handle else { return .crosshair }
+        switch handle {
+        case .body: return .openHand
+        case .left, .right: return .resizeLeftRight
+        case .top, .bottom: return .resizeUpDown
+        case .topLeft, .bottomRight:
+            if #available(macOS 15.0, *) { return .frameResize(position: .topLeft, directions: .all) }
+            return .crosshair
+        case .topRight, .bottomLeft:
+            if #available(macOS 15.0, *) { return .frameResize(position: .topRight, directions: .all) }
+            return .crosshair
         }
     }
 }

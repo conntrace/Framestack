@@ -25,7 +25,7 @@ enum PreviewQuality: String, CaseIterable, Identifiable {
 /// An immutable rendered preview, tagged with the settings revision it shows.
 struct PreviewSnapshot {
     let image: CGImage
-    let revision: Int
+    var revision: Int
     let size: PixelSize
     let framesComposited: Int
     let missingFrames: Int
@@ -206,7 +206,43 @@ final class AppModel: ObservableObject {
     @Published var brushSoftness: Double = 0.5
     @Published var brushErases = false
     /// Mouse drags on the preview paint instead of doing nothing.
-    @Published var isPainting = false
+    @Published var isPainting = false { didSet { if isPainting, isEditingCrop { isEditingCrop = false } } }
+
+    /// Crop handles on the preview (M6j): the preview shows the whole canvas
+    /// with the crop drawn over it, and drags move the crop. A tool state,
+    /// not saved; the crop itself is.
+    @Published var isEditingCrop = false {
+        didSet {
+            guard isEditingCrop != oldValue else { return }
+            cropDraft = nil
+            if isEditingCrop {
+                if isPainting { isPainting = false }
+                if viewMode == .original { viewMode = .composite }
+            }
+            // Same composite, shown uncropped or cropped: re-processed from the cache.
+            renderPreviewNow()
+        }
+    }
+    /// The shape the crop is held to while it is edited (not saved).
+    @Published var cropAspect: CropAspect = .free
+    /// The crop being dragged, in canvas pixels; committed as one undo step when the drag ends.
+    @Published var cropDraft: CGRect?
+    /// What the current preview image was made from, so a change that does
+    /// not alter the picture (the crop, while the whole canvas is shown)
+    /// re-stamps it instead of processing it again.
+    private var previewDisplayKey: PreviewDisplayKey?
+
+    struct PreviewDisplayKey: Equatable {
+        let composite: CompositeCacheKey
+        let color: ColorAdjustments
+        let geometry: GeometrySettings
+    }
+
+    /// The geometry the preview is drawn with: the document's, except that
+    /// the crop is left off while it is being edited on the preview.
+    var displayGeometry: GeometrySettings {
+        isEditingCrop ? GeometrySettings(rotationDegrees: geometry.rotationDegrees, crop: .full, edgeFill: geometry.edgeFill) : geometry
+    }
     @Published var showPaintedMaskOverlay = true
 
     /// Adds a finished stroke (canvas-normalised points) as one undo step.
@@ -297,6 +333,8 @@ final class AppModel: ObservableObject {
     @Published var viewMode: PreviewViewMode = .composite {
         didSet {
             if viewMode != .composite, scrubIndex == nil { scrubIndex = frameRange?.lowerBound ?? 0 }
+            // The crop is edited on the composite; the Original view has none to show.
+            if viewMode == .original, isEditingCrop { isEditingCrop = false }
             scheduleSourceFrame()
         }
     }
@@ -436,9 +474,9 @@ final class AppModel: ObservableObject {
     /// The canvas size the crop refers to (before crop, at native resolution).
     var canvasSize: PixelSize? { source?.displaySize }
 
-    /// Full-resolution size of what the preview shows (after crop).
+    /// Full-resolution size of what the preview shows (after crop; the whole canvas while the crop is edited).
     var displayedFullSize: PixelSize {
-        geometry.outputSize(for: source?.displaySize ?? PixelSize(width: 1, height: 1))
+        displayGeometry.outputSize(for: source?.displaySize ?? PixelSize(width: 1, height: 1))
     }
 
     // MARK: Geometry
@@ -453,7 +491,14 @@ final class AppModel: ObservableObject {
             let sy = Double(canvas.height) / Double(preview.canvasSize.height)
             valid = CGRect(x: area.minX * sx, y: area.minY * sy, width: area.width * sx, height: area.height * sy)
         }
-        geometry.crop = geometry.largestValidCrop(valid: valid, canvas: canvas)
+        var crop = geometry.largestValidCrop(valid: valid, canvas: canvas)
+        // A locked shape is kept: the largest rectangle of that shape inside the safe area.
+        if let aspect = cropAspect.value(canvas: canvas) {
+            let inside = CropEditing.inscribed(aspect: aspect, in: crop.pixelRect(in: canvas), canvas: canvas)
+            crop = NormalizedRect.from(pixels: inside, in: canvas).clamped(in: canvas)
+        }
+        cropDraft = nil
+        geometry.crop = crop
     }
 
     var canCropToSafeArea: Bool {
@@ -461,21 +506,27 @@ final class AppModel: ObservableObject {
     }
 
     func resetCrop() {
+        cropDraft = nil
+        cropAspect = .free
         geometry.crop = .full
     }
 
     func resetGeometry() {
+        cropDraft = nil
+        cropAspect = .free
         geometry = .identity
     }
 
-    /// Crop in canvas pixels (origin top-left), for the fields.
+    /// Crop in canvas pixels (origin top-left), for the fields and the
+    /// handles: the rectangle being dragged while a drag is in progress.
     var cropPixels: CGRect {
         guard let canvas = canvasSize else { return .zero }
-        return geometry.crop.pixelRect(in: canvas)
+        return cropDraft ?? geometry.crop.pixelRect(in: canvas)
     }
 
     func setCropPixels(_ rect: CGRect) {
         guard let canvas = canvasSize else { return }
+        cropDraft = nil
         geometry.crop = NormalizedRect.from(pixels: rect, in: canvas).clamped(in: canvas)
     }
 
@@ -750,7 +801,11 @@ final class AppModel: ObservableObject {
         color = .identity
         suppressChanges = false
         cachedComposite = nil
+        previewDisplayKey = nil
         isPainting = false
+        isEditingCrop = false
+        cropAspect = .free
+        cropDraft = nil
         // Export choices follow the user from clip to clip, but a project's
         // choices do not leak into an unrelated video opened afterwards.
         if projectURL != nil { exportSettings = ExportSettings() }
@@ -1262,10 +1317,18 @@ final class AppModel: ObservableObject {
         )
         let revision = settingsRevision
         let renderer = renderer
-        let geometry = geometry
+        let geometry = displayGeometry
         let color = color
         let key = CompositeCacheKey(sourceURL: source.url, settings: settings.compositingPart, quality: previewQuality)
         let cached = cachedComposite?.key == key ? cachedComposite?.result : nil
+        let displayKey = PreviewDisplayKey(composite: key, color: color, geometry: geometry)
+        if cached != nil, displayKey == previewDisplayKey, preview != nil {
+            // Nothing the picture depends on changed (the crop moved while
+            // the whole canvas is shown): the image on screen is already right.
+            preview?.revision = revision
+            renderActivity = .idle
+            return
+        }
         renderActivity = cached == nil ? .waiting : .idle
 
         previewTask = Task { [weak self] in
@@ -1299,6 +1362,7 @@ final class AppModel: ObservableObject {
                 }.value
                 guard let self, !Task.isCancelled, revision == self.settingsRevision else { return }
                 self.cachedComposite = (key, result)
+                self.previewDisplayKey = displayKey
                 self.preview = PreviewSnapshot(
                     image: image,
                     revision: revision,
